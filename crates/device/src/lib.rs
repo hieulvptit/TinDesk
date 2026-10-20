@@ -9,6 +9,8 @@ pub enum Error {
     Invalid,
     #[error("event connection closed by authorization or protocol policy")]
     PolicyClosed,
+    #[error("backend rejected device authorization")]
+    Unauthorized,
     #[error("backend request failed")]
     Request,
     #[error("caller already has an active session")]

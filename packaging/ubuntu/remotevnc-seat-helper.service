@@ -1,0 +1,38 @@
+[Unit]
+Description=RemoteVNC local physical X11 helper
+Wants=remotevnc-input-guardian.service
+After=remotevnc-input-guardian.service systemd-logind.service
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=root
+Group=root
+RuntimeDirectory=remotevnc
+RuntimeDirectoryMode=0711
+UMask=0077
+# The directory is root-owned. Remove only this fixed endpoint after a crashed main.
+ExecStartPre=/usr/bin/rm -f /run/remotevnc/helper.sock
+ExecStart=/bin/sh -ec 'exec /usr/bin/remotevnc-seat-helper --agent-uid "$$(id -u remotevnc-agent)"'
+Restart=always
+RestartSec=2
+# Guardian survives in a different cgroup and owns pending physical cleanup.
+KillMode=control-group
+TimeoutStopSec=5
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_KILL
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=no
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

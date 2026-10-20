@@ -1,0 +1,38 @@
+[Unit]
+Description=RemoteVNC independent input recovery guardian
+After=systemd-logind.service
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=root
+Group=root
+RuntimeDirectory=remotevnc-guardian
+RuntimeDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/remotevnc-seat-helper --input-guardian
+# Order dependents after the private listener exists, including a retained pending owner.
+ExecStartPost=/bin/sh -ec 'for n in 1 2 3 4 5 6 7 8 9 10; do test -S /run/remotevnc-guardian/guardian.sock && exit 0; sleep 0.1; done; exit 1'
+Restart=on-failure
+RestartSec=2
+# Never forcibly kill the final recovery owner while physical overlap is pending.
+KillMode=process
+TimeoutStopSec=infinity
+SendSIGKILL=no
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_KILL
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=no
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

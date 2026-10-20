@@ -89,10 +89,7 @@ impl DeviceApi {
             .send()
             .await
             .map_err(|_| Error::Request)?;
-        if response.status() != reqwest::StatusCode::NO_CONTENT {
-            return Err(Error::Request);
-        }
-        Ok(())
+        no_content(response)
     }
 }
 pub(crate) async fn decode<T: DeserializeOwned>(mut response: reqwest::Response) -> Result<T> {
@@ -223,6 +220,11 @@ impl DeviceApi {
             {
                 Err(Error::Limit)
             }
+            Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                if response.status().as_u16() == 401 =>
+            {
+                Err(Error::Unauthorized)
+            }
             Err(_) => Err(Error::Request),
         }
     }
@@ -298,6 +300,9 @@ impl DeviceEvents {
 fn check_status(response: &reqwest::Response) -> Result<()> {
     if response.status().is_success() {
         return Ok(());
+    }
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(Error::Unauthorized);
     }
     Err(
         match response
