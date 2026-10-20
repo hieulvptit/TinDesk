@@ -134,7 +134,7 @@ pub(super) fn apply_remote(
     Ok(())
 }
 
-pub(super) fn rebuild(shared: &Arc<Shared>, epoch: u64) -> Result<()> {
+pub(super) fn rebuild(shared: &Arc<Shared>, epoch: u64, ice: Option<Vec<IceServer>>) -> Result<()> {
     let _rebuild = shared.rebuild.lock().unwrap();
     shared.engine()?;
     if epoch
@@ -148,13 +148,26 @@ pub(super) fn rebuild(shared: &Arc<Shared>, epoch: u64) -> Result<()> {
     }
     {
         let _gate = shared.event_gate.lock().unwrap();
+        if shared.closed.load(Ordering::Acquire) {
+            return Err(TransportError::Closed);
+        }
+        shared.negotiation_ready.store(false, Ordering::Release);
         shared.epoch.store(epoch, Ordering::Release); // invalidate callbacks before teardown
         while shared.events_drain.try_recv().is_ok() {} // discard pending old-session input/media/signals
     }
+    let local_restart = ice.is_some();
+    if let Some(ice) = ice {
+        shared.config.lock().unwrap().ice_servers = ice;
+    }
     shared.emit(PeerEvent::ConnectionChanged(ConnectionState::Restarting));
     let old = shared.engine.lock().unwrap().take();
+    #[cfg(test)]
+    shared.hooks.engine_removed.pause();
     if let Some(old) = old {
         let _ = old.pipeline.set_state(gst::State::Null);
+    }
+    if shared.closed.load(Ordering::Acquire) {
+        return Err(TransportError::Closed);
     }
     shared.outgoing_motion.lock().unwrap().take();
     shared.incoming_motion.lock().unwrap().take();
@@ -165,16 +178,37 @@ pub(super) fn rebuild(shared: &Arc<Shared>, epoch: u64) -> Result<()> {
     let last_renewed_ms = decoder.last_renewed_ms();
     *decoder = InputDecoder::new(config.session_id, config.display, last_renewed_ms)?;
     drop(decoder);
-    match build_engine(shared, epoch) {
-        Ok(engine) => {
-            *shared.engine.lock().unwrap() = Some(engine);
-            Ok(())
-        }
+    let engine = match build_engine(shared, epoch) {
+        Ok(engine) => engine,
         Err(error) => {
             shared.fail(error.clone());
-            Err(error)
+            return Err(error);
         }
+    };
+    {
+        // Public close and native failure transitions use the same gate. A
+        // replacement can be published only before a closure transition.
+        let gate = shared.event_gate.lock().unwrap();
+        if shared.closed.load(Ordering::Acquire) {
+            drop(gate);
+            let _ = engine.pipeline.set_state(gst::State::Null);
+            return Err(TransportError::Closed);
+        }
+        *shared.engine.lock().unwrap() = Some(engine);
     }
+    if local_restart {
+        #[cfg(test)]
+        shared.hooks.before_restart_marker.pause();
+        shared.engine()?;
+        let session_id = shared.config.lock().unwrap().session_id;
+        shared.emit_at(
+            epoch,
+            PeerEvent::Signal(SignalMessage::Restart { session_id, epoch }),
+        );
+    }
+    shared.negotiation_ready.store(true, Ordering::Release);
+    shared.emit_at(epoch, PeerEvent::NegotiationNeeded);
+    Ok(())
 }
 
 pub(super) fn validate_ice(servers: &[IceServer]) -> Result<()> {

@@ -86,12 +86,15 @@ struct Engine {
     negotiating: AtomicBool,
 }
 struct Shared {
+    #[cfg(test)]
+    hooks: lifecycle_tests::Hooks,
     config: Mutex<PeerConfig>,
     engine: Mutex<Option<Arc<Engine>>>,
     rebuild: Mutex<()>,
     epoch: AtomicU64,
     closed: AtomicBool,
     shutdown_complete: AtomicBool,
+    negotiation_ready: AtomicBool,
     events: Sender<PeerEvent>,
     events_drain: Receiver<PeerEvent>,
     event_gate: Mutex<()>,
@@ -178,12 +181,15 @@ impl Peer {
         let (tx, events) = bounded(EVENT_CAPACITY);
         let input = InputDecoder::new(config.session_id, config.display, 0)?;
         let shared = Arc::new(Shared {
+            #[cfg(test)]
+            hooks: lifecycle_tests::Hooks::default(),
             config: Mutex::new(config),
             engine: Mutex::new(None),
             rebuild: Mutex::new(()),
             epoch: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             shutdown_complete: AtomicBool::new(false),
+            negotiation_ready: AtomicBool::new(true),
             events: tx,
             events_drain: events.clone(),
             event_gate: Mutex::new(()),
@@ -251,6 +257,8 @@ impl Peer {
             })
     }
     pub fn start_negotiation(&self) -> Result<()> {
+        #[cfg(test)]
+        self.shared.hooks.negotiation_requested.pause();
         let _rebuild = self.shared.rebuild.lock().unwrap();
         if self.shared.config.lock().unwrap().role != PeerRole::Controller {
             return Err(TransportError::WrongRole);
@@ -288,20 +296,23 @@ impl Peer {
             {
                 return Err(TransportError::StaleEpoch);
             }
-            rebuild(&self.shared, epoch)?;
-            self.shared.emit(PeerEvent::NegotiationNeeded);
+            rebuild(&self.shared, epoch, None)?;
             return Ok(());
         }
+        if epoch != self.epoch() {
+            return Err(TransportError::StaleEpoch);
+        }
+        #[cfg(test)]
+        self.shared.hooks.end_validated.pause();
+        let rebuild_guard = self.shared.rebuild.lock().unwrap();
         if epoch != self.epoch() {
             return Err(TransportError::StaleEpoch);
         }
         if matches!(message, SignalMessage::End { .. }) {
-            self.close();
+            self.shared.close_at(epoch);
+            drop(rebuild_guard);
+            self.join_monitor();
             return Ok(());
-        }
-        let _rebuild = self.shared.rebuild.lock().unwrap();
-        if epoch != self.epoch() {
-            return Err(TransportError::StaleEpoch);
         }
         let engine = self.shared.engine()?;
         match message {
@@ -434,20 +445,11 @@ impl Peer {
     /// PeerConnection and sends a typed epoch marker before its new offer/ICE.
     pub fn restart_ice(&self, ice: Vec<IceServer>) -> Result<()> {
         validate_ice(&ice)?;
-        self.shared.engine()?;
-        self.shared.config.lock().unwrap().ice_servers = ice;
         let epoch = self
             .epoch()
             .checked_add(1)
             .ok_or(TransportError::StaleEpoch)?;
-        rebuild(&self.shared, epoch)?;
-        let session_id = self.shared.config.lock().unwrap().session_id;
-        self.shared.emit(PeerEvent::Signal(SignalMessage::Restart {
-            session_id,
-            epoch,
-        }));
-        self.shared.emit(PeerEvent::NegotiationNeeded);
-        Ok(())
+        rebuild(&self.shared, epoch, Some(ice))
     }
     /// Configure H264 RTP transceivers before start_negotiation. Task4 adds the
     /// capture/decode graph inside this crate using the private engine handles.
@@ -501,7 +503,15 @@ impl Peer {
         Ok(())
     }
     pub fn close(&self) {
-        self.shared.closed.store(true, Ordering::Release);
+        {
+            let _gate = self.shared.event_gate.lock().unwrap();
+            self.shared.closed.store(true, Ordering::Release);
+        }
+        #[cfg(test)]
+        self.shared.hooks.close_requested.pause();
+        self.join_monitor();
+    }
+    fn join_monitor(&self) {
         if let Some(monitor) = self.monitor.lock().unwrap().take() {
             let _ = monitor.join();
         }
@@ -526,7 +536,7 @@ use signaling::{apply_remote, create_description, rebuild, validate_ice};
 mod tests {
     use super::*;
 
-    fn config(role: PeerRole) -> PeerConfig {
+    pub(super) fn config(role: PeerRole) -> PeerConfig {
         PeerConfig {
             session_id: SessionId::from_uuid(uuid::Uuid::nil()),
             local_peer_id: DeviceId::from_uuid(uuid::Uuid::from_u128(
@@ -667,3 +677,6 @@ mod tests {
         b.close();
     }
 }
+
+#[cfg(test)]
+mod lifecycle_tests;

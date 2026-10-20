@@ -103,7 +103,9 @@ pub(super) fn build_engine(shared: &Arc<Shared>, epoch: u64) -> Result<Arc<Engin
     engine
         .webrtc
         .connect("on-negotiation-needed", false, move |_| {
-            if let Some(s) = active(&weak, epoch) {
+            if let Some(s) = active(&weak, epoch)
+                && s.negotiation_ready.load(Ordering::Acquire)
+            {
                 s.emit_at(epoch, PeerEvent::NegotiationNeeded);
             }
             None
@@ -279,7 +281,12 @@ fn receive_input(shared: &Arc<Shared>, epoch: u64, label: &str, bytes: &[u8]) {
 pub(super) fn monitor_peer(shared: Arc<Shared>) {
     let mut stats_at = Instant::now();
     while !shared.closed.load(Ordering::Acquire) {
+        #[cfg(test)]
+        shared.hooks.monitor_before_lock.pause();
         let rebuild_guard = shared.rebuild.lock().unwrap();
+        if shared.closed.load(Ordering::Acquire) {
+            break;
+        }
         if shared.input.lock().unwrap().expired(shared.now_ms()) {
             shared.fail(ProtocolError::LeaseExpired.into());
             break;
@@ -331,7 +338,11 @@ pub(super) fn monitor_peer(shared: Arc<Shared>) {
         drop(rebuild_guard);
         thread::sleep(Duration::from_millis(5));
     }
-    if let Some(engine) = shared.engine.lock().unwrap().as_ref() {
+    // Teardown and replacement publication share one lifecycle transaction.
+    // close() joins only after releasing the event/lifecycle gates.
+    let _rebuild = shared.rebuild.lock().unwrap();
+    let engine = shared.engine.lock().unwrap().take();
+    if let Some(engine) = engine {
         let _ = engine.pipeline.set_state(gst::State::Null);
     }
     let _ = shared
