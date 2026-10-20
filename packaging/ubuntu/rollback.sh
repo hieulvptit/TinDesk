@@ -15,7 +15,11 @@ while read -r unit status; do
   case "$unit" in remotevnc-agent|remotevnc-seat-helper|remotevnc-input-guardian|lightdm) ;; *) exit 1 ;; esac
   case "$status" in
     enabled) systemctl enable "$unit.service" ;;
-    enabled-runtime) systemctl enable --runtime "$unit.service" ;;
+    enabled-runtime)
+      # Apply created permanent links; remove them before restoring runtime-only state.
+      systemctl disable "$unit.service"
+      systemctl enable --runtime "$unit.service"
+      ;;
     *) systemctl disable "$unit.service" ;;
   esac
 done < "$backup/enablement"

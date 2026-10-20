@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Installer integration checks in disposable chroots, never on the active desktop.
 
-Run as root on Linux; creates its own private mount namespace. Only apt/systemctl
-are stand-ins: filesystem writes, account creation, ownership and rollback are real.
+Run as root on Linux; creates its own private mount namespace. Service actions and
+apt are stand-ins; enablement uses real offline systemctl in the disposable root.
+Filesystem writes, account creation, ownership and rollback are real.
 """
 import os
 import json
@@ -59,13 +60,16 @@ class Installer(unittest.TestCase):
             path.chmod(0o755)
         (self.root / "usr/share/xsessions").mkdir(parents=True, exist_ok=True)
         (self.root / "usr/share/xsessions/xfce.desktop").write_text('[Desktop Entry]\n')
+        # Real offline enablement needs a minimal LightDM unit; no desktop runs.
+        (self.root / "usr/lib/systemd/system/lightdm.service").write_text(
+            '[Unit]\nDescription=Fixture display manager\n[Service]\nExecStart=/bin/true\n[Install]\nAlias=display-manager.service\n')
         (self.root / "etc/debconf-value").write_text('gdm3')
         (self.root / "etc/debconf-seen").write_text('false')
         for name, body in {
             "apt-get": 'echo "apt $*" >> /commands; /usr/sbin/policy-rc.d; [[ $? == 101 ]] || exit 9; echo /usr/sbin/lightdm > /etc/X11/default-display-manager; exit ${APT_STATUS:-0}',
             "lightdm": 'exit 0',
             "light-locker": 'exit 0',
-            "systemctl": 'echo "systemctl $*" >> /commands; if [[ "$1" == is-enabled ]]; then exit 1; fi; if [[ "$*" == "enable --force lightdm.service" ]]; then ln -sf /usr/lib/systemd/system/lightdm.service /etc/systemd/system/display-manager.service; fi',
+            "systemctl": 'echo "systemctl $*" >> /commands; case "$1" in is-enabled|enable|disable) exec /usr/bin/systemctl --root=/ "$@" ;; esac',
             "gst-inspect-1.0": 'exit 0',
             "debconf-set-selections": 'while read -r owner question kind value; do if [[ "$kind" == select ]]; then printf "%s" "$value" > /etc/debconf-value; echo true > /etc/debconf-seen; fi; done',
             "debconf-communicate": 'while read -r verb question field value; do case "$verb" in GET) if [[ -f /etc/debconf-value ]]; then echo "0 $(cat /etc/debconf-value)"; else echo "10 missing"; fi ;; FGET) echo "0 $(cat /etc/debconf-seen)" ;; SET) printf "%s" "$field" > /etc/debconf-value; echo 0 ;; FSET) printf "%s" "$value" > /etc/debconf-seen; echo 0 ;; esac; done',
@@ -80,6 +84,20 @@ class Installer(unittest.TestCase):
                                  "/bin/bash", "/work/packaging/ubuntu/install.sh", *args, "--bin-dir", "/artifacts"], text=True, capture_output=True)
         self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
         return result
+
+    def enroll_fixture(self):
+        identity = self.root / "var/lib/remotevnc-agent/identity.json"
+        identity.write_text(json.dumps(dict(version=1,device_id="00000000-0000-4000-8000-000000000001",secret=[1]*32)))
+        identity.chmod(0o600)
+        os.chown(identity, (self.root / "var/lib/remotevnc-agent").stat().st_uid, (self.root / "var/lib/remotevnc-agent").stat().st_gid)
+
+    def run_rollback(self, output):
+        backup = next(line.removeprefix('Rollback: sudo ').split()[-1]
+                      for line in output.splitlines() if line.startswith('Rollback: sudo '))
+        self.assertTrue((self.root / backup.removeprefix('/')).is_dir())
+        result = subprocess.run(["chroot", str(self.root), "/usr/bin/env", "PATH=/test-bin:/usr/sbin:/usr/bin:/sbin:/bin", "/bin/bash", "/work/packaging/ubuntu/rollback.sh", backup], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return self.root / backup.removeprefix('/')
 
     def snapshot(self):
         return [(str(p.relative_to(self.root)), p.lstat().st_mode, p.read_bytes() if p.is_file() and not p.is_symlink() else b"")
@@ -135,11 +153,8 @@ class Installer(unittest.TestCase):
         self.run_install("--apply", success=False)
         self.assertEqual((self.root / "etc/X11/default-display-manager").read_text(), "/usr/sbin/gdm3\n")
         # Executable fixture above represents successful owner-only `doctor`/credential check.
-        identity = self.root / "var/lib/remotevnc-agent/identity.json"
-        identity.write_text(json.dumps(dict(version=1,device_id="00000000-0000-4000-8000-000000000001",secret=[1]*32)))
-        identity.chmod(0o600)
-        os.chown(identity, (self.root / "var/lib/remotevnc-agent").stat().st_uid, (self.root / "var/lib/remotevnc-agent").stat().st_gid)
-        self.run_install("--apply")
+        self.enroll_fixture()
+        applied = self.run_install("--apply")
         self.assertEqual((self.root / "etc/X11/default-display-manager").read_text(), "/usr/sbin/lightdm\n")
         self.assertEqual((self.root / "etc/debconf-value").read_text().strip(), 'lightdm')
         self.assertEqual((self.root / "etc/debconf-seen").read_text().strip(), 'true')
@@ -147,15 +162,32 @@ class Installer(unittest.TestCase):
         commands = (self.root / "commands").read_text()
         starts = [line for line in commands.splitlines() if line.startswith('systemctl start ')]
         self.assertEqual(starts, ['systemctl start remotevnc-input-guardian.service','systemctl start remotevnc-seat-helper.service','systemctl start remotevnc-agent.service'])
-        backups = sorted((self.root / "var/lib/remotevnc-installer").glob("backup-*"))
-        self.assertTrue(backups)
-        result = subprocess.run(["chroot", str(self.root), "/usr/bin/env", "PATH=/test-bin:/usr/sbin:/usr/bin:/sbin:/bin", "/bin/bash", "/work/packaging/ubuntu/rollback.sh", "/" + str(backups[-1].relative_to(self.root))], capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.run_rollback(applied.stdout)
         self.assertEqual((self.root / "etc/lightdm/lightdm.conf.d/50-remotevnc.conf").read_text(), "previous settings\n")
         self.assertEqual((self.root / "etc/X11/default-display-manager").read_text(), "/usr/sbin/gdm3\n")
         self.assertEqual(os.readlink(self.root / "etc/systemd/system/display-manager.service"), "/usr/lib/systemd/system/gdm3.service")
         self.assertEqual((self.root / "etc/debconf-value").read_text().strip(), 'gdm3')
         self.assertEqual((self.root / "etc/debconf-seen").read_text().strip(), 'false')
+
+    def test_rollback_restores_runtime_only_agent_without_persistent_enablement(self):
+        self.run_install("--prepare")
+        self.enroll_fixture()
+        # This is actual systemctl file enablement in the private root, never the live manager.
+        subprocess.run(["chroot", str(self.root), "/usr/bin/systemctl", "--root=/", "enable", "--runtime", "remotevnc-agent.service"], check=True, capture_output=True, text=True)
+        runtime = self.root / "run/systemd/system/multi-user.target.wants/remotevnc-agent.service"
+        persistent = self.root / "etc/systemd/system/multi-user.target.wants/remotevnc-agent.service"
+        self.assertTrue(runtime.is_symlink())
+        self.assertFalse(persistent.is_symlink())
+        applied = self.run_install("--apply")
+        self.assertTrue(persistent.is_symlink())
+        backup = self.run_rollback(applied.stdout)
+        self.assertIn('remotevnc-agent enabled-runtime', (backup / 'enablement').read_text().splitlines())
+        stops = [line for line in (self.root / 'commands').read_text().splitlines() if line.startswith('systemctl stop ')]
+        self.assertEqual(stops, ['systemctl stop remotevnc-agent.service remotevnc-seat-helper.service', 'systemctl stop remotevnc-input-guardian.service'])
+        self.assertFalse(persistent.is_symlink(), 'rollback must remove apply-created permanent enablement')
+        self.assertTrue(runtime.is_symlink(), 'runtime-only enablement must survive rollback')
+        result = subprocess.run(["chroot", str(self.root), "/usr/bin/systemctl", "--root=/", "is-enabled", "remotevnc-agent.service"], check=True, capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), 'enabled-runtime')
 
 
 unittest.main()
