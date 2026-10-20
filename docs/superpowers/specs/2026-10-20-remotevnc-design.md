@@ -1,6 +1,6 @@
 # RemoteVNC cho macOS và Ubuntu 26.04
 
-Trạng thái: bản đặc tả đề xuất, chờ người dùng review trước khi lập kế hoạch triển khai.
+Trạng thái: người dùng đã duyệt ngày 2026-10-20 bằng yêu cầu “ok triển đi”.
 
 ## 1. Mục tiêu và quyết định đã chốt
 
