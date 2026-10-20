@@ -1,9 +1,11 @@
 //! Shared RemoteVNC wire contracts and local input policy, with no native dependencies.
+pub mod enrollment;
 pub mod identity;
 pub mod input;
 pub mod ipc;
 pub mod wire;
 
+pub use enrollment::*;
 pub use identity::*;
 pub use input::*;
 pub use ipc::*;
