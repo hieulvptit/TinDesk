@@ -14,7 +14,7 @@ cleanup() {
 }
 trap cleanup EXIT
 # Xvfb selects an unused display; never assumes :0.
-Xvfb -displayfd 3 -screen 0 800x600x24 -nolisten tcp -auth "$XAUTHORITY" 3>"$fixture/display" >"$fixture/xvfb.log" 2>&1 &
+Xvfb -displayfd 3 -screen 0 1920x1080x24 -nolisten tcp -auth "$XAUTHORITY" 3>"$fixture/display" >"$fixture/xvfb.log" 2>&1 &
 xvfb_pid=$!
 for _ in {1..100}; do [[ -s "$fixture/display" ]] && break; sleep .05; done
 export DISPLAY=":$(cat "$fixture/display")"
@@ -23,7 +23,7 @@ xauth -f "$XAUTHORITY" add "$DISPLAY" MIT-MAGIC-COOKIE-1 "$(od -An -N16 -tx1 /de
 # Xvfb reads auth at initialization: restart on the chosen display with real auth.
 kill "$xvfb_pid"
 wait "$xvfb_pid" 2>/dev/null || true
-Xvfb "$DISPLAY" -screen 0 800x600x24 -nolisten tcp -auth "$XAUTHORITY" >"$fixture/xvfb.log" 2>&1 &
+Xvfb "$DISPLAY" -screen 0 1920x1080x24 -nolisten tcp -auth "$XAUTHORITY" >"$fixture/xvfb.log" 2>&1 &
 xvfb_pid=$!
 for _ in {1..100}; do xdpyinfo >/dev/null 2>&1 && break; sleep .05; done
 export REMOTEVNC_XVFB_PID="$xvfb_pid"
@@ -65,3 +65,9 @@ actual = Path(os.environ['REMOTEVNC_GTK_RESULT']).read_text()
 assert actual == expected, f'exact GTK Unicode mismatch: {actual!r} != {expected!r}'
 print('GTK exact Unicode PASS: Vietnamese, NFC, NFD, CJK, non-BMP; no duplicate commits')
 PY
+
+# Native capture/media and independent guardian recovery on this disposable display.
+cargo test -p remotevnc-seat-helper --test capture physical_capture -- --ignored --test-threads=1
+cargo test -p remotevnc-seat-helper --test capture cropped_capture -- --ignored --test-threads=1
+cargo test -p remotevnc-seat-helper --test recovery guardian_releases_real -- --ignored --test-threads=1
+cargo test -p remotevnc-seat-helper --test recovery guardian_restores_unicode -- --ignored --test-threads=1

@@ -17,6 +17,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             _ => return Err("unknown argument; use --help".into()),
         }
     }
+    #[cfg(target_os = "macos")]
+    remotevnc_client::media_runtime::initialize_bundled()?;
     let mut config = Config::new(&backend)?;
     config.relay_only = relay;
     let options = eframe::NativeOptions {

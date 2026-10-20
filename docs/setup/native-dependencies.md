@@ -2,7 +2,7 @@
 
 The protocol, backend, and policy crates have no GStreamer dependency. The
 transport uses GStreamer Rust bindings 0.24 with a minimum native API of 1.24.
-Use Rust 1.94 or newer and the committed Cargo.lock (`--locked`).
+Use Rust 1.95 or newer and the committed Cargo.lock (`--locked`).
 
 ## macOS (Apple Silicon or Intel)
 

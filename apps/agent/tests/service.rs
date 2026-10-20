@@ -293,11 +293,7 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
                     .await
                     .unwrap(),
                 PeerEvent::ChannelsReady => channels = true,
-                PeerEvent::Frame(_) => {
-                    if released {
-                        decoded_after_release = true;
-                    }
-                }
+                PeerEvent::Frame(_) if released => decoded_after_release = true,
                 PeerEvent::Error(e) => panic!("controller {e}"),
                 _ => {}
             }

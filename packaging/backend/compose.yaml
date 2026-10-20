@@ -1,0 +1,34 @@
+# One instance only: in-memory authorization gates/presence are process-local.
+services:
+  backend:
+    image: remotevnc-backend:local
+    restart: unless-stopped
+    init: true
+    stop_signal: SIGINT
+    stop_grace_period: 20s
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 512m
+    ports: ["127.0.0.1:18080:8080"]
+    volumes:
+      - ${REMOTEVNC_DATA_DIR:?set absolute private data directory}:/data
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m,mode=1777"]
+    environment:
+      REMOTEVNC_PUBLIC_ORIGIN: ${REMOTEVNC_PUBLIC_ORIGIN:?HTTPS origin required}
+      REMOTEVNC_GOOGLE_REDIRECT_URI: ${REMOTEVNC_GOOGLE_REDIRECT_URI:?registered callback required}
+      REMOTEVNC_GOOGLE_CLIENT_ID: ${REMOTEVNC_GOOGLE_CLIENT_ID:?Google client ID required}
+      REMOTEVNC_GOOGLE_CLIENT_SECRET_FILE: /run/secrets/google_client_secret
+      REMOTEVNC_TURN_KEY_ID: ${REMOTEVNC_TURN_KEY_ID:?TURN key ID required}
+      REMOTEVNC_TURN_API_TOKEN_FILE: /run/secrets/turn_api_token
+    secrets: [google_client_secret, turn_api_token]
+    logging:
+      driver: local
+      options: {max-size: "5m", max-file: "3"}
+secrets:
+  google_client_secret:
+    file: ${REMOTEVNC_GOOGLE_SECRET_FILE:?private Google secret file required}
+  turn_api_token:
+    file: ${REMOTEVNC_TURN_TOKEN_FILE:?private TURN token file required}

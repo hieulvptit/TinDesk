@@ -1,0 +1,8 @@
+[Unit]
+Description=Prune expired RemoteVNC ephemeral records (preserve device tombstones)
+Requires=docker.service
+After=docker.service
+[Service]
+Type=oneshot
+# Install compose.yaml + private deploy.env at /etc/remotevnc-backend (root0700).
+ExecStart=/usr/bin/docker compose --project-directory /etc/remotevnc-backend --env-file /etc/remotevnc-backend/deploy.env -f /etc/remotevnc-backend/compose.yaml exec -T backend python3 /usr/local/bin/maintenance.py prune /data/backend.db
