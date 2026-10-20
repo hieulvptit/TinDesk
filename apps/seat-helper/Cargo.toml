@@ -1,0 +1,15 @@
+[package]
+name = "remotevnc-seat-helper"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+remotevnc-protocol = { path = "../../crates/protocol" }
+x11rb = { version = "0.13", features = ["xtest", "xkb"] }
+libc = "0.2"
+signal-hook = "0.3"
+
+[dev-dependencies]
+uuid.workspace = true

@@ -16,6 +16,11 @@ pub enum HelperRequest {
         display: DisplayInfo,
     },
     Input(InputEnvelope),
+    /// Only sent by the authenticated local agent after a backend lease renewal.
+    RenewLease {
+        session_id: SessionId,
+        generation: u64,
+    },
     ReleaseAll {
         session_id: SessionId,
         generation: u64,
@@ -31,6 +36,7 @@ pub enum HelperRequest {
 pub enum HelperEvent {
     Ready,
     DisplayChanged(DisplayInfo),
+    DisplayUnavailable { generation: u64 },
     Stopped { session_id: SessionId },
     Error { message: String },
 }

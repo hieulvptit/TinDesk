@@ -1,0 +1,314 @@
+//! XTest input. Text uses a spare keycode, never clipboard or an IME commit channel.
+use crate::{Result, error, seat::DisplayTarget, x11};
+use remotevnc_protocol::{InputEvent, MouseButton};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Mutex,
+    thread,
+    time::Duration,
+};
+use x11rb::{
+    connection::Connection,
+    protocol::{
+        xkb::{self, ConnectionExt as _},
+        xproto::{self, ConnectionExt as _, ModMask},
+        xtest::ConnectionExt as _,
+    },
+    rust_connection::RustConnection,
+};
+static TEXT_TRANSACTION: Mutex<()> = Mutex::new(());
+const CORE_KEYBOARD: u16 = 256;
+
+pub fn unicode_keysym(ch: char) -> Result<u32> {
+    match ch {
+        '\n' | '\r' => Ok(0xff0d),
+        '\t' => Ok(0xff09),
+        c if c.is_control() => Err(error("unsupported control character in text")),
+        c if (c as u32) <= 0xff => Ok(c as u32),
+        c => Ok(0x0100_0000 | c as u32),
+    }
+}
+pub struct X11Input {
+    connection: RustConnection,
+    root: u32,
+    width: u32,
+    height: u32,
+    keys: BTreeMap<u32, u8>,
+    buttons: BTreeSet<u8>,
+}
+impl X11Input {
+    pub fn connect(target: &DisplayTarget) -> Result<Self> {
+        let connection = x11::connect(target)?;
+        connection.xtest_get_version(2, 2)?.reply()?;
+        if !connection.xkb_use_extension(1, 0)?.reply()?.supported {
+            return Err(error("XKB unsupported"));
+        }
+        let root = connection.setup().roots[0].root;
+        let geometry = connection.get_geometry(root)?.reply()?;
+        Ok(Self {
+            connection,
+            root,
+            width: geometry.width.into(),
+            height: geometry.height.into(),
+            keys: BTreeMap::new(),
+            buttons: BTreeSet::new(),
+        })
+    }
+    fn fake(&self, kind: u8, detail: u8, x: i16, y: i16) -> Result<()> {
+        self.connection
+            .xtest_fake_input(kind, detail, 0, self.root, x, y, 0)?
+            .check()?;
+        Ok(())
+    }
+    fn motion(&self, x: u32, y: u32) -> Result<()> {
+        if x >= self.width || y >= self.height {
+            return Err(error("pointer outside current display"));
+        }
+        self.fake(
+            xproto::MOTION_NOTIFY_EVENT,
+            0,
+            i16::try_from(x)?,
+            i16::try_from(y)?,
+        )
+    }
+    pub fn apply(&mut self, event: &InputEvent) -> Result<()> {
+        self.apply_with_cancel(event, || false)
+    }
+    pub fn apply_with_cancel(
+        &mut self,
+        event: &InputEvent,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<()> {
+        if cancelled() {
+            return Err(error("input cancelled"));
+        }
+        match event {
+            InputEvent::PointerMove { x, y } => self.motion(*x, *y)?,
+            InputEvent::Button {
+                button,
+                pressed,
+                x,
+                y,
+            } => {
+                self.motion(*x, *y)?;
+                let code = match button {
+                    MouseButton::Left => 1,
+                    MouseButton::Middle => 2,
+                    MouseButton::Right => 3,
+                    MouseButton::Back => 8,
+                    MouseButton::Forward => 9,
+                };
+                if !pressed && !self.buttons.contains(&code) {
+                    return Ok(());
+                }
+                if *pressed && !self.buttons.contains(&code) && code <= 5 {
+                    let state = self.connection.query_pointer(self.root)?.reply()?;
+                    if u16::from(state.mask) & (1 << (code + 7)) != 0 {
+                        return Err(error("button already held by local input"));
+                    }
+                }
+                self.fake(
+                    if *pressed {
+                        xproto::BUTTON_PRESS_EVENT
+                    } else {
+                        xproto::BUTTON_RELEASE_EVENT
+                    },
+                    code,
+                    0,
+                    0,
+                )?;
+                if *pressed {
+                    self.buttons.insert(code);
+                } else {
+                    self.buttons.remove(&code);
+                }
+            }
+            InputEvent::Key { keysym, pressed } => self.key(*keysym, *pressed)?,
+            InputEvent::Text { text } => self.text(text, &cancelled)?,
+            InputEvent::Scroll {
+                delta_x,
+                delta_y,
+                x,
+                y,
+            } => {
+                if delta_x.unsigned_abs() > 100 || delta_y.unsigned_abs() > 100 {
+                    return Err(error("scroll exceeds 100 steps per axis"));
+                }
+                self.motion(*x, *y)?;
+                for (delta, negative, positive) in [(*delta_y, 4, 5), (*delta_x, 6, 7)] {
+                    for _ in 0..delta.unsigned_abs() {
+                        let button = if delta < 0 { negative } else { positive };
+                        self.fake(xproto::BUTTON_PRESS_EVENT, button, 0, 0)?;
+                        self.fake(xproto::BUTTON_RELEASE_EVENT, button, 0, 0)?;
+                    }
+                }
+            }
+            InputEvent::ReleaseAll => self.release_all()?,
+            InputEvent::DisplayAck => {}
+        }
+        self.connection.flush()?;
+        Ok(())
+    }
+    fn key(&mut self, keysym: u32, pressed: bool) -> Result<()> {
+        if !pressed {
+            if let Some(code) = self.keys.get(&keysym).copied() {
+                self.fake(xproto::KEY_RELEASE_EVENT, code, 0, 0)?;
+                self.keys.remove(&keysym);
+            }
+            return Ok(());
+        }
+        if self.keys.contains_key(&keysym) {
+            return Ok(());
+        }
+        let setup = self.connection.setup();
+        let map = self
+            .connection
+            .get_keyboard_mapping(setup.min_keycode, setup.max_keycode - setup.min_keycode + 1)?
+            .reply()?;
+        let state = self.connection.xkb_get_state(CORE_KEYBOARD)?.reply()?;
+        let group = usize::from(u8::from(state.group));
+        // Core mappings expose XKB group pairs. Preserve current physical/remote
+        // modifiers: shortcuts carry their own Shift/Control/Alt key events.
+        let code = map
+            .keysyms
+            .chunks(usize::from(map.keysyms_per_keycode))
+            .enumerate()
+            .find_map(|(index, syms)| {
+                let pair = if group * 2 < syms.len() { group * 2 } else { 0 };
+                syms[pair..syms.len().min(pair + 2)]
+                    .contains(&keysym)
+                    .then_some(setup.min_keycode + index as u8)
+            })
+            .ok_or_else(|| error("keysym unavailable in active XKB group"))?;
+        let down = self.connection.query_keymap()?.reply()?.keys;
+        if down[usize::from(code) / 8] & (1 << (code % 8)) != 0 {
+            return Err(error("key already held by local input"));
+        }
+        self.fake(xproto::KEY_PRESS_EVENT, code, 0, 0)?;
+        self.keys.insert(keysym, code);
+        Ok(())
+    }
+    fn text(&mut self, text: &str, cancelled: &impl Fn() -> bool) -> Result<()> {
+        if text.len() > remotevnc_protocol::TEXT_LIMIT {
+            return Err(error("text too large"));
+        }
+        let _serial = TEXT_TRANSACTION
+            .lock()
+            .map_err(|_| error("text transaction poisoned"))?;
+        let c = &self.connection;
+        let state = c.xkb_get_state(CORE_KEYBOARD)?.reply()?;
+        if u16::from(state.latched_mods) != 0 || state.latched_group != 0 || state.base_group != 0 {
+            return Err(error(
+                "text injection unsupported with latched modifiers or momentary group",
+            ));
+        }
+        let setup = c.setup();
+        let map = c
+            .get_keyboard_mapping(setup.min_keycode, setup.max_keycode - setup.min_keycode + 1)?
+            .reply()?;
+        let per = usize::from(map.keysyms_per_keycode);
+        let down = c.query_keymap()?.reply()?.keys;
+        let spare = map
+            .keysyms
+            .chunks(per)
+            .enumerate()
+            .rev()
+            .find(|(index, syms)| {
+                let code = usize::from(setup.min_keycode) + index;
+                syms.iter().all(|sym| *sym == 0) && down[code / 8] & (1 << (code % 8)) == 0
+            })
+            .map(|(i, syms)| (setup.min_keycode + i as u8, syms.to_vec()))
+            .ok_or_else(|| error("no unused X11 keycode for Unicode text"))?;
+        let modifiers = c.get_modifier_mapping()?.reply()?.keycodes;
+        let held: BTreeSet<u8> = modifiers
+            .into_iter()
+            .filter(|code| *code != 0 && down[usize::from(*code) / 8] & (1 << (*code % 8)) != 0)
+            .collect();
+        let operation = (|| -> Result<()> {
+            for code in &held {
+                self.fake(xproto::KEY_RELEASE_EVENT, *code, 0, 0)?;
+            }
+            c.xkb_latch_lock_state(
+                CORE_KEYBOARD,
+                ModMask::from(255u8),
+                ModMask::from(0u8),
+                true,
+                xkb::Group::M1,
+                ModMask::from(0u8),
+                false,
+                0,
+            )?
+            .check()?;
+            for ch in text.chars() {
+                if cancelled() {
+                    return Err(error("text transaction cancelled"));
+                }
+                let symbol = unicode_keysym(ch)?;
+                c.change_keyboard_mapping(1, spare.0, map.keysyms_per_keycode, &vec![symbol; per])?
+                    .check()?;
+                // X11 has no client-consumption acknowledgement. Give toolkit keymap
+                // invalidation a turn before sending, and delivery a turn before restore.
+                thread::sleep(Duration::from_millis(20));
+                self.fake(xproto::KEY_PRESS_EVENT, spare.0, 0, 0)?;
+                self.fake(xproto::KEY_RELEASE_EVENT, spare.0, 0, 0)?;
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(())
+        })();
+        // Cleanup is attempted in full even if one restoration request fails.
+        let key_release = self.fake(xproto::KEY_RELEASE_EVENT, spare.0, 0, 0);
+        let mapping_restore = (|| -> Result<()> {
+            c.change_keyboard_mapping(1, spare.0, map.keysyms_per_keycode, &spare.1)?
+                .check()?;
+            Ok(())
+        })();
+        let mut modifier_restore = Ok(());
+        for code in &held {
+            if let Err(e) = self.fake(xproto::KEY_PRESS_EVENT, *code, 0, 0) {
+                modifier_restore = Err(e);
+            }
+        }
+        let lock_restore = (|| -> Result<()> {
+            c.xkb_latch_lock_state(
+                CORE_KEYBOARD,
+                ModMask::from(255u8),
+                state.locked_mods,
+                true,
+                state.locked_group,
+                ModMask::from(0u8),
+                false,
+                0,
+            )?
+            .check()?;
+            Ok(())
+        })();
+        operation
+            .and(key_release)
+            .and(mapping_restore)
+            .and(modifier_restore)
+            .and(lock_restore)
+    }
+    pub fn release_all(&mut self) -> Result<()> {
+        let mut result = Ok(());
+        for code in self.keys.values().copied().collect::<Vec<_>>() {
+            if let Err(e) = self.fake(xproto::KEY_RELEASE_EVENT, code, 0, 0) {
+                result = Err(e);
+            }
+        }
+        for button in self.buttons.iter().copied().collect::<Vec<_>>() {
+            if let Err(e) = self.fake(xproto::BUTTON_RELEASE_EVENT, button, 0, 0) {
+                result = Err(e);
+            }
+        }
+        if result.is_ok() {
+            self.keys.clear();
+            self.buttons.clear();
+        }
+        result
+    }
+}
+impl Drop for X11Input {
+    fn drop(&mut self) {
+        let _ = self.release_all();
+    }
+}
