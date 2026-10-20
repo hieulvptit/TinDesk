@@ -43,10 +43,19 @@ pub(crate) struct Queued {
     source_token: Option<String>,
 }
 struct Subscription {
+    hub: Hub,
+    device: DeviceId,
     id: Uuid,
     output: mpsc::Receiver<Queued>,
     stop: watch::Receiver<bool>,
 }
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        // Upgrade failure/cancellation and normal loop exit share identity-scoped cleanup.
+        self.hub.remove(self.device, self.id);
+    }
+}
+
 impl Hub {
     pub(crate) fn enqueue(
         &self,
@@ -113,6 +122,8 @@ impl Hub {
             },
         );
         Ok(Subscription {
+            hub: self.clone(),
+            device: principal.device_id,
             id,
             output: rx,
             stop: cancel,
@@ -175,10 +186,7 @@ pub async fn events(
     let token = bearer(&headers)?.to_owned();
     let service = state.sessions;
     let _gate = authorization_gate().lock().await;
-    let principal = service
-        .db
-        .transaction(|tx| devices::principal(tx, &token))?;
-    let sub = service.hub.subscribe(&principal, query.role)?;
+    let (principal, sub) = service.prepare_connection(&token, query.role)?;
     let cleanup = service.hub.clone();
     let device = principal.device_id;
     let id = sub.id;
@@ -189,6 +197,29 @@ pub async fn events(
         .on_upgrade(move |socket| run(service, token, principal, query.role, sub, socket)))
 }
 impl SessionService {
+    // Caller holds authorization_gate across preparation/publication.
+    fn prepare_connection(
+        &self,
+        token: &str,
+        role: DeviceRole,
+    ) -> Result<(devices::DevicePrincipal, Subscription)> {
+        let principal = self.db.transaction(|tx| devices::principal(tx, token))?;
+        let sub = self.hub.subscribe(&principal, role)?;
+        // The shared gate prevents every live publisher from using this registration
+        // until its bounded initial queue has been completely built.
+        self.initial_events(token, principal.device_id)?;
+        Ok((principal, sub))
+    }
+    fn activate_connection(
+        &self,
+        token: &str,
+        principal: &devices::DevicePrincipal,
+        role: DeviceRole,
+    ) -> Result<()> {
+        self.db.transaction(|tx| devices::principal(tx, token))?;
+        self.hub.announce(principal, role, true)
+    }
+
     pub async fn presence_authenticated(&self, token: &str) -> Result<Vec<DevicePresence>> {
         let _gate = authorization_gate().lock().await;
         self.db.transaction(|tx| {
@@ -265,7 +296,7 @@ impl SessionService {
             } => self.installed(token, session_id, generation),
         }
     }
-    fn authorize_output(&self, token: &str, queued: &Queued) -> Result<Duration> {
+    fn authorize_output(&self, token: &str, queued: &mut Queued) -> Result<Duration> {
         self.db.transaction(|tx| {
             let principal = devices::principal(tx, token)?;
             let token_expiry: i64 = tx.query_row(
@@ -273,7 +304,7 @@ impl SessionService {
                 [crate::db::hash(token)],
                 |r| r.get(0),
             )?;
-            let session = match &queued.event {
+            let session = match &mut queued.event {
                 DeviceEvent::Presence { devices } => {
                     for peer in devices {
                         // Offline notifications may refer to a just-revoked device, still same owner.
@@ -292,7 +323,17 @@ impl SessionService {
                     None
                 }
                 DeviceEvent::SessionSnapshot { session_ids } => {
-                    for session in session_ids { authorized(tx,principal.device_id,*session)?; }
+                    // Reconcile against current authority even if the queued grant
+                    // expired or was revoked before the first socket write.
+                    let mut active = Vec::with_capacity(session_ids.len());
+                    for session in session_ids.drain(..) {
+                        match authorized(tx, principal.device_id, session) {
+                            Ok(_) => active.push(session),
+                            Err(Error::Invalid) => {},
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    *session_ids = active;
                     None
                 },
                 DeviceEvent::SessionClosed { session_id } => {
@@ -329,18 +370,46 @@ impl SessionService {
         })
     }
     /// The gate remains held through the bounded send, but never a database transaction.
-    async fn write<S>(&self, sink: &mut S, token: &str, queued: Queued) -> Result<()>
+    async fn write<S>(&self, sink: &mut S, token: &str, mut queued: Queued) -> Result<DeviceEvent>
     where
         S: Sink<Message> + Unpin,
     {
         let _gate = authorization_gate().lock().await;
-        let deadline = self.authorize_output(token, &queued)?;
+        let deadline = self.authorize_output(token, &mut queued)?;
         let bytes = encode_control(&queued.event).map_err(|_| Error::Invalid)?;
         let text = String::from_utf8(bytes).map_err(|_| Error::Internal)?;
         tokio::time::timeout(deadline, sink.send(Message::Text(text.into())))
             .await
             .map_err(|_| Error::Internal)?
-            .map_err(|_| Error::Internal)
+            .map_err(|_| Error::Internal)?;
+        Ok(queued.event)
+    }
+    fn check_known_session(&self, device: DeviceId, known: &mut Option<SessionId>) -> Result<()> {
+        if let Some(session) = *known
+            && self
+                .db
+                .transaction(|tx| authorized(tx, device, session))
+                .is_err()
+        {
+            self.hub.enqueue(
+                device,
+                DeviceEvent::SessionClosed {
+                    session_id: session,
+                },
+                None,
+                true,
+            )?;
+            *known = None;
+        }
+        Ok(())
+    }
+}
+fn remember_sent_session(event: &DeviceEvent, known: &mut Option<SessionId>) {
+    match event {
+        DeviceEvent::SessionSnapshot { session_ids } => *known = session_ids.first().copied(),
+        DeviceEvent::Session { grant } => *known = Some(grant.session_id),
+        DeviceEvent::SessionClosed { session_id } if *known == Some(*session_id) => *known = None,
+        _ => {}
     }
 }
 fn signal_session(message: &SignalMessage) -> SessionId {
@@ -392,9 +461,7 @@ async fn run(
     let (mut sink, mut stream) = socket.split();
     let setup = {
         let _gate = authorization_gate().lock().await;
-        service
-            .initial_events(&token, principal.device_id)
-            .and_then(|_| service.hub.announce(&principal, role, true))
+        service.activate_connection(&token, &principal, role)
     };
     let mut policy_close = setup.is_err();
     let mut known_session = None;
@@ -409,11 +476,7 @@ async fn run(
                 _ = heartbeat.tick() => {
                     let _gate = authorization_gate().lock().await;
                     if service.db.transaction(|tx| devices::principal(tx,&token)).is_err() { policy_close=true;break; }
-                    if let Some(session) = known_session
-                        && service.db.transaction(|tx|authorized(tx,principal.device_id,session)).is_err() {
-                        if service.hub.enqueue(principal.device_id,DeviceEvent::SessionClosed {session_id:session},None,true).is_err() { break; }
-                        known_session=None;
-                    }
+                    if service.check_known_session(principal.device_id,&mut known_session).is_err() {break;}
                 }
                 message = stream.next() => {
                     let Some(Ok(message)) = message else { break; };
@@ -432,13 +495,8 @@ async fn run(
                 }
                 queued = sub.output.recv() => {
                     let Some(queued) = queued else { break; };
-                    let session = match &queued.event {
-                        DeviceEvent::Session {grant} => Some(Some(grant.session_id)),
-                        DeviceEvent::SessionClosed {..} => Some(None),
-                        _ => None,
-                    };
                     match service.write(&mut sink,&token,queued).await {
-                        Ok(()) => {if let Some(session)=session {known_session=session;}},
+                        Ok(event) => remember_sent_session(&event,&mut known_session),
                         Err(Error::Invalid) => {
                             // A queued session payload can become unauthorized before delivery.
                             // Discard it; heartbeat emits SessionClosed to a still-authorized peer.
@@ -514,8 +572,13 @@ mod tests {
             self.poll_flush(cx)
         }
     }
-    #[tokio::test]
-    async fn revoke_waits_for_inflight_write_and_rechecks_already_queued_payload() {
+    fn fixture() -> (
+        tempfile::TempDir,
+        rusqlite::Connection,
+        devices::DeviceService,
+        SessionService,
+        [DeviceId; 2],
+    ) {
         let dir = tempfile::tempdir().unwrap();
         #[cfg(unix)]
         {
@@ -553,6 +616,11 @@ mod tests {
         .unwrap();
         let devices = crate::devices::DeviceService::new(config, db.clone());
         let service = SessionService::new(db, crate::turn::TurnClient::unavailable());
+        (dir, sql, devices, service, ids)
+    }
+    #[tokio::test]
+    async fn revoke_waits_for_inflight_write_and_rechecks_already_queued_payload() {
+        let (_dir, sql, devices, service, ids) = fixture();
         let grant = service
             .create_authenticated("token-0", ids[1])
             .await
@@ -663,5 +731,283 @@ mod tests {
             }
         }
         assert!(hub.require_connected(principal.device_id).is_err());
+    }
+
+    #[derive(Default)]
+    struct RecordingSink(Vec<Message>);
+    impl Sink<Message> for RecordingSink {
+        type Error = ();
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn start_send(mut self: Pin<&mut Self>, message: Message) -> std::result::Result<(), ()> {
+            self.0.push(message);
+            Ok(())
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_callback_delay_preserves_snapshot_order_and_one_pending_configuration() {
+        let (_dir, _sql, _devices, initial, ids) = fixture();
+        let grant = initial
+            .create_authenticated("token-0", ids[1])
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/turn", listener.local_addr().unwrap());
+        let provider = tokio::spawn(async move {
+            axum::serve(listener,axum::Router::new().route("/turn",axum::routing::post(||async {
+                (axum::http::StatusCode::CREATED,axum::Json(serde_json::json!({"iceServers":[{"urls":["turn:turn.cloudflare.com:3478?transport=udp"],"username":"fixture","credential":"fixture"}]})))
+            }))).await.unwrap();
+        });
+        let service = SessionService::new(
+            initial.db.clone(),
+            crate::turn::TurnClient::new(&endpoint, "fixture-token".into()).unwrap(),
+        );
+        let (_agent, _agent_sub, client, mut client_sub) = {
+            let _gate = authorization_gate().lock().await;
+            let (agent, agent_sub) = service
+                .prepare_connection("token-1", DeviceRole::Agent)
+                .unwrap();
+            service
+                .activate_connection("token-1", &agent, DeviceRole::Agent)
+                .unwrap();
+            let (client, client_sub) = service
+                .prepare_connection("token-0", DeviceRole::Client)
+                .unwrap();
+            (agent, agent_sub, client, client_sub)
+        };
+        // Deliberately withhold the upgrade callback while real publishers complete.
+        service
+            .refresh_turn_authenticated("token-1", grant.session_id)
+            .await
+            .unwrap();
+        service
+            .renew_authenticated("token-1", grant.session_id)
+            .await
+            .unwrap();
+        {
+            let _gate = authorization_gate().lock().await;
+            service
+                .handle(
+                    "token-1",
+                    DeviceCommand::Signal {
+                        receiver: ids[0],
+                        message: SignalMessage::Offer {
+                            session_id: grant.session_id,
+                            epoch: 1,
+                            sdp: "during-upgrade".into(),
+                        },
+                    },
+                )
+                .unwrap();
+            service
+                .activate_connection("token-0", &client, DeviceRole::Client)
+                .unwrap();
+        }
+        let mut events = Vec::new();
+        while let Ok(queued) = client_sub.output.try_recv() {
+            events.push(queued.event);
+        }
+        let configurations = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    DeviceEvent::IceConfiguration {
+                        requires_ack: true,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            configurations, 1,
+            "one installation must never provoke a duplicate ACK"
+        );
+        let snapshot = events
+            .iter()
+            .position(|event| matches!(event, DeviceEvent::SessionSnapshot { .. }))
+            .unwrap();
+        assert!(
+            events[..snapshot]
+                .iter()
+                .all(|event| matches!(event, DeviceEvent::Presence { .. })),
+            "snapshot must precede all live session/config/signal events"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, DeviceEvent::Signal { .. }))
+        );
+        let _gate = authorization_gate().lock().await;
+        service
+            .handle(
+                "token-0",
+                DeviceCommand::IceInstalled {
+                    session_id: grant.session_id,
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        service
+            .handle(
+                "token-1",
+                DeviceCommand::IceInstalled {
+                    session_id: grant.session_id,
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        provider.abort();
+    }
+
+    async fn queued_snapshot_reconciles(invalidate_by_revoke: bool) {
+        let (_dir, sql, devices, service, ids) = fixture();
+        let grant = service
+            .create_authenticated("token-0", ids[1])
+            .await
+            .unwrap();
+        let mut sub = {
+            let _gate = authorization_gate().lock().await;
+            let (principal, sub) = service
+                .prepare_connection("token-0", DeviceRole::Client)
+                .unwrap();
+            service
+                .activate_connection("token-0", &principal, DeviceRole::Client)
+                .unwrap();
+            sub
+        };
+        let snapshot = loop {
+            let queued = sub.output.try_recv().unwrap();
+            if let DeviceEvent::SessionSnapshot { session_ids } = &queued.event {
+                assert_eq!(session_ids, &vec![grant.session_id]);
+                break queued;
+            }
+        };
+        if invalidate_by_revoke {
+            devices.revoke("token-0", ids[1]).await.unwrap();
+        } else {
+            let _gate = authorization_gate().lock().await;
+            sql.execute("UPDATE sessions SET lease_expires_at=0", [])
+                .unwrap();
+        }
+        let mut sink = RecordingSink::default();
+        service.write(&mut sink,"token-0",snapshot).await.expect("a surviving peer must receive reconciliation even when its queued grant became invalid");
+        assert_eq!(sink.0.len(), 1);
+        match &sink.0[0] {
+            Message::Text(text) => match decode_control::<DeviceEvent>(text.as_bytes()).unwrap() {
+                DeviceEvent::SessionSnapshot { session_ids } => assert!(session_ids.is_empty()),
+                _ => panic!("expected authoritative snapshot"),
+            },
+            _ => panic!("expected control text"),
+        }
+    }
+    #[tokio::test]
+    async fn queued_snapshot_then_revoke_delivers_empty_reconciliation() {
+        queued_snapshot_reconciles(true).await;
+    }
+    #[tokio::test]
+    async fn queued_snapshot_then_expiry_delivers_empty_reconciliation() {
+        queued_snapshot_reconciles(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_upgrade_removes_registration_and_old_cleanup_preserves_replacement() {
+        let (_dir, _sql, _devices, service, _ids) = fixture();
+        let _gate = authorization_gate().lock().await;
+        let (principal, sub) = service
+            .prepare_connection("token-0", DeviceRole::Client)
+            .unwrap();
+        drop(sub); // The HTTP/upgrade task can be cancelled before its callback starts.
+        assert!(service.hub.require_connected(principal.device_id).is_err());
+        let (_, old) = service
+            .prepare_connection("token-0", DeviceRole::Client)
+            .unwrap();
+        service.hub.remove(principal.device_id, old.id);
+        let (_, replacement) = service
+            .prepare_connection("token-0", DeviceRole::Client)
+            .unwrap();
+        drop(old);
+        assert!(service.hub.require_connected(principal.device_id).is_ok());
+        drop(replacement);
+        assert!(service.hub.require_connected(principal.device_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn revoke_after_snapshot_before_grant_still_emits_session_closed() {
+        let (_dir, _sql, devices, service, ids) = fixture();
+        let grant = service
+            .create_authenticated("token-0", ids[1])
+            .await
+            .unwrap();
+        let mut sub = {
+            let _gate = authorization_gate().lock().await;
+            let (principal, sub) = service
+                .prepare_connection("token-0", DeviceRole::Client)
+                .unwrap();
+            service
+                .activate_connection("token-0", &principal, DeviceRole::Client)
+                .unwrap();
+            sub
+        };
+        let mut snapshot = None;
+        let mut queued_grant = None;
+        while let Ok(queued) = sub.output.try_recv() {
+            match queued.event {
+                DeviceEvent::SessionSnapshot { .. } => snapshot = Some(queued),
+                DeviceEvent::Session { .. } => queued_grant = Some(queued),
+                _ => {}
+            }
+        }
+        let mut sink = RecordingSink::default();
+        let sent = service
+            .write(&mut sink, "token-0", snapshot.unwrap())
+            .await
+            .unwrap();
+        let mut known = None;
+        remember_sent_session(&sent, &mut known);
+        assert_eq!(known, Some(grant.session_id));
+        devices.revoke("token-0", ids[1]).await.unwrap();
+        assert!(
+            service
+                .write(&mut sink, "token-0", queued_grant.unwrap())
+                .await
+                .is_err()
+        );
+        {
+            let _gate = authorization_gate().lock().await;
+            service.check_known_session(ids[0], &mut known).unwrap();
+        }
+        let closed = sub.output.try_recv().unwrap();
+        let sent = service.write(&mut sink, "token-0", closed).await.unwrap();
+        assert!(
+            matches!(sent,DeviceEvent::SessionClosed {session_id} if session_id==grant.session_id)
+        );
+        remember_sent_session(&sent, &mut known);
+        assert!(known.is_none());
+        let replacement = SessionId(Uuid::new_v4());
+        known = Some(replacement);
+        remember_sent_session(&sent, &mut known);
+        assert_eq!(
+            known,
+            Some(replacement),
+            "an old close cannot erase a newer observed session"
+        );
     }
 }
