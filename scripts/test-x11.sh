@@ -30,6 +30,7 @@ export REMOTEVNC_XVFB_PID="$xvfb_pid"
 cargo test -p remotevnc-seat-helper --test seat live_probe -- --ignored --test-threads=1
 cargo test -p remotevnc-seat-helper --test input cancelled_long_text -- --ignored --test-threads=1
 cargo test -p remotevnc-seat-helper --test input remote_cleanup -- --ignored --test-threads=1
+cargo test -p remotevnc-seat-helper --test ipc stalled_discovery -- --ignored --test-threads=1
 cargo test -p remotevnc-seat-helper --test input x11_releases -- --ignored --test-threads=1
 python3 - <<'PY' &
 import gi, os

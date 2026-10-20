@@ -1,6 +1,10 @@
-use crate::{Result, error};
+use crate::{Result, error, input::X11Input, seat::DisplayTarget};
 use remotevnc_protocol::*;
-use std::io::Write;
+use std::{
+    io::{ErrorKind, Read, Write},
+    os::{fd::AsRawFd, unix::net::UnixStream},
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 pub fn authorize_uid(actual: u32, allowed: u32) -> Result<()> {
     if actual != allowed {
@@ -109,4 +113,158 @@ pub fn peer_uid(peer: &std::os::unix::net::UnixStream) -> Result<u32> {
 #[cfg(not(target_os = "linux"))]
 pub fn peer_uid(_peer: &std::os::unix::net::UnixStream) -> Result<u32> {
     Err("helper service requires Linux SO_PEERCRED".into())
+}
+
+fn disconnected(peer: &UnixStream) -> bool {
+    let mut byte = 0u8;
+    unsafe {
+        libc::recv(
+            peer.as_raw_fd(),
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        ) == 0
+    }
+}
+fn info(target: &DisplayTarget, generation: u64) -> DisplayInfo {
+    DisplayInfo {
+        generation,
+        width: target.width,
+        height: target.height,
+    }
+}
+/// Serve one already-authorized peer. Discovery must honor cancellation while
+/// waiting; the clock supplies monotonic milliseconds for the local lease.
+/// The listener configures bounded read/write timeouts before entering this loop.
+pub fn serve(
+    peer: &mut UnixStream,
+    monitor: &mut impl FnMut(&dyn Fn() -> bool) -> Result<Option<DisplayTarget>>,
+    generation: &mut u64,
+    now_ms: impl Fn() -> u64,
+    stop: &AtomicBool,
+) -> Result<()> {
+    send_event(peer, &HelperEvent::Ready)?;
+    let mut target = None;
+    let mut input: Option<X11Input> = None;
+    let mut policy = SessionPolicy::default();
+    let mut frames = FrameDecoder::default();
+    loop {
+        // Cancellation is checked before discovery and while loginctl is waiting.
+        let cancelled =
+            || stop.load(Ordering::Relaxed) || policy.expired(now_ms()) || disconnected(peer);
+        if cancelled() {
+            input.take();
+            if let Some(session_id) = policy.stop() {
+                send_event(peer, &HelperEvent::Stopped { session_id })?;
+            }
+            return Ok(());
+        }
+        let current = monitor(&cancelled).unwrap_or(None);
+        // Sample after discovery: its result never extends a control lease.
+        let now = now_ms();
+        if stop.load(Ordering::Relaxed) || policy.expired(now) || disconnected(peer) {
+            input.take();
+            if let Some(session_id) = policy.stop() {
+                send_event(peer, &HelperEvent::Stopped { session_id })?;
+            }
+            return Ok(());
+        }
+        if current != target {
+            input.take();
+            if let Some(session_id) = policy.stop() {
+                send_event(peer, &HelperEvent::Stopped { session_id })?;
+            }
+            *generation = generation.checked_add(1).ok_or("generation overflow")?;
+            target = current;
+            if let Some(t) = &target {
+                send_event(peer, &HelperEvent::DisplayChanged(info(t, *generation)))?;
+            } else {
+                send_event(
+                    peer,
+                    &HelperEvent::DisplayUnavailable {
+                        generation: *generation,
+                    },
+                )?;
+            }
+        }
+        let mut bytes = [0u8; 4096];
+        let count = match peer.read(&mut bytes) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        for frame in frames.push(&bytes[..count])? {
+            let request: HelperRequest = decode_control(&frame)?;
+            let now = now_ms();
+            let result = (|| -> Result<()> {
+                match request {
+                    HelperRequest::Start {
+                        session_id,
+                        display,
+                    } => {
+                        let t = target.as_ref().ok_or("no physical display")?;
+                        if display != info(t, *generation) {
+                            return Err("Start display must match current helper display".into());
+                        }
+                        policy.start(session_id, display, now)?;
+                        input = Some(X11Input::connect(t)?);
+                    }
+                    HelperRequest::Input(event) => {
+                        policy.accept(&event, now)?;
+                        input
+                            .as_mut()
+                            .ok_or("no active X11 input")?
+                            .apply_with_cancel(&event.event, || {
+                                stop.load(Ordering::Relaxed)
+                                    || policy.expired(now_ms())
+                                    || disconnected(peer)
+                            })?;
+                    }
+                    HelperRequest::RenewLease {
+                        session_id,
+                        generation,
+                    } => {
+                        policy.renew(session_id, generation, now)?;
+                    }
+                    HelperRequest::ReleaseAll {
+                        session_id,
+                        generation,
+                    } => {
+                        policy.validate(session_id, generation, now)?;
+                        input.as_mut().ok_or("no input")?.release_all()?;
+                    }
+                    HelperRequest::Stop {
+                        session_id,
+                        generation,
+                    } => {
+                        policy.validate(session_id, generation, now)?;
+                        input.take();
+                        policy.stop();
+                        send_event(peer, &HelperEvent::Stopped { session_id })?;
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                // Errors describe supported operations; submitted text is never formatted.
+                send_event(
+                    peer,
+                    &HelperEvent::Error {
+                        message: format!(
+                            "helper request rejected: {error}; control session stopped"
+                        ),
+                    },
+                )?;
+                return Err("helper request rejected".into());
+            }
+        }
+    }
 }

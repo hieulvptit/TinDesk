@@ -138,3 +138,173 @@ fn helper_rejects_oversize_frame_and_removes_socket_on_sigterm() {
     );
     fs::remove_dir(dir).unwrap();
 }
+
+#[test]
+#[ignore = "requires scripts/test-x11.sh Xvfb fixture"]
+fn stalled_discovery_cannot_delay_responsive_input_cleanup() {
+    use remotevnc_seat_helper::{
+        ipc::serve,
+        seat::{DisplayTarget, ServerIdentity, command_output},
+        x11,
+    };
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        process::Command,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            mpsc,
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+    use x11rb::{connection::Connection, protocol::xproto::ConnectionExt};
+    fn receive(peer: &mut UnixStream) -> HelperEvent {
+        let mut header = [0; 4];
+        peer.read_exact(&mut header).unwrap();
+        let mut data = vec![0; u32::from_be_bytes(header) as usize];
+        peer.read_exact(&mut data).unwrap();
+        decode_control(&data).unwrap()
+    }
+    for reason in ["lease", "disconnect", "signal"] {
+        let t = DisplayTarget {
+            seat: "test-only".into(),
+            display: std::env::var("DISPLAY").unwrap(),
+            authority: std::env::var_os("XAUTHORITY").unwrap().into(),
+            identity: ServerIdentity {
+                process_start: "fixture".into(),
+                socket_inode: 0,
+                authority_inode: 0,
+                authority_modified_ns: 0,
+                connection_epoch: 0,
+            },
+            width: 800,
+            height: 600,
+        };
+        let c = x11::connect(&t).unwrap();
+        let root = c.setup().roots[0].root;
+        let (mut client, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        peer.set_write_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let now = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_now = now.clone();
+        let thread_stop = stop.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut first = true;
+            let mut discovery = |cancelled: &dyn Fn() -> bool| {
+                if first {
+                    first = false;
+                    return Ok(Some(t.clone()));
+                }
+                started_tx.send(()).unwrap();
+                command_output(
+                    Command::new("/bin/sleep").arg("5"),
+                    Duration::from_secs(5),
+                    cancelled,
+                )?;
+                Ok(Some(t.clone()))
+            };
+            serve(
+                &mut peer,
+                &mut discovery,
+                &mut 0,
+                || thread_now.load(Ordering::Relaxed),
+                &thread_stop,
+            )
+        });
+        assert!(matches!(receive(&mut client), HelperEvent::Ready));
+        let display = match receive(&mut client) {
+            HelperEvent::DisplayChanged(d) => d,
+            _ => panic!("expected display"),
+        };
+        let id = SessionId(Uuid::new_v4());
+        // Coalesce Start + held inputs so discovery starts only after they are owned.
+        let mut frames = Vec::new();
+        for request in [
+            HelperRequest::Start {
+                session_id: id,
+                display,
+            },
+            HelperRequest::Input(InputEnvelope {
+                version: WIRE_VERSION,
+                session_id: id,
+                generation: display.generation,
+                sequence: 1,
+                event: InputEvent::Key {
+                    keysym: 0xffe1,
+                    pressed: true,
+                },
+            }),
+            HelperRequest::Input(InputEnvelope {
+                version: WIRE_VERSION,
+                session_id: id,
+                generation: display.generation,
+                sequence: 2,
+                event: InputEvent::Button {
+                    button: MouseButton::Left,
+                    pressed: true,
+                    x: 1,
+                    y: 1,
+                },
+            }),
+        ] {
+            let bytes = encode_control(&request).unwrap();
+            frames.extend((bytes.len() as u32).to_be_bytes());
+            frames.extend(bytes);
+        }
+        client.write_all(&frames).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_ne!(
+            u16::from(c.query_pointer(root).unwrap().reply().unwrap().mask) & 0x100,
+            0
+        );
+        assert!(
+            c.query_keymap()
+                .unwrap()
+                .reply()
+                .unwrap()
+                .keys
+                .iter()
+                .any(|k| *k != 0)
+        );
+        let began_cleanup = Instant::now();
+        match reason {
+            "lease" => now.store(LEASE_DURATION_MS, Ordering::Relaxed),
+            "signal" => stop.store(true, Ordering::Relaxed),
+            "disconnect" => {
+                client.shutdown(std::net::Shutdown::Both).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        while !worker.is_finished() {
+            assert!(
+                began_cleanup.elapsed() < Duration::from_secs(1),
+                "{reason} waited for stalled discovery"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let _ = worker.join().unwrap(); // disconnected peer may make Stopped notification fail.
+        assert!(
+            c.query_keymap()
+                .unwrap()
+                .reply()
+                .unwrap()
+                .keys
+                .iter()
+                .all(|k| *k == 0)
+        );
+        assert_eq!(
+            u16::from(c.query_pointer(root).unwrap().reply().unwrap().mask) & 0x100,
+            0,
+            "{reason} left button held"
+        );
+    }
+}

@@ -2,9 +2,17 @@
 #[cfg(target_os = "linux")]
 use crate::x11;
 use crate::{Result, error};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    io::Read,
+    os::fd::AsRawFd,
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 #[cfg(target_os = "linux")]
-use std::{fs, os::unix::fs::MetadataExt, process::Command};
+use std::{fs, os::unix::fs::MetadataExt};
 
 #[derive(Default)]
 pub struct SessionProperties(BTreeMap<String, String>);
@@ -64,39 +72,125 @@ pub struct SeatMonitor {
     #[cfg(target_os = "linux")]
     probe: x11::ServerProbe,
 }
-#[cfg(target_os = "linux")]
-fn loginctl(args: &[&str]) -> Result<String> {
-    let out = Command::new("/usr/bin/loginctl").args(args).output()?;
-    if !out.status.success() {
-        return Err(error("logind query failed"));
+/// Execute a trusted discovery query with bounded output and cancellable waiting.
+/// Production callers use fixed loginctl arguments, never IPC-provided commands.
+pub fn command_output(
+    command: &mut Command,
+    timeout: Duration,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<String> {
+    if cancelled() {
+        return Err(error("seat discovery cancelled"));
     }
-    Ok(String::from_utf8(out.stdout)?)
+    struct QueryChild(Child);
+    impl Drop for QueryChild {
+        fn drop(&mut self) {
+            // Reap even when parsing, timeout or cancellation fails.
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = QueryChild(
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let mut stdout = child
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| error("missing discovery output"))?;
+    let fd = stdout.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let started = Instant::now();
+    let mut output = Vec::new();
+    const LIMIT: usize = 64 * 1024;
+    loop {
+        if cancelled() {
+            return Err(error("seat discovery cancelled"));
+        }
+        if started.elapsed() >= timeout {
+            return Err(error("seat discovery timed out"));
+        }
+        let status = child.0.try_wait()?;
+        // Nonblocking reads also avoid waiting for descendants inheriting stdout.
+        match stdout
+            .by_ref()
+            .take((LIMIT + 1 - output.len()) as u64)
+            .read_to_end(&mut output)
+        {
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(e) => return Err(e.into()),
+        }
+        if output.len() > LIMIT {
+            return Err(error("seat discovery output exceeds limit"));
+        }
+        if let Some(status) = status {
+            if !status.success() {
+                return Err(error("logind query failed"));
+            }
+            return Ok(String::from_utf8(output)?);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+#[cfg(target_os = "linux")]
+fn loginctl(args: &[&str], cancelled: &dyn Fn() -> bool) -> Result<String> {
+    command_output(
+        Command::new("/usr/bin/loginctl").args(args),
+        Duration::from_secs(1),
+        cancelled,
+    )
 }
 impl SeatMonitor {
     pub fn current(&mut self) -> Result<Option<DisplayTarget>> {
+        self.current_with_cancel(&|| false)
+    }
+    pub fn current_with_cancel(
+        &mut self,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<DisplayTarget>> {
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = cancelled;
             Err(error("physical seat discovery requires Linux/logind"))
         }
         #[cfg(target_os = "linux")]
-        self.current_linux()
+        self.current_linux(cancelled)
     }
     #[cfg(target_os = "linux")]
-    fn current_linux(&mut self) -> Result<Option<DisplayTarget>> {
-        let session = loginctl(&["show-seat", "seat0", "-p", "ActiveSession", "--value"])?;
+    fn current_linux(&mut self, cancelled: &dyn Fn() -> bool) -> Result<Option<DisplayTarget>> {
+        let session = loginctl(
+            &["show-seat", "seat0", "-p", "ActiveSession", "--value"],
+            cancelled,
+        )?;
         let session = session.trim();
         if session.is_empty() {
             self.probe.invalidate();
             return Ok(None);
         }
         // Session IDs come from logind and are separate arguments, never shell fragments.
-        let props = SessionProperties::parse(&loginctl(&["show-session", session])?);
+        let props = SessionProperties::parse(&loginctl(&["show-session", session], cancelled)?);
         if !physical_session(&props) {
             self.probe.invalidate();
             return Ok(None);
         }
         let mut found = None;
         for entry in fs::read_dir("/proc")? {
+            if cancelled() {
+                return Err(error("seat discovery cancelled"));
+            }
             let entry = entry?;
             if !entry
                 .file_name()
@@ -190,6 +284,9 @@ impl SeatMonitor {
             self.probe.invalidate();
             return Ok(None);
         };
+        if cancelled() {
+            return Err(error("seat discovery cancelled"));
+        }
         let (epoch, width, height) = self.probe.refresh(&target)?;
         target.identity.connection_epoch = epoch;
         target.width = width;

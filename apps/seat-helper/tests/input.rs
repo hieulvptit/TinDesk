@@ -277,3 +277,91 @@ fn remote_cleanup_does_not_release_unowned_local_input() {
         .check()
         .unwrap();
 }
+
+#[test]
+#[ignore = "requires scripts/test-x11.sh Xvfb fixture"]
+fn remote_cleanup_preserves_local_back_and_forward_buttons() {
+    use remotevnc_protocol::{InputEvent, MouseButton};
+    use remotevnc_seat_helper::{input::X11Input, x11};
+    use x11rb::{
+        connection::Connection,
+        protocol::{xinput::ConnectionExt as _, xproto, xtest::ConnectionExt as _},
+    };
+    let t = target();
+    let c = x11::connect(&t).unwrap();
+    c.xinput_xi_query_version(2, 0).unwrap().reply().unwrap();
+    let root = c.setup().roots[0].root;
+    let pointer = c
+        .xinput_xi_query_device(x11rb::protocol::xinput::Device::ALL_MASTER)
+        .unwrap()
+        .reply()
+        .unwrap()
+        .infos
+        .into_iter()
+        .find(|device| device.type_ == x11rb::protocol::xinput::DeviceType::MASTER_POINTER)
+        .unwrap()
+        .deviceid;
+    for (button, code) in [(MouseButton::Back, 8u8), (MouseButton::Forward, 9u8)] {
+        c.xtest_fake_input(xproto::BUTTON_PRESS_EVENT, code, 0, root, 0, 0, 0)
+            .unwrap()
+            .check()
+            .unwrap();
+        let mut input = X11Input::connect(&t).unwrap();
+        input
+            .apply(&InputEvent::Button {
+                button,
+                pressed: false,
+                x: 1,
+                y: 1,
+            })
+            .unwrap();
+        let result = input.apply(&InputEvent::Button {
+            button,
+            pressed: true,
+            x: 1,
+            y: 1,
+        });
+        input.release_all().unwrap();
+        drop(input);
+        let after = c
+            .xinput_xi_query_pointer(root, pointer)
+            .unwrap()
+            .reply()
+            .unwrap();
+        c.xtest_fake_input(xproto::BUTTON_RELEASE_EVENT, code, 0, root, 0, 0, 0)
+            .unwrap()
+            .check()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "remote must reject locally held button {code}"
+        );
+        assert_ne!(
+            after.buttons[0] & (1 << code),
+            0,
+            "cleanup released local button {code}"
+        );
+    }
+    // Back/Forward remain supported when the helper can acquire ownership.
+    for button in [MouseButton::Back, MouseButton::Forward] {
+        let mut input = X11Input::connect(&t).unwrap();
+        input
+            .apply(&InputEvent::Button {
+                button,
+                pressed: true,
+                x: 1,
+                y: 1,
+            })
+            .unwrap();
+        input.release_all().unwrap();
+        assert_eq!(
+            c.xinput_xi_query_pointer(root, pointer)
+                .unwrap()
+                .reply()
+                .unwrap()
+                .buttons[0]
+                & ((1 << 8) | (1 << 9)),
+            0
+        );
+    }
+}

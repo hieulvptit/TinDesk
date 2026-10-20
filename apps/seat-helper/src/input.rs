@@ -10,6 +10,7 @@ use std::{
 use x11rb::{
     connection::Connection,
     protocol::{
+        xinput::{ConnectionExt as _, Device, DeviceType},
         xkb::{self, ConnectionExt as _},
         xproto::{self, ConnectionExt as _, ModMask},
         xtest::ConnectionExt as _,
@@ -31,6 +32,7 @@ pub fn unicode_keysym(ch: char) -> Result<u32> {
 pub struct X11Input {
     connection: RustConnection,
     root: u32,
+    pointer_device: u16,
     width: u32,
     height: u32,
     keys: BTreeMap<u32, u8>,
@@ -43,11 +45,34 @@ impl X11Input {
         if !connection.xkb_use_extension(1, 0)?.reply()?.supported {
             return Err(error("XKB unsupported"));
         }
+        if connection
+            .xinput_xi_query_version(2, 0)?
+            .reply()?
+            .major_version
+            < 2
+        {
+            return Err(error("XI2 required for safe mouse button ownership"));
+        }
+        let devices = connection
+            .xinput_xi_query_device(Device::ALL_MASTER)?
+            .reply()?;
+        let mut pointers = devices
+            .infos
+            .iter()
+            .filter(|device| device.type_ == DeviceType::MASTER_POINTER);
+        let pointer_device = pointers
+            .next()
+            .ok_or_else(|| error("no XI2 master pointer"))?
+            .deviceid;
+        if pointers.next().is_some() {
+            return Err(error("multiple XI2 master pointers are unsupported"));
+        }
         let root = connection.setup().roots[0].root;
         let geometry = connection.get_geometry(root)?.reply()?;
         Ok(Self {
             connection,
             root,
+            pointer_device,
             width: geometry.width.into(),
             height: geometry.height.into(),
             keys: BTreeMap::new(),
@@ -101,9 +126,18 @@ impl X11Input {
                 if !pressed && !self.buttons.contains(&code) {
                     return Ok(());
                 }
-                if *pressed && !self.buttons.contains(&code) && code <= 5 {
-                    let state = self.connection.query_pointer(self.root)?.reply()?;
-                    if u16::from(state.mask) & (1 << (code + 7)) != 0 {
+                if *pressed && !self.buttons.contains(&code) {
+                    // Core QueryPointer exposes only buttons1..5. XI2 also covers
+                    // Back/Forward, so no supported button can be claimed locally-held.
+                    let state = self
+                        .connection
+                        .xinput_xi_query_pointer(self.root, self.pointer_device)?
+                        .reply()?;
+                    let word = state
+                        .buttons
+                        .get(usize::from(code) / 32)
+                        .ok_or_else(|| error("mouse button state unavailable"))?;
+                    if word & (1 << (code % 32)) != 0 {
                         return Err(error("button already held by local input"));
                     }
                 }

@@ -70,3 +70,41 @@ fn live_probe_changes_epoch_on_same_pid_server_reset() {
         "same process and display must get new identity after reset"
     );
 }
+
+#[test]
+fn stalled_discovery_subprocess_is_bounded_and_cancellable() {
+    use remotevnc_seat_helper::seat::command_output;
+    use std::{
+        process::Command,
+        time::{Duration, Instant},
+    };
+    let started = Instant::now();
+    assert!(
+        command_output(
+            Command::new("/bin/sleep").arg("5"),
+            Duration::from_millis(40),
+            &|| false
+        )
+        .is_err()
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let started = Instant::now();
+    assert!(
+        command_output(
+            Command::new("/bin/sleep").arg("5"),
+            Duration::from_secs(5),
+            &|| started.elapsed() >= Duration::from_millis(40)
+        )
+        .is_err()
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(
+        command_output(
+            Command::new("/bin/echo").arg("seat0"),
+            Duration::from_secs(1),
+            &|| false
+        )
+        .unwrap(),
+        "seat0\n"
+    );
+}
