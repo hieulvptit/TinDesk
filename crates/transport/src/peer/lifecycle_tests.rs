@@ -183,3 +183,53 @@ fn lifecycle_end_validated_before_restart_cannot_close_the_new_epoch() {
     assert_eq!(result, Err(TransportError::StaleEpoch));
     assert!(replacement_open && replacement_playing);
 }
+
+#[test]
+fn install_ice_waits_for_coordinated_restart_without_renewing_lease() {
+    let peer = peer();
+    let original = peer.shared.engine().unwrap();
+    let renewed = peer.shared.input.lock().unwrap().last_renewed_ms();
+    let ice = vec![IceServer {
+        urls: vec!["stun:127.0.0.1:3478".into()],
+        username: None,
+        credential: None,
+        expires_at_unix_secs: None,
+    }];
+    peer.install_ice(ice.clone()).unwrap();
+    assert!(Arc::ptr_eq(&original, &peer.shared.engine().unwrap()));
+    assert_eq!(peer.epoch(), 0);
+    assert_eq!(peer.shared.input.lock().unwrap().last_renewed_ms(), renewed);
+    assert_eq!(
+        original.webrtc.property::<Option<String>>("stun-server"),
+        None
+    );
+    assert!(!peer.shared.events_drain.try_iter().any(|event| matches!(
+        event,
+        PeerEvent::Signal(SignalMessage::Restart { .. }) | PeerEvent::InputReset { .. }
+    )));
+    let mut invalid = ice.clone();
+    invalid[0].expires_at_unix_secs = Some(0);
+    assert_eq!(peer.install_ice(invalid), Err(TransportError::InvalidIce));
+    assert_eq!(peer.shared.config.lock().unwrap().ice_servers, ice);
+    // The controller's received Restart must consume its previously installed
+    // configuration; installing alone must never initiate a competing rebuild.
+    let session_id = peer.shared.config.lock().unwrap().session_id;
+    peer.handle_signal(SignalMessage::Restart {
+        session_id,
+        epoch: 1,
+    })
+    .unwrap();
+    assert_eq!(peer.epoch(), 1);
+    assert!(!Arc::ptr_eq(&original, &peer.shared.engine().unwrap()));
+    assert_eq!(
+        peer.shared
+            .engine()
+            .unwrap()
+            .webrtc
+            .property::<Option<String>>("stun-server"),
+        Some("stun://127.0.0.1:3478".into())
+    );
+    assert_eq!(peer.shared.input.lock().unwrap().last_renewed_ms(), renewed);
+    peer.close();
+    assert_eq!(peer.install_ice(vec![]), Err(TransportError::Closed));
+}

@@ -48,14 +48,26 @@ pub fn send_event(writer: &mut impl Write, event: &HelperEvent) -> Result<()> {
 pub struct SessionPolicy {
     session: Option<(SessionId, u64, InputGuard)>,
     acknowledged: bool,
+    deadline_ms: Option<u64>,
 }
 impl SessionPolicy {
     pub fn start(&mut self, id: SessionId, display: DisplayInfo, now: u64) -> Result<()> {
+        self.start_until(id, display, now, now.saturating_add(LEASE_DURATION_MS))
+    }
+    pub fn start_until(
+        &mut self,
+        id: SessionId,
+        display: DisplayInfo,
+        now: u64,
+        deadline: u64,
+    ) -> Result<()> {
+        validate_deadline(now, deadline)?;
         if self.session.is_some() {
             return Err(error("control session already active"));
         }
         self.session = Some((id, display.generation, InputGuard::new(id, display, now)?));
         self.acknowledged = false;
+        self.deadline_ms = Some(deadline);
         Ok(())
     }
     pub fn validate(&self, id: SessionId, generation: u64, now: u64) -> Result<()> {
@@ -66,7 +78,7 @@ impl SessionPolicy {
         if *session != id || *current != generation {
             return Err(error("wrong session or display generation"));
         }
-        if guard.expired(now) {
+        if guard.expired(now) || self.expired(now) {
             return Err(error("control lease expired"));
         }
         Ok(())
@@ -79,6 +91,7 @@ impl SessionPolicy {
         Ok(())
     }
     pub fn accept(&mut self, input: &InputEnvelope, now: u64) -> Result<()> {
+        self.validate(input.session_id, input.generation, now)?;
         if !self.acknowledged
             && !matches!(input.event, InputEvent::DisplayAck | InputEvent::ReleaseAll)
         {
@@ -95,18 +108,38 @@ impl SessionPolicy {
         Ok(())
     }
     pub fn renew(&mut self, id: SessionId, generation: u64, now: u64) -> Result<()> {
+        self.renew_until(id, generation, now, now.saturating_add(LEASE_DURATION_MS))
+    }
+    pub fn renew_until(
+        &mut self,
+        id: SessionId,
+        generation: u64,
+        now: u64,
+        deadline: u64,
+    ) -> Result<()> {
         self.validate(id, generation, now)?;
+        validate_deadline(now, deadline)?;
+        if self.deadline_ms.is_some_and(|old| deadline < old) {
+            return Err(error("lease deadline cannot go backwards"));
+        }
         self.session.as_mut().unwrap().2.renew_lease(now);
+        self.deadline_ms = Some(deadline);
         Ok(())
     }
     pub fn expired(&self, now: u64) -> bool {
-        self.session
-            .as_ref()
-            .is_some_and(|(_, _, g)| g.expired(now))
+        self.deadline_ms.is_some_and(|deadline| now >= deadline)
     }
     pub fn stop(&mut self) -> Option<SessionId> {
+        self.deadline_ms = None;
         self.session.take().map(|v| v.0)
     }
+}
+
+fn validate_deadline(now: u64, deadline: u64) -> Result<()> {
+    if deadline <= now || deadline - now > LEASE_DURATION_MS {
+        return Err(error("invalid helper lease deadline"));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -160,27 +193,57 @@ pub fn serve(
     now_ms: impl Fn() -> u64,
     stop: &AtomicBool,
 ) -> Result<()> {
+    serve_with_guardian(
+        peer,
+        monitor,
+        generation,
+        now_ms,
+        stop,
+        std::path::Path::new("/run/remotevnc-guardian/guardian.sock"),
+    )
+}
+/// Trusted embedding/tests may select a local guardian endpoint. No network
+/// request or agent IPC can select it.
+pub fn serve_with_guardian(
+    peer: &mut UnixStream,
+    monitor: &mut impl FnMut(&dyn Fn() -> bool) -> Result<Option<DisplayTarget>>,
+    generation: &mut u64,
+    now_ms: impl Fn() -> u64,
+    stop: &AtomicBool,
+    guardian_socket: &std::path::Path,
+) -> Result<()> {
     let output = Output::new(peer.try_clone()?)?;
     output.event(HelperEvent::Ready)?;
+    // Reverse local drop order also stops capture before input recovery on
+    // every early `?`/EOF path, not only explicit cancellation branches.
+    let mut input: Option<X11Input> = None;
     let mut capture: Option<Capture> = None;
     let mut recovering_video = false;
     let mut last_scan = std::time::Instant::now() - std::time::Duration::from_secs(1);
     peer.set_read_timeout(Some(std::time::Duration::from_millis(5)))?;
     let mut target = None;
-    let mut input: Option<X11Input> = None;
     let mut policy = SessionPolicy::default();
     let mut frames = FrameDecoder::default();
     loop {
+        if let Some(input) = input.as_mut()
+            && input.poll_recovery().is_err()
+        {
+            capture.take();
+            return Ok(());
+        }
         // Cancellation is checked before discovery and while loginctl is waiting.
         let cancelled = || {
             stop.load(Ordering::Relaxed)
                 || output.failed.load(Ordering::Relaxed)
                 || policy.expired(now_ms())
+                || input
+                    .as_ref()
+                    .is_some_and(|input| !input.guardian_healthy())
                 || disconnected(peer)
         };
         if cancelled() {
-            input.take();
             capture.take();
+            input.take();
             if let Some(session_id) = policy.stop() {
                 output.event(HelperEvent::Stopped { session_id })?;
             }
@@ -195,16 +258,16 @@ pub fn serve(
         // Sample after discovery: its result never extends a control lease.
         let now = now_ms();
         if stop.load(Ordering::Relaxed) || policy.expired(now) || disconnected(peer) {
-            input.take();
             capture.take();
+            input.take();
             if let Some(session_id) = policy.stop() {
                 output.event(HelperEvent::Stopped { session_id })?;
             }
             return Ok(());
         }
         if current != target {
-            input.take();
             capture.take();
+            input.take();
             if let Some(session_id) = policy.stop() {
                 output.event(HelperEvent::Stopped { session_id })?;
             }
@@ -243,8 +306,8 @@ pub fn serve(
             }
         }
         if capture_stopped {
-            input.take();
             capture.take();
+            input.take();
             if let Some(session_id) = policy.stop() {
                 output.event(HelperEvent::Stopped { session_id })?;
             }
@@ -318,13 +381,18 @@ pub fn serve(
                     HelperRequest::Start {
                         session_id,
                         display,
+                        deadline_boot_ms,
                     } => {
                         let t = target.as_ref().ok_or("no physical display")?;
                         if display != info(t, *generation) {
                             return Err("Start display must match current helper display".into());
                         }
-                        policy.start(session_id, display, now)?;
-                        input = Some(X11Input::connect(t)?);
+                        policy.start_until(session_id, display, now, deadline_boot_ms)?;
+                        input = Some(X11Input::connect_guarded(
+                            t,
+                            guardian_socket,
+                            deadline_boot_ms,
+                        )?);
                     }
                     HelperRequest::Input(event) => {
                         policy.accept(&event, now)?;
@@ -340,8 +408,13 @@ pub fn serve(
                     HelperRequest::RenewLease {
                         session_id,
                         generation,
+                        deadline_boot_ms,
                     } => {
-                        policy.renew(session_id, generation, now)?;
+                        policy.renew_until(session_id, generation, now, deadline_boot_ms)?;
+                        input
+                            .as_mut()
+                            .ok_or("no input guardian")?
+                            .renew_guardian(deadline_boot_ms)?;
                     }
                     HelperRequest::ReleaseAll {
                         session_id,
@@ -355,8 +428,8 @@ pub fn serve(
                         generation,
                     } => {
                         policy.validate(session_id, generation, now)?;
-                        input.take();
                         capture.take();
+                        input.take();
                         policy.stop();
                         output.event(HelperEvent::Stopped { session_id })?;
                     }

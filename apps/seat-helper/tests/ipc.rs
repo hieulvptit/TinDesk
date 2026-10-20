@@ -62,6 +62,7 @@ fn new_helper_wire_messages_round_trip() {
     let req = HelperRequest::RenewLease {
         session_id: id,
         generation: 7,
+        deadline_boot_ms: 60_000,
     };
     assert!(matches!(
         decode_control::<HelperRequest>(&encode_control(&req).unwrap()).unwrap(),
@@ -143,7 +144,7 @@ fn helper_rejects_oversize_frame_and_removes_socket_on_sigterm() {
 #[ignore = "requires scripts/test-x11.sh Xvfb fixture"]
 fn stalled_discovery_cannot_delay_responsive_input_cleanup() {
     use remotevnc_seat_helper::{
-        ipc::serve,
+        ipc::serve_with_guardian as serve,
         seat::{DisplayTarget, ServerIdentity, command_output},
         x11,
     };
@@ -195,7 +196,18 @@ fn stalled_discovery_cannot_delay_responsive_input_cleanup() {
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let now = Arc::new(AtomicU64::new(0));
+        let boot_now = remotevnc_seat_helper::recovery::boot_time_ms().unwrap();
+        let now = Arc::new(AtomicU64::new(boot_now));
+        let guardian_path = std::env::temp_dir().join(format!(
+            "remotevnc-stalled-guardian-{}.sock",
+            Uuid::new_v4()
+        ));
+        let guardian_listener = std::os::unix::net::UnixListener::bind(&guardian_path).unwrap();
+        let guardian_worker = thread::spawn(move || {
+            let (mut peer, _) = guardian_listener.accept().unwrap();
+            remotevnc_seat_helper::recovery::serve(&mut peer)
+        });
+        let helper_guardian_path = guardian_path.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_now = now.clone();
         let thread_stop = stop.clone();
@@ -221,6 +233,7 @@ fn stalled_discovery_cannot_delay_responsive_input_cleanup() {
                 &mut 0,
                 || thread_now.load(Ordering::Relaxed),
                 &thread_stop,
+                &helper_guardian_path,
             )
         });
         assert!(matches!(receive(&mut client), HelperEvent::Ready));
@@ -235,6 +248,7 @@ fn stalled_discovery_cannot_delay_responsive_input_cleanup() {
             HelperRequest::Start {
                 session_id: id,
                 display,
+                deadline_boot_ms: now.load(Ordering::Relaxed) + LEASE_DURATION_MS,
             },
             HelperRequest::Input(InputEnvelope {
                 version: WIRE_VERSION,
@@ -287,7 +301,7 @@ fn stalled_discovery_cannot_delay_responsive_input_cleanup() {
         );
         let began_cleanup = Instant::now();
         match reason {
-            "lease" => now.store(LEASE_DURATION_MS, Ordering::Relaxed),
+            "lease" => now.store(boot_now + LEASE_DURATION_MS, Ordering::Relaxed),
             "signal" => stop.store(true, Ordering::Relaxed),
             "disconnect" => {
                 client.shutdown(std::net::Shutdown::Both).unwrap();
@@ -302,6 +316,8 @@ fn stalled_discovery_cannot_delay_responsive_input_cleanup() {
             thread::sleep(Duration::from_millis(5));
         }
         let _ = worker.join().unwrap(); // disconnected peer may make Stopped notification fail.
+        guardian_worker.join().unwrap().unwrap();
+        std::fs::remove_file(guardian_path).unwrap();
         assert!(
             c.query_keymap()
                 .unwrap()
@@ -353,4 +369,41 @@ fn display_reset_requires_ack_and_does_not_renew_lease() {
     input.event = InputEvent::PointerMove { x: 1, y: 1 };
     policy.accept(&input, 5).unwrap();
     assert!(policy.expired(LEASE_DURATION_MS));
+}
+
+#[test]
+fn explicit_deadline_survives_display_restart_and_rejects_extension_by_traffic() {
+    let id = SessionId(Uuid::new_v4());
+    let display = DisplayInfo {
+        generation: 1,
+        width: 800,
+        height: 600,
+    };
+    let mut policy = SessionPolicy::default();
+    assert!(policy.start_until(id, display, 1_000, 1_000).is_err());
+    assert!(policy.start_until(id, display, 1_000, 61_001).is_err());
+    policy.start_until(id, display, 1_000, 3_000).unwrap();
+    assert!(!policy.expired(2_999));
+    assert!(policy.expired(3_000));
+    policy.stop();
+    policy
+        .start_until(
+            id,
+            DisplayInfo {
+                generation: 2,
+                ..display
+            },
+            2_500,
+            3_000,
+        )
+        .unwrap();
+    assert!(policy.renew_until(id, 2, 2_600, 2_999).is_err());
+    assert!(
+        policy.expired(3_000),
+        "display restart must preserve the existing absolute deadline"
+    );
+    assert!(
+        policy.renew_until(id, 2, 3_000, 63_000).is_err(),
+        "expired sessions cannot be revived"
+    );
 }

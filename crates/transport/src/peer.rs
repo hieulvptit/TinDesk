@@ -558,6 +558,15 @@ impl Peer {
             .renew_lease(self.shared.now_ms());
         Ok(())
     }
+    /// Store validated ICE credentials for the next coordinated rebuild. This
+    /// does not alter the active connection, signal a restart, or renew its lease.
+    pub fn install_ice(&self, ice: Vec<IceServer>) -> Result<()> {
+        let _rebuild = self.shared.rebuild.lock().unwrap();
+        self.shared.engine()?;
+        validate_ice(&ice)?;
+        self.shared.config.lock().unwrap().ice_servers = ice;
+        Ok(())
+    }
     /// GStreamer does not implement in-place ICE restart. This replaces the whole
     /// PeerConnection and sends a typed epoch marker before its new offer/ICE.
     pub fn restart_ice(&self, ice: Vec<IceServer>) -> Result<()> {

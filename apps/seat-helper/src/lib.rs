@@ -1,6 +1,7 @@
 pub mod capture;
 pub mod input;
 pub mod ipc;
+pub mod recovery;
 pub mod seat;
 pub mod x11;
 

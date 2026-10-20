@@ -39,6 +39,8 @@ pub struct X11Input {
     origin_y: u32,
     keys: BTreeMap<u32, u8>,
     buttons: BTreeSet<u8>,
+    guardian: Option<crate::recovery::Client>,
+    recovery: crate::recovery::Snapshot,
 }
 impl X11Input {
     pub fn connect(target: &DisplayTarget) -> Result<Self> {
@@ -86,7 +88,63 @@ impl X11Input {
             origin_y: target.origin_y,
             keys: BTreeMap::new(),
             buttons: BTreeSet::new(),
+            guardian: None,
+            recovery: Default::default(),
         })
+    }
+    pub fn connect_guarded(
+        target: &DisplayTarget,
+        socket: &std::path::Path,
+        deadline: u64,
+    ) -> Result<Self> {
+        let mut input = Self::connect(target)?;
+        input.guardian = Some(crate::recovery::Client::connect(
+            &input.connection,
+            target,
+            socket,
+            deadline,
+        )?);
+        Ok(input)
+    }
+    pub fn guardian_healthy(&self) -> bool {
+        self.guardian.as_ref().is_none_or(|g| g.healthy())
+    }
+    pub fn renew_guardian(&mut self, deadline: u64) -> Result<()> {
+        self.guardian
+            .as_mut()
+            .ok_or("no input guardian")?
+            .renew(deadline)
+    }
+    pub fn poll_recovery(&mut self) -> Result<()> {
+        if self.guardian.is_none() || self.recovery.text.is_some() {
+            return Ok(());
+        }
+        let borrowed: Vec<_> = self
+            .recovery
+            .keys
+            .iter()
+            .copied()
+            .filter(|code| !self.keys.values().any(|owned| owned == code))
+            .collect();
+        if borrowed.is_empty() {
+            return Ok(());
+        }
+        for code in borrowed {
+            if !crate::recovery::physical_state(&self.connection)?
+                .keys
+                .contains(&code)
+            {
+                self.fake(xproto::KEY_RELEASE_EVENT, code, 0, 0)?;
+                self.recovery.keys.remove(&code);
+            }
+        }
+        self.save_recovery()
+    }
+    fn save_recovery(&mut self) -> Result<()> {
+        if let Some(guardian) = self.guardian.as_mut() {
+            guardian.state(&self.recovery)?;
+        }
+        Ok(())
     }
     fn fake(&self, kind: u8, detail: u8, x: i16, y: i16) -> Result<()> {
         self.connection
@@ -113,9 +171,10 @@ impl X11Input {
         event: &InputEvent,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
-        if cancelled() {
+        if cancelled() || !self.guardian_healthy() {
             return Err(error("input cancelled"));
         }
+        self.poll_recovery()?;
         match event {
             InputEvent::PointerMove { x, y } => self.motion(*x, *y)?,
             InputEvent::Button {
@@ -150,6 +209,18 @@ impl X11Input {
                         return Err(error("button already held by local input"));
                     }
                 }
+                if *pressed {
+                    self.recovery.buttons.insert(code);
+                    self.save_recovery()?;
+                }
+                if !pressed
+                    && self.guardian.is_some()
+                    && crate::recovery::physical_state(&self.connection)?
+                        .buttons
+                        .contains(&code)
+                {
+                    return Err(error("local button ownership keeps recovery pending"));
+                }
                 self.fake(
                     if *pressed {
                         xproto::BUTTON_PRESS_EVENT
@@ -164,6 +235,8 @@ impl X11Input {
                     self.buttons.insert(code);
                 } else {
                     self.buttons.remove(&code);
+                    self.recovery.buttons.remove(&code);
+                    self.save_recovery()?;
                 }
             }
             InputEvent::Key { keysym, pressed } => self.key(*keysym, *pressed)?,
@@ -181,8 +254,30 @@ impl X11Input {
                 for (delta, negative, positive) in [(*delta_y, 4, 5), (*delta_x, 6, 7)] {
                     for _ in 0..delta.unsigned_abs() {
                         let button = if delta < 0 { negative } else { positive };
+                        let state = self
+                            .connection
+                            .xinput_xi_query_pointer(self.root, self.pointer_device)?
+                            .reply()?;
+                        if state
+                            .buttons
+                            .first()
+                            .is_none_or(|word| word & (1 << button) != 0)
+                        {
+                            return Err(error("scroll button already held by local input"));
+                        }
+                        self.recovery.buttons.insert(button);
+                        self.save_recovery()?;
                         self.fake(xproto::BUTTON_PRESS_EVENT, button, 0, 0)?;
+                        if self.guardian.is_some()
+                            && crate::recovery::physical_state(&self.connection)?
+                                .buttons
+                                .contains(&button)
+                        {
+                            return Err(error("local scroll ownership keeps recovery pending"));
+                        }
                         self.fake(xproto::BUTTON_RELEASE_EVENT, button, 0, 0)?;
+                        self.recovery.buttons.remove(&button);
+                        self.save_recovery()?;
                     }
                 }
             }
@@ -195,8 +290,17 @@ impl X11Input {
     fn key(&mut self, keysym: u32, pressed: bool) -> Result<()> {
         if !pressed {
             if let Some(code) = self.keys.get(&keysym).copied() {
+                if self.guardian.is_some()
+                    && crate::recovery::physical_state(&self.connection)?
+                        .keys
+                        .contains(&code)
+                {
+                    return Err(error("local key ownership keeps recovery pending"));
+                }
                 self.fake(xproto::KEY_RELEASE_EVENT, code, 0, 0)?;
                 self.keys.remove(&keysym);
+                self.recovery.keys.remove(&code);
+                self.save_recovery()?;
             }
             return Ok(());
         }
@@ -227,6 +331,8 @@ impl X11Input {
         if down[usize::from(code) / 8] & (1 << (code % 8)) != 0 {
             return Err(error("key already held by local input"));
         }
+        self.recovery.keys.insert(code);
+        self.save_recovery()?;
         self.fake(xproto::KEY_PRESS_EVENT, code, 0, 0)?;
         self.keys.insert(keysym, code);
         Ok(())
@@ -239,6 +345,11 @@ impl X11Input {
             .lock()
             .map_err(|_| error("text transaction poisoned"))?;
         let c = &self.connection;
+        let fake = |kind: u8, code: u8| -> Result<()> {
+            c.xtest_fake_input(kind, code, 0, self.root, 0, 0, 0)?
+                .check()?;
+            Ok(())
+        };
         let state = c.xkb_get_state(CORE_KEYBOARD)?.reply()?;
         if u16::from(state.latched_mods) != 0 || state.latched_group != 0 || state.base_group != 0 {
             return Err(error(
@@ -267,9 +378,36 @@ impl X11Input {
             .into_iter()
             .filter(|code| *code != 0 && down[usize::from(*code) / 8] & (1 << (*code % 8)) != 0)
             .collect();
+        let physical = crate::recovery::physical_state(c)?;
+        if physical.keys.contains(&spare.0) {
+            return Err(error("spare keycode held by a physical source"));
+        }
+        let local_modifiers: BTreeSet<u8> = held
+            .iter()
+            .copied()
+            .filter(|code| !self.keys.values().any(|v| v == code))
+            .collect();
+        if local_modifiers
+            .iter()
+            .any(|code| !physical.keys.contains(code))
+        {
+            return Err(error("text cannot borrow an unowned shared XTEST modifier"));
+        }
+        self.recovery.keys.insert(spare.0);
+        self.recovery.text = Some(crate::recovery::TextRestore {
+            code: spare.0,
+            original: spare.1.clone(),
+            expected: vec![spare.1.clone()],
+            local_modifiers,
+            locked_mods: u16::from(state.locked_mods) as u8,
+            locked_group: u8::from(state.locked_group),
+        });
+        if let Some(g) = self.guardian.as_mut() {
+            g.state(&self.recovery)?;
+        }
         let operation = (|| -> Result<()> {
             for code in &held {
-                self.fake(xproto::KEY_RELEASE_EVENT, *code, 0, 0)?;
+                fake(xproto::KEY_RELEASE_EVENT, *code)?;
             }
             c.xkb_latch_lock_state(
                 CORE_KEYBOARD,
@@ -283,35 +421,98 @@ impl X11Input {
             )?
             .check()?;
             for ch in text.chars() {
-                if cancelled() {
+                if cancelled() || self.guardian.as_ref().is_some_and(|g| !g.healthy()) {
                     return Err(error("text transaction cancelled"));
                 }
                 let symbol = unicode_keysym(ch)?;
+                let text_state = self.recovery.text.as_mut().unwrap();
+                let prior = text_state.expected.last().unwrap().clone();
+                text_state.expected = vec![prior, vec![symbol; per]];
+                if let Some(g) = self.guardian.as_mut() {
+                    g.state(&self.recovery)?;
+                }
+                if crate::recovery::physical_state(c)?.keys.contains(&spare.0) {
+                    return Err(error("local spare-key mapping keeps recovery pending"));
+                }
                 c.change_keyboard_mapping(1, spare.0, map.keysyms_per_keycode, &vec![symbol; per])?
                     .check()?;
                 // X11 has no client-consumption acknowledgement. Give toolkit keymap
                 // invalidation a turn before sending, and delivery a turn before restore.
                 thread::sleep(Duration::from_millis(20));
-                self.fake(xproto::KEY_PRESS_EVENT, spare.0, 0, 0)?;
-                self.fake(xproto::KEY_RELEASE_EVENT, spare.0, 0, 0)?;
+                if cancelled() || self.guardian.as_ref().is_some_and(|g| !g.healthy()) {
+                    return Err(error("text transaction cancelled"));
+                }
+                if crate::recovery::physical_state(c)?.keys.contains(&spare.0) {
+                    return Err(error("local spare-key ownership keeps recovery pending"));
+                }
+                fake(xproto::KEY_PRESS_EVENT, spare.0)?;
+                if crate::recovery::physical_state(c)?.keys.contains(&spare.0) {
+                    return Err(error("local spare-key ownership keeps recovery pending"));
+                }
+                fake(xproto::KEY_RELEASE_EVENT, spare.0)?;
                 thread::sleep(Duration::from_millis(20));
             }
             Ok(())
         })();
         // Cleanup is attempted in full even if one restoration request fails.
-        let key_release = self.fake(xproto::KEY_RELEASE_EVENT, spare.0, 0, 0);
+        let key_release = (|| -> Result<()> {
+            if crate::recovery::physical_state(c)?.keys.contains(&spare.0) {
+                return Err(error("local spare-key ownership keeps recovery pending"));
+            }
+            fake(xproto::KEY_RELEASE_EVENT, spare.0)
+        })();
         let mapping_restore = (|| -> Result<()> {
+            let current = c.get_keyboard_mapping(spare.0, 1)?.reply()?;
+            let text_state = self.recovery.text.as_ref().unwrap();
+            if !text_state.expected.iter().any(|expected| {
+                current
+                    .keysyms
+                    .iter()
+                    .all(|sym| *sym == 0 || expected.contains(sym))
+            }) {
+                return Ok(()); // Preserve a mapping changed by another local owner.
+            }
+            if crate::recovery::physical_state(c)?.keys.contains(&spare.0) {
+                return Err(error("local spare-key mapping keeps recovery pending"));
+            }
             c.change_keyboard_mapping(1, spare.0, map.keysyms_per_keycode, &spare.1)?
                 .check()?;
             Ok(())
         })();
-        let mut modifier_restore = Ok(());
+        let physical_after = crate::recovery::physical_state(c);
+        let mut modifier_restore = if physical_after.is_err() {
+            Err(error("physical modifier state unavailable"))
+        } else {
+            Ok(())
+        };
         for code in &held {
-            if let Err(e) = self.fake(xproto::KEY_PRESS_EVENT, *code, 0, 0) {
+            if !self.keys.values().any(|v| v == code)
+                && !physical_after.as_ref().is_ok_and(|p| p.keys.contains(code))
+            {
+                continue;
+            }
+            if !self.keys.values().any(|v| v == code) {
+                self.recovery.keys.insert(*code);
+                if let Some(g) = self.guardian.as_mut()
+                    && let Err(e) = g.state(&self.recovery)
+                {
+                    modifier_restore = Err(e);
+                }
+            }
+            if !self.keys.values().any(|v| v == code)
+                && !crate::recovery::physical_state(c).is_ok_and(|p| p.keys.contains(code))
+            {
+                continue;
+            }
+            if let Err(e) = fake(xproto::KEY_PRESS_EVENT, *code) {
                 modifier_restore = Err(e);
             }
         }
         let lock_restore = (|| -> Result<()> {
+            let current = c.xkb_get_state(CORE_KEYBOARD)?.reply()?;
+            if u16::from(current.locked_mods) != 0 || u8::from(current.locked_group) != 0 {
+                return Ok(());
+            }
             c.xkb_latch_lock_state(
                 CORE_KEYBOARD,
                 ModMask::from(255u8),
@@ -325,6 +526,17 @@ impl X11Input {
             .check()?;
             Ok(())
         })();
+        if key_release.is_ok()
+            && mapping_restore.is_ok()
+            && modifier_restore.is_ok()
+            && lock_restore.is_ok()
+        {
+            self.recovery.text = None;
+            self.recovery.keys.remove(&spare.0);
+            if let Some(g) = self.guardian.as_mut() {
+                let _ = g.state(&self.recovery);
+            }
+        }
         operation
             .and(key_release)
             .and(mapping_restore)
@@ -332,6 +544,16 @@ impl X11Input {
             .and(lock_restore)
     }
     pub fn release_all(&mut self) -> Result<()> {
+        if self.guardian.is_some() {
+            let complete = crate::recovery::restore(&self.connection, &mut self.recovery)?;
+            let _ = self.save_recovery();
+            if complete {
+                self.keys.clear();
+                self.buttons.clear();
+                return Ok(());
+            }
+            return Err(error("local input ownership keeps recovery pending"));
+        }
         let mut result = Ok(());
         for code in self.keys.values().copied().collect::<Vec<_>>() {
             if let Err(e) = self.fake(xproto::KEY_RELEASE_EVENT, code, 0, 0) {
@@ -353,5 +575,27 @@ impl X11Input {
 impl Drop for X11Input {
     fn drop(&mut self) {
         let _ = self.release_all();
+        // Retain the last surviving recovery connection while a physical
+        // source still owns overlapping state. The caller stops capture first.
+        while self.guardian.is_some()
+            && (!self.recovery.keys.is_empty()
+                || !self.recovery.buttons.is_empty()
+                || self.recovery.text.is_some())
+        {
+            if crate::recovery::restore(&self.connection, &mut self.recovery).is_ok_and(|done| done)
+            {
+                break;
+            }
+            if self
+                .connection
+                .get_input_focus()
+                .ok()
+                .and_then(|v| v.reply().ok())
+                .is_none()
+            {
+                break; // That exact X server is gone; never reconnect for cleanup.
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }

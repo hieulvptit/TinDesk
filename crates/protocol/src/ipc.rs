@@ -28,12 +28,15 @@ pub enum HelperRequest {
     Start {
         session_id: SessionId,
         display: DisplayInfo,
+        /// Absolute Linux CLOCK_BOOTTIME milliseconds, at most 60 seconds ahead.
+        deadline_boot_ms: u64,
     },
     Input(InputEnvelope),
     /// Only sent by the authenticated local agent after a backend lease renewal.
     RenewLease {
         session_id: SessionId,
         generation: u64,
+        deadline_boot_ms: u64,
     },
     ReleaseAll {
         session_id: SessionId,

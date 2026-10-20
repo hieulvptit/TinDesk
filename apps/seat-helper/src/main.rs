@@ -17,7 +17,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 fn main() {
@@ -27,6 +27,18 @@ fn main() {
     }
 }
 fn run() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--input-guardian") {
+        let mut args = std::env::args().skip(2);
+        let socket = match args.next().as_deref() {
+            None => PathBuf::from("/run/remotevnc-guardian/guardian.sock"),
+            Some("--socket") => args.next().ok_or("missing guardian socket")?.into(),
+            _ => return Err("usage: --input-guardian [--socket PATH]".into()),
+        };
+        if args.next().is_some() {
+            return Err("unexpected guardian argument".into());
+        }
+        return remotevnc_seat_helper::recovery::run(&socket);
+    }
     if std::env::args().nth(1).as_deref() == Some("--capture-worker") {
         return remotevnc_seat_helper::capture::worker_main();
     }
@@ -94,7 +106,7 @@ fn run() -> Result<()> {
     }
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
-    let start = Instant::now();
+    remotevnc_seat_helper::recovery::boot_time_ms()?;
     let mut generation = 0u64;
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
@@ -109,7 +121,7 @@ fn run() -> Result<()> {
                     &mut peer,
                     &mut |cancelled| monitor.current_with_cancel(cancelled),
                     &mut generation,
-                    || start.elapsed().as_millis() as u64,
+                    || remotevnc_seat_helper::recovery::boot_time_ms().unwrap_or(u64::MAX),
                     &stop,
                 );
             }
