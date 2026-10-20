@@ -42,9 +42,18 @@ struct IssuerState {
     grants: Arc<Mutex<HashMap<String, Grant>>>,
     rotated: Arc<AtomicBool>,
 }
-fn key() -> &'static RsaPrivateKey {
-    static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
-    KEY.get_or_init(|| RsaPrivateKey::new(&mut OsRng, 2048).unwrap())
+struct FixtureKeys {
+    primary: RsaPrivateKey,
+    rotated: RsaPrivateKey,
+    wrong_signature: RsaPrivateKey,
+}
+fn fixture_keys() -> &'static FixtureKeys {
+    static KEYS: OnceLock<FixtureKeys> = OnceLock::new();
+    KEYS.get_or_init(|| FixtureKeys {
+        primary: RsaPrivateKey::new(&mut OsRng, 2048).unwrap(),
+        rotated: RsaPrivateKey::new(&mut OsRng, 2048).unwrap(),
+        wrong_signature: RsaPrivateKey::new(&mut OsRng, 2048).unwrap(),
+    })
 }
 pub struct Issuer {
     state: IssuerState,
@@ -58,6 +67,9 @@ impl Drop for Issuer {
 }
 impl Issuer {
     pub async fn start() -> Self {
+        // RSA generation can exceed the real client's request deadline on slower CPUs.
+        // Finish it before serving requests; handlers only sign with prepared test keys.
+        tokio::task::spawn_blocking(fixture_keys).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let state = IssuerState {
             origin: format!("http://{}", listener.local_addr().unwrap()),
@@ -126,13 +138,14 @@ async fn discovery(State(s): State<IssuerState>) -> Json<Value> {
         json!({"issuer":s.origin,"authorization_endpoint":format!("{}/authorize",s.origin),"token_endpoint":format!("{}/token",s.origin),"jwks_uri":format!("{}/jwks",s.origin),"response_types_supported":["code"],"subject_types_supported":["public"],"id_token_signing_alg_values_supported":["RS256"]}),
     )
 }
-fn rotated_key() -> &'static RsaPrivateKey {
-    static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
-    KEY.get_or_init(|| RsaPrivateKey::new(&mut OsRng, 2048).unwrap())
-}
 async fn jwks(State(s): State<IssuerState>) -> Json<Value> {
     let rotated = s.rotated.load(Ordering::SeqCst);
-    let key = if rotated { rotated_key() } else { key() };
+    let keys = fixture_keys();
+    let key = if rotated {
+        &keys.rotated
+    } else {
+        &keys.primary
+    };
     let kid = if rotated { "rotated-key" } else { "test-key" };
     Json(
         json!({"keys":[{"kty":"RSA","kid":kid,"use":"sig","alg":"RS256","n":URL_SAFE_NO_PAD.encode(key.n().to_bytes_be()),"e":URL_SAFE_NO_PAD.encode(key.e().to_bytes_be())}]}),
@@ -172,14 +185,13 @@ async fn token(
     let rotated = s.rotated.load(Ordering::SeqCst);
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(if rotated { "rotated-key" } else { "test-key" }.into());
-    let wrong;
+    let keys = fixture_keys();
     let signing = if matches!(grant.fault, Fault::Signature) {
-        wrong = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
-        &wrong
+        &keys.wrong_signature
     } else if rotated {
-        rotated_key()
+        &keys.rotated
     } else {
-        key()
+        &keys.primary
     };
     // jsonwebtoken without PEM support accepts DER, keeping fixture signing local.
     let der = signing.to_pkcs1_der().unwrap();

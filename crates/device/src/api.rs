@@ -14,12 +14,12 @@ impl DeviceApi {
     /// HTTPS is mandatory except explicit loopback HTTP for local development/test servers.
     pub fn new(base: &str, key: SigningKey) -> Result<Self> {
         let base = Url::parse(base).map_err(|_| Error::Invalid)?;
-        let loopback = base.host_str().is_some_and(|host| {
-            host == "localhost"
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        });
+        let loopback = match base.host() {
+            Some(url::Host::Domain("localhost")) => true,
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            _ => false,
+        };
         if (base.scheme() != "https" && !(base.scheme() == "http" && loopback))
             || !base.username().is_empty()
             || base.password().is_some()

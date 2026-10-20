@@ -8,7 +8,12 @@ pub struct DeviceIdentity {
     pub device_id: DeviceId,
     pub signing_key: SigningKey,
 }
-/// Persist before beginning enrollment. Set the ID after a successful poll (or recovery authentication).
+/// Persist the provisional key before beginning enrollment. Before the first completion
+/// poll, persist `Enrollment::challenge.device_id` as the candidate `device_id`.
+/// After a restart or a lost poll response, try authentication with that candidate ID
+/// and key: the backend may already have completed enrollment. If enrollment never
+/// completed and its private polling verifier was not retained, start a new enrollment
+/// with the same key. An already registered key cannot be enrolled a second time.
 pub struct StoredCredentials {
     pub device_id: Option<DeviceId>,
     pub signing_key: SigningKey,
