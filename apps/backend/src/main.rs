@@ -14,6 +14,11 @@ async fn run() -> Result<()> {
     let path = std::env::var("REMOTEVNC_DATABASE").map_err(|_| Error::Invalid)?;
     let db = Database::open(path)?;
     let auth = AuthService::discover_google(config.clone(), db.clone()).await?;
+    let sessions = remotevnc_backend::sessions::SessionService::new(
+        db.clone(),
+        remotevnc_backend::turn::TurnClient::from_env()?,
+    );
+    sessions.expire_on_startup().await?;
     let devices = DeviceService::new(config.clone(), db);
     let bind = std::env::var("REMOTEVNC_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let listener = tokio::net::TcpListener::bind(bind)
@@ -25,6 +30,7 @@ async fn run() -> Result<()> {
             config,
             auth,
             devices,
+            sessions,
         }),
     )
     .with_graceful_shutdown(async {

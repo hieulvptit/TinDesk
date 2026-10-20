@@ -96,12 +96,7 @@ impl DeviceApi {
     }
 }
 pub(crate) async fn decode<T: DeserializeOwned>(mut response: reqwest::Response) -> Result<T> {
-    if response.status() == reqwest::StatusCode::CONFLICT {
-        return Err(Error::Limit);
-    }
-    if !response.status().is_success() {
-        return Err(Error::Request);
-    }
+    check_status(&response)?;
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| Error::Request)? {
         if bytes.len() + chunk.len() > 1024 * 1024 {
@@ -110,4 +105,211 @@ pub(crate) async fn decode<T: DeserializeOwned>(mut response: reqwest::Response)
         bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).map_err(|_| Error::Request)
+}
+
+impl DeviceApi {
+    pub async fn create_session(
+        &self,
+        token: &AccessToken,
+        agent_id: DeviceId,
+    ) -> Result<SessionGrant> {
+        decode(
+            self.http
+                .post(self.url("/v1/sessions")?)
+                .bearer_auth(&token.token)
+                .json(&CreateSession { agent_id })
+                .send()
+                .await
+                .map_err(|_| Error::Request)?,
+        )
+        .await
+    }
+    /// Agent renews every 15s; the returned absolute deadline remains authoritative.
+    pub async fn renew_session(
+        &self,
+        token: &AccessToken,
+        session: SessionId,
+    ) -> Result<SessionGrant> {
+        decode(
+            self.http
+                .post(self.url(&format!("/v1/sessions/{}/renew", session.0))?)
+                .bearer_auth(&token.token)
+                .send()
+                .await
+                .map_err(|_| Error::Request)?,
+        )
+        .await
+    }
+    pub async fn close_session(&self, token: &AccessToken, session: SessionId) -> Result<()> {
+        no_content(
+            self.http
+                .delete(self.url(&format!("/v1/sessions/{}", session.0))?)
+                .bearer_auth(&token.token)
+                .send()
+                .await
+                .map_err(|_| Error::Request)?,
+        )
+    }
+    /// Agent only. Request at the earliest ICE expiry minus 300 seconds.
+    /// Install the resulting IceConfiguration without restarting, ACK from both peers,
+    /// then only the agent handles IceRestartReady. Treat its generation idempotently.
+    pub async fn refresh_turn(&self, token: &AccessToken, session: SessionId) -> Result<()> {
+        no_content(
+            self.http
+                .post(self.url(&format!("/v1/sessions/{}/turn", session.0))?)
+                .bearer_auth(&token.token)
+                .send()
+                .await
+                .map_err(|_| Error::Request)?,
+        )
+    }
+    pub async fn presence(&self, token: &AccessToken) -> Result<Vec<DevicePresence>> {
+        decode(
+            self.http
+                .get(self.url("/v1/presence")?)
+                .bearer_auth(&token.token)
+                .send()
+                .await
+                .map_err(|_| Error::Request)?,
+        )
+        .await
+    }
+    /// Bearer credentials travel only in the upgrade Authorization header.
+    /// Before token expiry, authenticate again, close/drop the old split connection,
+    /// and reconnect with the new token within the session lease. A duplicate live
+    /// socket returns Limit (409); retry with bounded backoff while cleanup finishes.
+    /// Reconcile the initial SessionSnapshot, then replayed grants/config/readiness.
+    /// Keep an existing Peer and last applied refresh generation during rotation.
+    /// A fresh process without that Peer must close old grants and create a new session.
+    pub async fn events(&self, token: &AccessToken, role: DeviceRole) -> Result<DeviceConnection> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut url = self.url("/v1/events")?;
+        let scheme = if self.base.scheme() == "https" {
+            "wss"
+        } else {
+            "ws"
+        };
+        url.set_scheme(scheme).map_err(|_| Error::Invalid)?;
+        url.query_pairs_mut().append_pair(
+            "role",
+            match role {
+                DeviceRole::Agent => "agent",
+                DeviceRole::Client => "client",
+            },
+        );
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|_| Error::Invalid)?;
+        request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {}", token.token)
+                .parse()
+                .map_err(|_| Error::Invalid)?,
+        );
+        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(CONTROL_PAYLOAD_LIMIT))
+            .max_frame_size(Some(CONTROL_PAYLOAD_LIMIT));
+        let connection = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::connect_async_with_config(request, Some(config), false),
+        )
+        .await
+        .map_err(|_| Error::Request)?;
+        match connection {
+            Ok((socket, _)) => Ok(DeviceConnection(socket)),
+            Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                if response.status().as_u16() == 409 =>
+            {
+                Err(Error::Limit)
+            }
+            Err(_) => Err(Error::Request),
+        }
+    }
+}
+fn no_content(response: reqwest::Response) -> Result<()> {
+    check_status(&response)?;
+    if response.status() == reqwest::StatusCode::NO_CONTENT {
+        Ok(())
+    } else {
+        Err(Error::Request)
+    }
+}
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+pub struct DeviceConnection(Socket);
+pub struct DeviceSender(
+    futures_util::stream::SplitSink<Socket, tokio_tungstenite::tungstenite::Message>,
+);
+pub struct DeviceEvents(futures_util::stream::SplitStream<Socket>);
+impl DeviceConnection {
+    pub fn split(self) -> (DeviceSender, DeviceEvents) {
+        use futures_util::StreamExt;
+        let (sender, events) = self.0.split();
+        (DeviceSender(sender), DeviceEvents(events))
+    }
+}
+impl DeviceSender {
+    pub async fn send(&mut self, command: &DeviceCommand) -> Result<()> {
+        use futures_util::SinkExt;
+        let bytes = encode_control(command).map_err(|_| Error::Invalid)?;
+        let text = String::from_utf8(bytes).map_err(|_| Error::Invalid)?;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.0
+                .send(tokio_tungstenite::tungstenite::Message::Text(text.into())),
+        )
+        .await
+        .map_err(|_| Error::Request)?
+        .map_err(|_| Error::Request)
+    }
+    /// Bounded close-frame write. Drop both halves afterwards to release the socket.
+    pub async fn close(&mut self) -> Result<()> {
+        use futures_util::SinkExt;
+        tokio::time::timeout(Duration::from_secs(1), self.0.close())
+            .await
+            .map_err(|_| Error::Request)?
+            .map_err(|_| Error::Request)
+    }
+}
+impl DeviceEvents {
+    pub async fn next(&mut self) -> Result<Option<DeviceEvent>> {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+        loop {
+            match self.0.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    return decode_control(text.as_bytes())
+                        .map(Some)
+                        .map_err(|_| Error::Request);
+                }
+                Some(Ok(Message::Binary(bytes))) => {
+                    return decode_control(&bytes).map(Some).map_err(|_| Error::Request);
+                }
+                Some(Ok(Message::Close(Some(frame)))) if frame.code==tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy => return Err(Error::PolicyClosed),
+                Some(Ok(Message::Close(_))) | None => return Ok(None),
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                _ => return Err(Error::Request),
+            }
+        }
+    }
+}
+
+fn check_status(response: &reqwest::Response) -> Result<()> {
+    if response.status().is_success() {
+        return Ok(());
+    }
+    Err(
+        match response
+            .headers()
+            .get("x-remotevnc-error")
+            .and_then(|v| v.to_str().ok())
+        {
+            Some("caller_busy") => Error::CallerBusy,
+            Some("agent_busy") => Error::AgentBusy,
+            Some("turn_unavailable") => Error::TurnUnavailable,
+            _ if response.status() == reqwest::StatusCode::CONFLICT => Error::Limit,
+            _ => Error::Request,
+        },
+    )
 }

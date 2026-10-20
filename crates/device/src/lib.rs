@@ -7,8 +7,16 @@ pub enum Error {
     Storage,
     #[error("invalid device configuration or credentials")]
     Invalid,
+    #[error("event connection closed by authorization or protocol policy")]
+    PolicyClosed,
     #[error("backend request failed")]
     Request,
+    #[error("caller already has an active session")]
+    CallerBusy,
+    #[error("agent already has an active session")]
+    AgentBusy,
+    #[error("TURN unavailable")]
+    TurnUnavailable,
     #[error("active device limit reached")]
     Limit,
 }

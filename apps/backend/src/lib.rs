@@ -20,6 +20,12 @@ pub enum Error {
     Invalid,
     #[error("service unavailable")]
     Internal,
+    #[error("caller already has an active session")]
+    CallerBusy,
+    #[error("agent already has an active session")]
+    AgentBusy,
+    #[error("TURN unavailable")]
+    TurnUnavailable,
     #[error("active device limit reached")]
     Limit,
 }
@@ -28,10 +34,22 @@ impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let status = match self {
             Self::Invalid => StatusCode::UNAUTHORIZED,
-            Self::Internal => StatusCode::SERVICE_UNAVAILABLE,
-            Self::Limit => StatusCode::CONFLICT,
+            Self::Internal | Self::TurnUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Limit | Self::CallerBusy | Self::AgentBusy => StatusCode::CONFLICT,
         };
-        (status, "Request could not be completed").into_response()
+        let code = match self {
+            Self::CallerBusy => "caller_busy",
+            Self::AgentBusy => "agent_busy",
+            Self::TurnUnavailable => "turn_unavailable",
+            Self::Limit => "limit",
+            Self::Invalid => "unauthorized",
+            Self::Internal => "unavailable",
+        };
+        let mut response = (status, "Request could not be completed").into_response();
+        response
+            .headers_mut()
+            .insert("x-remotevnc-error", HeaderValue::from_static(code));
+        response
     }
 }
 #[derive(Clone)]
@@ -39,10 +57,17 @@ pub struct BackendState {
     pub config: config::Config,
     pub auth: auth::AuthService,
     pub devices: devices::DeviceService,
+    pub sessions: sessions::SessionService,
 }
 pub fn router(state: BackendState) -> Router {
     let callback = state.config.redirect_uri.path().to_owned();
     Router::new()
+        .route("/v1/sessions", post(create_session))
+        .route("/v1/sessions/{id}/renew", post(renew_session))
+        .route("/v1/sessions/{id}/turn", post(refresh_turn))
+        .route("/v1/sessions/{id}", delete(close_session))
+        .route("/v1/events", get(signaling::events))
+        .route("/v1/presence", get(presence))
         .route("/v1/enrollments", post(begin))
         .route("/v1/enrollments/{id}/poll", post(poll))
         .route("/auth/google/start", get(start))
@@ -165,7 +190,7 @@ async fn revoke(
     headers: HeaderMap,
     Path(id): Path<uuid::Uuid>,
 ) -> Result<StatusCode> {
-    s.devices.revoke(bearer(&headers)?, DeviceId(id))?;
+    s.devices.revoke(bearer(&headers)?, DeviceId(id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 fn escape(text: &str) -> String {
@@ -174,4 +199,59 @@ fn escape(text: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+pub mod turn;
+
+pub mod sessions;
+
+pub mod signaling;
+
+async fn create_session(
+    State(s): State<BackendState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateSession>,
+) -> Result<Json<SessionGrant>> {
+    s.sessions
+        .create_authenticated(bearer(&headers)?, request.agent_id)
+        .await
+        .map(Json)
+}
+async fn renew_session(
+    State(s): State<BackendState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Json<SessionGrant>> {
+    s.sessions
+        .renew_authenticated(bearer(&headers)?, SessionId(id))
+        .await
+        .map(Json)
+}
+async fn close_session(
+    State(s): State<BackendState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<StatusCode> {
+    s.sessions
+        .close_authenticated(bearer(&headers)?, SessionId(id))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn refresh_turn(
+    State(s): State<BackendState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<StatusCode> {
+    s.sessions
+        .refresh_turn_authenticated(bearer(&headers)?, SessionId(id))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn presence(
+    State(s): State<BackendState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<DevicePresence>>> {
+    s.sessions
+        .presence_authenticated(bearer(&headers)?)
+        .await
+        .map(Json)
 }

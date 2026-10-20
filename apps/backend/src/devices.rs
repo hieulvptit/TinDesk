@@ -250,7 +250,8 @@ impl DeviceService {
             Ok(devices)
         })
     }
-    pub fn revoke(&self, token: &str, id: DeviceId) -> Result<()> {
+    pub async fn revoke(&self, token: &str, id: DeviceId) -> Result<()> {
+        let _guard = crate::db::authorization_gate().lock().await;
         self.db.transaction(|tx| {
             let principal = principal(tx, token)?;
             if tx.execute(
@@ -264,7 +265,7 @@ impl DeviceService {
         })
     }
 }
-fn principal(tx: &Transaction<'_>, token: &str) -> Result<DevicePrincipal> {
+pub(crate) fn principal(tx: &Transaction<'_>, token: &str) -> Result<DevicePrincipal> {
     if token.len() > 128 {
         return Err(Error::Invalid);
     }

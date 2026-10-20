@@ -258,3 +258,60 @@ pub fn private_dir() -> tempfile::TempDir {
     }
     dir
 }
+
+pub struct SessionFixture {
+    pub directory: tempfile::TempDir,
+    pub db: Database,
+    pub devices: remotevnc_backend::devices::DeviceService,
+    pub ids: [remotevnc_protocol::DeviceId; 4],
+    pub tokens: [String; 4],
+}
+impl SessionFixture {
+    pub fn path(&self) -> std::path::PathBuf {
+        self.directory.path().join("sessions.sqlite")
+    }
+}
+pub fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+pub fn session_fixture() -> SessionFixture {
+    let directory = private_dir();
+    let path = directory.path().join("sessions.sqlite");
+    let db = Database::open(&path).unwrap();
+    let c = rusqlite::Connection::open(&path).unwrap();
+    c.execute("INSERT INTO users(subject) VALUES('owner'),('other')", [])
+        .unwrap();
+    let ids = std::array::from_fn(|_| remotevnc_protocol::DeviceId(uuid::Uuid::new_v4()));
+    let tokens = std::array::from_fn(|_| uuid::Uuid::new_v4().to_string());
+    for index in 0..4 {
+        c.execute(
+            "INSERT INTO devices(id,owner,name,public_key) VALUES(?,?,?,?)",
+            rusqlite::params![
+                ids[index].0.to_string(),
+                if index == 2 { "other" } else { "owner" },
+                format!("device-{index}"),
+                URL_SAFE_NO_PAD.encode(device_key(index as u8 + 1).verifying_key().to_bytes())
+            ],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO access_tokens(token_hash,device_id,expires_at) VALUES(?,?,?)",
+            rusqlite::params![
+                URL_SAFE_NO_PAD.encode(Sha256::digest(tokens[index].as_bytes())),
+                ids[index].0.to_string(),
+                unix_ms() as i64 + 300_000
+            ],
+        )
+        .unwrap();
+    }
+    SessionFixture {
+        devices: remotevnc_backend::devices::DeviceService::new(config(), db.clone()),
+        db,
+        directory,
+        ids,
+        tokens,
+    }
+}

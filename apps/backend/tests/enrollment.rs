@@ -158,5 +158,10 @@ async fn expired_transactions_challenges_and_access_tokens_fail_closed() {
     sql.execute("UPDATE access_tokens SET expires_at=0", [])
         .unwrap();
     assert!(service.list(&token.token).is_err());
-    assert!(service.revoke(&token.token, e.challenge.device_id).is_err());
+    assert!(
+        service
+            .revoke(&token.token, e.challenge.device_id)
+            .await
+            .is_err()
+    );
 }

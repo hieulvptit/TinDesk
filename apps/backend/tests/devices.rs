@@ -21,11 +21,11 @@ async fn google_subject_not_shared_email_owns_devices_and_revocation_is_immediat
     }
     assert_eq!(service.list(&tokens[0].token).unwrap().len(), 2);
     assert_eq!(service.list(&tokens[1].token).unwrap().len(), 1);
-    assert!(service.revoke(&tokens[1].token, ids[0]).is_err());
-    service.revoke(&tokens[0].token, ids[2]).unwrap();
+    assert!(service.revoke(&tokens[1].token, ids[0]).await.is_err());
+    service.revoke(&tokens[0].token, ids[2]).await.unwrap();
     assert!(service.list(&tokens[2].token).is_err());
     assert!(service.challenge(ids[2]).is_err());
-    service.revoke(&tokens[0].token, ids[0]).unwrap();
+    service.revoke(&tokens[0].token, ids[0]).await.unwrap();
     assert!(service.list(&tokens[0].token).is_err());
 }
 
@@ -71,6 +71,10 @@ async fn http_sdk_enrolls_confirms_authenticates_lists_and_revokes() {
     let state = BackendState {
         config: config(),
         auth,
+        sessions: remotevnc_backend::sessions::SessionService::new(
+            db.clone(),
+            remotevnc_backend::turn::TurnClient::unavailable(),
+        ),
         devices: DeviceService::new(config(), db),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -175,6 +179,10 @@ async fn request_errors_never_echo_submitted_values() {
     let state = remotevnc_backend::BackendState {
         config: config(),
         auth: issuer.auth(db.clone()),
+        sessions: remotevnc_backend::sessions::SessionService::new(
+            db.clone(),
+            remotevnc_backend::turn::TurnClient::unavailable(),
+        ),
         devices: DeviceService::new(config(), db),
     };
     let response = remotevnc_backend::router(state)
@@ -231,6 +239,7 @@ async fn active_device_quota_bounds_listing_and_revocation_frees_a_slot() {
     assert_eq!(service.list(&token.token).unwrap().len(), 1000);
     service
         .revoke(&token.token, remotevnc_protocol::DeviceId(removable))
+        .await
         .unwrap();
     assert!(
         service

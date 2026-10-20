@@ -53,6 +53,7 @@ impl Database {
         let connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(2))?;
         connection.execute_batch(include_str!("../migrations/001_identity.sql"))?;
+        connection.execute_batch(include_str!("../migrations/002_sessions.sql"))?;
         Ok(Self(Arc::new(Mutex::new(connection))))
     }
     pub(crate) fn transaction<T>(
@@ -84,4 +85,10 @@ impl From<rusqlite::Error> for Error {
     fn from(_: rusqlite::Error) -> Self {
         Self::Internal
     }
+}
+
+/// One backend runtime serializes final socket writes with revocation/close commits.
+pub(crate) fn authorization_gate() -> &'static tokio::sync::Mutex<()> {
+    static GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    &GATE
 }
