@@ -1,0 +1,480 @@
+#[path = "../../backend/tests/common/mod.rs"]
+mod common;
+use axum::{
+    extract::Request,
+    http::{Method, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+};
+use common::*;
+use remotevnc_backend::{
+    BackendState, auth::AuthService, db::Database, devices::DeviceService,
+    sessions::SessionService, turn::TurnClient,
+};
+use remotevnc_client::{
+    app::{ClientCredentialStore, ClientRuntime, Config, ViewState},
+    video::LatestFrame,
+};
+use remotevnc_device::{CredentialStore, StoredCredentials};
+use remotevnc_protocol::*;
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+struct MemoryStore {
+    record: Mutex<Option<StoredCredentials>>,
+    saves: AtomicUsize,
+    fail_save: AtomicUsize,
+    fail_delete: AtomicBool,
+    deleted: AtomicBool,
+    view: Arc<Mutex<ViewState>>,
+}
+fn clone_credentials(c: &StoredCredentials) -> StoredCredentials {
+    StoredCredentials {
+        device_id: c.device_id,
+        signing_key: c.signing_key.clone(),
+    }
+}
+impl CredentialStore for MemoryStore {
+    fn load(&self) -> remotevnc_device::Result<Option<StoredCredentials>> {
+        Ok(self.record.lock().unwrap().as_ref().map(clone_credentials))
+    }
+    fn save(&self, c: &StoredCredentials) -> remotevnc_device::Result<()> {
+        let n = self.saves.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == self.fail_save.load(Ordering::SeqCst) {
+            return Err(remotevnc_device::Error::Storage);
+        }
+        *self.record.lock().unwrap() = Some(clone_credentials(c));
+        Ok(())
+    }
+}
+impl ClientCredentialStore for MemoryStore {
+    fn delete(&self) -> remotevnc_device::Result<()> {
+        let view = self.view.lock().unwrap();
+        assert!(
+            !view.connected && !view.ready && !view.signed_in,
+            "worker/Peer stop precedes persistence deletion"
+        );
+        if self.fail_delete.load(Ordering::SeqCst) {
+            return Err(remotevnc_device::Error::Storage);
+        }
+        self.record.lock().unwrap().take();
+        self.deleted.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+fn store(record: Option<StoredCredentials>) -> Arc<MemoryStore> {
+    Arc::new(MemoryStore {
+        record: Mutex::new(record),
+        saves: AtomicUsize::new(0),
+        fail_save: AtomicUsize::new(0),
+        fail_delete: AtomicBool::new(false),
+        deleted: AtomicBool::new(false),
+        view: Arc::new(Mutex::new(ViewState::default())),
+    })
+}
+#[derive(Default)]
+struct Control {
+    begins: AtomicUsize,
+    polls: AtomicUsize,
+    auths: AtomicUsize,
+    revokes: AtomicUsize,
+    deny_challenge: AtomicUsize,
+    revoke_unavailable: AtomicBool,
+    rotate: AtomicBool,
+}
+struct Server {
+    base: String,
+    auth: AuthService,
+    devices: DeviceService,
+    task: tokio::task::JoinHandle<()>,
+    control: Arc<Control>,
+    _issuer: Issuer,
+}
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+async fn server(db: Database, store: Arc<MemoryStore>) -> Server {
+    let issuer = Issuer::start().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let mut config = config();
+    config.public_origin = url::Url::parse(&base).unwrap();
+    let devices = DeviceService::new(config.clone(), db.clone());
+    let auth = issuer.auth(db.clone());
+    let control = Arc::new(Control::default());
+    let state = BackendState {
+        config,
+        auth: auth.clone(),
+        devices: devices.clone(),
+        sessions: SessionService::new(db, TurnClient::unavailable()),
+    };
+    let checks = control.clone();
+    let app = remotevnc_backend::router(state).layer(middleware::from_fn(
+        move |request: Request, next: Next| {
+            let store = store.clone();
+            let checks = checks.clone();
+            async move {
+                let path = request.uri().path().to_string();
+                if path == "/v1/enrollments" {
+                    checks.begins.fetch_add(1, Ordering::SeqCst);
+                    assert!(
+                        store.record.lock().unwrap().is_some(),
+                        "provisional key must be persisted before begin"
+                    );
+                }
+                if path.ends_with("/poll") {
+                    checks.polls.fetch_add(1, Ordering::SeqCst);
+                    assert!(
+                        store
+                            .record
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .device_id
+                            .is_some(),
+                        "candidate must be persisted before first poll"
+                    );
+                }
+                if path.ends_with("/challenge") {
+                    match checks.deny_challenge.load(Ordering::SeqCst) {
+                        401 => return StatusCode::UNAUTHORIZED.into_response(),
+                        503 => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                        _ => {}
+                    }
+                }
+                if request.method() == Method::DELETE && path.starts_with("/v1/devices/") {
+                    checks.revokes.fetch_add(1, Ordering::SeqCst);
+                    assert!(
+                        !store.view.lock().unwrap().connected,
+                        "native delivery stops before HTTP revoke"
+                    );
+                    assert!(
+                        !store.deleted.load(Ordering::SeqCst),
+                        "persistent key is deleted after revoke attempt"
+                    );
+                    if checks.revoke_unavailable.load(Ordering::SeqCst) {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                }
+                let response = next.run(request).await;
+                if path == "/v1/devices/authenticate" && response.status().is_success() {
+                    checks.auths.fetch_add(1, Ordering::SeqCst);
+                    if checks.rotate.load(Ordering::SeqCst) {
+                        let (mut parts, body) = response.into_parts();
+                        let bytes = axum::body::to_bytes(body, 65536).await.unwrap();
+                        let mut token: AccessToken = serde_json::from_slice(&bytes).unwrap();
+                        token.expires_at_unix_ms = unix_ms() + 31_000;
+                        parts.headers.remove("content-length");
+                        return Response::from_parts(
+                            parts,
+                            axum::body::Body::from(serde_json::to_vec(&token).unwrap()),
+                        );
+                    }
+                }
+                response
+            }
+        },
+    ));
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    Server {
+        base,
+        auth,
+        devices,
+        task,
+        control,
+        _issuer: issuer,
+    }
+}
+async fn wait_for(mut f: impl FnMut() -> bool) {
+    let until = Instant::now() + Duration::from_secs(8);
+    while !f() {
+        assert!(Instant::now() < until, "fixture state timed out");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+fn run(server: &Server, store: &Arc<MemoryStore>) -> ClientRuntime {
+    ClientRuntime::start_with_store(
+        Config::new(&server.base).unwrap(),
+        store.view.clone(),
+        LatestFrame::default(),
+        store.clone(),
+    )
+    .unwrap()
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persists_candidate_before_poll_and_recovers_interrupted_final_save_with_signed_authentication()
+ {
+    let dir = private_dir();
+    let db = Database::open(dir.path().join("db")).unwrap();
+    let store = store(None);
+    store.fail_save.store(3, Ordering::SeqCst);
+    let server = server(db, store.clone()).await;
+    let runtime = run(&server, &store);
+    wait_for(|| store.view.lock().unwrap().enrollment.is_some()).await;
+    let (display_code, url) = store.view.lock().unwrap().enrollment.clone().unwrap();
+    let id = url::Url::parse(&url)
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "enrollment")
+        .unwrap()
+        .1
+        .into_owned();
+    let (code, state) = server._issuer.issue(
+        &server.auth.start_login(&id).unwrap(),
+        "fixture-owner",
+        Fault::None,
+    );
+    let login = server.auth.finish_login(&code, &state).await.unwrap();
+    server
+        .auth
+        .confirm(&login.confirmation, &display_code)
+        .unwrap();
+    wait_for(|| runtime.is_finished()).await;
+    drop(runtime);
+    assert!(store.view.lock().unwrap().status.contains("storage"));
+    assert!(server.control.polls.load(Ordering::SeqCst) > 0);
+    let candidate = store
+        .record
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .device_id
+        .unwrap();
+    assert!(
+        server.devices.challenge(candidate).is_ok(),
+        "backend enrolled before final local save failed"
+    );
+    let runtime = run(&server, &store);
+    wait_for(|| store.view.lock().unwrap().status == "Choose an online Ubuntu agent").await;
+    assert_eq!(
+        server.control.begins.load(Ordering::SeqCst),
+        1,
+        "candidate signed authentication recovers without new enrollment"
+    );
+    let status = tokio::task::spawn_blocking(move || runtime.sign_out())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.contains("registration revoked"));
+    assert_eq!(server.control.revokes.load(Ordering::SeqCst), 1);
+    assert!(store.record.lock().unwrap().is_none());
+    assert!(server.devices.challenge(candidate).is_err());
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_signout_reports_unconfirmed_revocation_and_deletion_failure_without_fallback() {
+    for fail_delete in [false, true] {
+        let f = session_fixture();
+        let store = store(Some(StoredCredentials {
+            device_id: Some(f.ids[0]),
+            signing_key: device_key(1),
+        }));
+        let server = server(f.db.clone(), store.clone()).await;
+        server
+            .control
+            .revoke_unavailable
+            .store(true, Ordering::SeqCst);
+        store.fail_delete.store(fail_delete, Ordering::SeqCst);
+        let runtime = run(&server, &store);
+        wait_for(|| store.view.lock().unwrap().status == "Choose an online Ubuntu agent").await;
+        let result = tokio::task::spawn_blocking(move || runtime.sign_out())
+            .await
+            .unwrap();
+        if fail_delete {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Keychain removal failed")
+            );
+            assert!(store.record.lock().unwrap().is_some());
+        } else {
+            assert!(result.unwrap().contains("not confirmed"));
+            assert!(store.record.lock().unwrap().is_none());
+        }
+        assert_eq!(server.control.revokes.load(Ordering::SeqCst), 1);
+        assert!(!store.view.lock().unwrap().signed_in);
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authorization_denial_and_network_failure_preserve_candidate_and_are_distinct() {
+    for code in [401, 503] {
+        let f = session_fixture();
+        let store = store(Some(StoredCredentials {
+            device_id: Some(f.ids[0]),
+            signing_key: device_key(1),
+        }));
+        let server = server(f.db.clone(), store.clone()).await;
+        server.control.deny_challenge.store(code, Ordering::SeqCst);
+        let runtime = run(&server, &store);
+        wait_for(|| runtime.is_finished()).await;
+        drop(runtime);
+        assert_eq!(store.saves.load(Ordering::SeqCst), 0);
+        assert!(!store.deleted.load(Ordering::SeqCst));
+        let status = store.view.lock().unwrap().status.clone();
+        assert!(status.contains(if code == 401 {
+            "authorization"
+        } else {
+            "request failed"
+        }));
+    }
+}
+
+fn encoded() -> EncodedFrame {
+    use gst::prelude::*;
+    gst::init().unwrap();
+    let pipeline=gst::parse::launch("videotestsrc num-buffers=1 pattern=blue ! video/x-raw,width=320,height=240,framerate=30/1 ! videoconvert ! x264enc tune=zerolatency speed-preset=ultrafast bframes=0 key-int-max=30 ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au ! appsink name=sink").unwrap().downcast::<gst::Pipeline>().unwrap();
+    pipeline.set_state(gst::State::Playing).unwrap();
+    let sample: Option<gst::Sample> = pipeline
+        .by_name("sink")
+        .unwrap()
+        .emit_by_name("try-pull-sample", &[&5_000_000_000u64]);
+    let sample = sample.unwrap();
+    let buffer = sample.buffer().unwrap();
+    let frame = EncodedFrame {
+        generation: 1,
+        pts_ns: 0,
+        keyframe: true,
+        data: buffer.map_readable().unwrap().as_slice().to_vec(),
+    };
+    pipeline.set_state(gst::State::Null).unwrap();
+    frame
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotating_signed_sockets_keep_native_video_then_lost_restart_has_bounded_fallback() {
+    use remotevnc_device::DeviceApi;
+    use remotevnc_transport::{Peer, PeerConfig, PeerEvent, PeerRole};
+    let f = session_fixture();
+    let store = store(Some(StoredCredentials {
+        device_id: Some(f.ids[0]),
+        signing_key: device_key(1),
+    }));
+    let server = server(f.db.clone(), store.clone()).await;
+    server.control.rotate.store(true, Ordering::SeqCst);
+    let agent_api = DeviceApi::new(&server.base, device_key(2)).unwrap();
+    let agent_token = AccessToken {
+        token: f.tokens[1].clone(),
+        expires_at_unix_ms: unix_ms() + 300_000,
+    };
+    let (mut sender, mut incoming) = agent_api
+        .events(&agent_token, DeviceRole::Agent)
+        .await
+        .unwrap()
+        .split();
+    let frames = LatestFrame::default();
+    let runtime = ClientRuntime::start_with_store(
+        Config::new(&server.base).unwrap(),
+        store.view.clone(),
+        frames.clone(),
+        store.clone(),
+    )
+    .unwrap();
+    wait_for(|| store.view.lock().unwrap().status == "Choose an online Ubuntu agent").await;
+    assert!(runtime.connect(f.ids[1]));
+    let mut peer: Option<Peer> = None;
+    let mut grant: Option<SessionGrant> = None;
+    let mut dropped_at = None;
+    let mut video = encoded();
+    let mut last_video = Instant::now();
+    let mut last_renew = Instant::now();
+    let mut decoded = 0;
+    let mut renewals = 0;
+    let until = Instant::now() + Duration::from_secs(35);
+    loop {
+        tokio::select! {
+            event=incoming.next()=>match event.unwrap().unwrap() {
+                DeviceEvent::Session{grant:g} if grant.is_none()=>{
+                    let p=Peer::new(PeerConfig{session_id:g.session_id,local_peer_id:g.agent_id,remote_peer_id:g.client_id,role:PeerRole::Agent,display:None,ice_servers:g.ice_servers.clone(),relay_only:false}).unwrap();
+                    p.enable_h264().unwrap();p.update_display(DisplayInfo{generation:1,width:640,height:480}).unwrap();peer=Some(p);grant=Some(g);
+                },
+                DeviceEvent::Signal{message,..}=>{if let Some(peer)=&peer{peer.handle_signal(message).unwrap();}},
+                DeviceEvent::SessionClosed{..}=>{assert!(dropped_at.is_some(),"healthy rotation must keep the session");break},
+                _=>{},
+            },
+            _=tokio::time::sleep(Duration::from_millis(10))=>{},
+        }
+        if let Some(peer) = peer.as_mut() {
+            for event in peer.events().try_iter().collect::<Vec<_>>() {
+                if let PeerEvent::Signal(message) = event {
+                    // Model an accepted control-plane message lost across socket rotation.
+                    if dropped_at.is_none() {
+                        sender
+                            .send(&DeviceCommand::Signal {
+                                receiver: f.ids[0],
+                                message,
+                            })
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+            if dropped_at.is_none() && last_video.elapsed() > Duration::from_millis(100) {
+                video.pts_ns += 100_000_000;
+                let _ = peer.push_video(video.clone());
+                last_video = Instant::now();
+            }
+            if let Some(frame) = frames.take() {
+                assert_eq!((frame.width, frame.height), (320, 240));
+                decoded += 1;
+            }
+            if dropped_at.is_none()
+                && decoded >= 5
+                && server.control.auths.load(Ordering::SeqCst) >= 5
+            {
+                assert!(store.view.lock().unwrap().ready);
+                assert_eq!(store.view.lock().unwrap().epoch, 1);
+                peer.update_display(DisplayInfo {
+                    generation: 2,
+                    width: 800,
+                    height: 600,
+                })
+                .unwrap();
+                dropped_at = Some(Instant::now());
+            }
+        }
+        if dropped_at.is_some() && last_renew.elapsed() > Duration::from_secs(3) {
+            if let Some(grant) = &grant
+                && agent_api
+                    .renew_session(&agent_token, grant.session_id)
+                    .await
+                    .is_ok()
+            {
+                renewals += 1;
+            }
+            last_renew = Instant::now();
+        }
+        if let Some(dropped) = dropped_at
+            && !store.view.lock().unwrap().connected
+        {
+            assert!(dropped.elapsed() < Duration::from_secs(23));
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "rotation/reconciliation did not settle: {}",
+            store.view.lock().unwrap().status
+        );
+    }
+    assert!(decoded >= 5);
+    assert!(server.control.auths.load(Ordering::SeqCst) >= 5);
+    assert!(
+        renewals > 0,
+        "fresh grants must not extend incoherent negotiation"
+    );
+    tokio::task::spawn_blocking(move || drop(runtime))
+        .await
+        .unwrap();
+    assert!(
+        store.record.lock().unwrap().is_some(),
+        "ordinary window close preserves enrollment"
+    );
+    assert_eq!(server.control.revokes.load(Ordering::SeqCst), 0);
+}

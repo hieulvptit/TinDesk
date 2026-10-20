@@ -114,10 +114,10 @@ impl InputGuard {
         match &input.event {
             InputEvent::PointerMove { x, y }
             | InputEvent::Button { x, y, .. }
-            | InputEvent::Scroll { x, y, .. } => {
-                if *x >= self.display.width || *y >= self.display.height {
-                    return Err(ProtocolError::InvalidCoordinates);
-                }
+            | InputEvent::Scroll { x, y, .. }
+                if *x >= self.display.width || *y >= self.display.height =>
+            {
+                return Err(ProtocolError::InvalidCoordinates);
             }
             InputEvent::Text { text } if text.len() > TEXT_LIMIT => {
                 return Err(ProtocolError::TextTooLarge);

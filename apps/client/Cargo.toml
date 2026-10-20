@@ -1,0 +1,43 @@
+[package]
+name = "remotevnc-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+remotevnc-protocol = { path = "../../crates/protocol" }
+remotevnc-device = { path = "../../crates/device" }
+remotevnc-transport = { path = "../../crates/transport" }
+eframe = { version = "=0.37.0", default-features = false, features = ["default_fonts", "glow", "x11"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-util = "0.7"
+ed25519-dalek.workspace = true
+base64 = "0.22"
+rand = "0.8"
+url = "2"
+serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[dev-dependencies]
+uuid.workspace = true
+tempfile = "3"
+
+remotevnc-backend = { path = "../backend" }
+axum = { version = "0.8", features = ["form", "ws"] }
+openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+jsonwebtoken = { version = "9", default-features = false }
+rsa = { version = "0.9", features = ["pem"] }
+sha2 = "0.10"
+rusqlite = { version = "0.38", features = ["bundled"] }
+gst = { package = "gstreamer", version = "0.24", features = ["v1_24"] }
+
+[features]
+native-smoke = ["eframe/__screenshot"]
+
+[[example]]
+name = "ui_smoke"
+required-features = ["native-smoke"]
