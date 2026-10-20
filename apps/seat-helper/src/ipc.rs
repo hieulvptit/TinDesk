@@ -382,6 +382,8 @@ struct Output {
     generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     failed: std::sync::Arc<AtomicBool>,
     stop: std::sync::Arc<AtomicBool>,
+    interrupt: UnixStream,
+    finished: std::sync::mpsc::Receiver<()>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 impl Output {
@@ -399,6 +401,8 @@ impl Output {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         peer.set_write_timeout(Some(Duration::from_millis(100)))?;
+        let interrupt = peer.try_clone()?;
+        let (done, finished) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             loop {
                 let next = if let Ok(event) = controls.try_recv() {
@@ -422,8 +426,11 @@ impl Output {
                     std::thread::sleep(Duration::from_millis(2));
                 }
             }
+            let _ = done.send(());
         });
         Ok(Self {
+            interrupt,
+            finished,
             control,
             video,
             generation,
@@ -441,6 +448,15 @@ impl Output {
 impl Drop for Output {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        // Give queued terminal events a finite grace period. A per-syscall
+        // timeout does not bound write_all when the reader keeps making progress.
+        if self
+            .finished
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err()
+        {
+            let _ = self.interrupt.shutdown(std::net::Shutdown::Write);
+        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -474,5 +490,83 @@ mod tests {
         let started = Instant::now();
         drop(output);
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+    #[test]
+    fn slow_draining_video_writer_drop_interrupts_active_message() {
+        use std::{net::Shutdown, sync::mpsc, thread, time::Duration};
+        let (peer, mut reader) = UnixStream::pair().unwrap();
+        let size: libc::c_int = 8192;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    peer.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&size as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&size) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        let rescue = peer.try_clone().unwrap();
+        let output = Output::new(peer).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let draining = thread::spawn(move || {
+            let mut started = Some(started_tx);
+            let mut bytes = [0; 4096];
+            while let Ok(n) = reader.read(&mut bytes) {
+                if n == 0 {
+                    break;
+                }
+                if let Some(tx) = started.take() {
+                    let _ = tx.send(());
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        output
+            .video
+            .try_send(EncodedFrame {
+                generation: 0,
+                pts_ns: 0,
+                keyframe: true,
+                data: vec![0; ENCODED_FRAME_LIMIT],
+            })
+            .unwrap();
+        let started = started_rx.recv_timeout(Duration::from_secs(2));
+        thread::sleep(Duration::from_millis(200));
+        let was_active = !output.worker.as_ref().unwrap().is_finished();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let dropping = thread::spawn(move || {
+            drop(output);
+            let _ = finished_tx.send(());
+        });
+        let finished = finished_rx.recv_timeout(Duration::from_millis(500));
+        // Always rescue the old implementation before asserting, so a RED run
+        // cannot leave either the writer join or reader blocked indefinitely.
+        let _ = rescue.shutdown(Shutdown::Both);
+        dropping.join().unwrap();
+        draining.join().unwrap();
+        assert!(started.is_ok(), "reader never received the active frame");
+        assert!(was_active, "fixture did not keep write_all active");
+        assert!(
+            finished.is_ok(),
+            "Output::drop waited for a slow reader beyond its teardown bound"
+        );
+    }
+
+    #[test]
+    fn output_drop_delivers_queued_terminal_event_within_grace() {
+        let (peer, mut reader) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let output = Output::new(peer).unwrap();
+        let session_id = SessionId::from_uuid(uuid::Uuid::nil());
+        output.event(HelperEvent::Stopped { session_id }).unwrap();
+        drop(output);
+        assert!(
+            matches!(read_helper_output(&mut reader).unwrap(),HelperOutput::Event(HelperEvent::Stopped {session_id:id}) if id==session_id)
+        );
     }
 }

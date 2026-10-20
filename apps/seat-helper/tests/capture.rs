@@ -348,6 +348,10 @@ fn repeated_1080p_rtp_stream_stays_bounded_and_stops_cleanly() {
             height: 1080,
         };
         let profile = VideoProfile::default();
+        assert_eq!(
+            (profile.width, profile.height, profile.fps),
+            (1920, 1080, 60)
+        );
         let mut capture = Capture::start_with_worker(
             Path::new(env!("CARGO_BIN_EXE_remotevnc-seat-helper")),
             &target,

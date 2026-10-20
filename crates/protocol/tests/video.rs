@@ -19,6 +19,7 @@ fn binary_video_preserves_access_unit_metadata_and_bounds() {
 #[test]
 fn profile_bounds_and_pressure_downshift() {
     let p = VideoProfile::default();
+    assert_eq!((p.width, p.height, p.fps), (1920, 1080, 60));
     p.validate().unwrap();
     let lower = p.downshift();
     assert!(lower.bitrate_kbps < p.bitrate_kbps);

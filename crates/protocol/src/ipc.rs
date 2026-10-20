@@ -131,7 +131,7 @@ impl Default for VideoProfile {
         Self {
             width: 1920,
             height: 1080,
-            fps: 30,
+            fps: 60,
             bitrate_kbps: 6000,
             encoder: VideoEncoder::Auto,
         }
