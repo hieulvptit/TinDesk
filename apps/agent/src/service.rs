@@ -204,6 +204,7 @@ impl AgentService {
                                     let token = token_rx.borrow().clone().ok_or("no authenticated token")?;
                                     let id = grant.session_id;
                                     pending = Some(grant);
+                                    next_renew = Instant::now() + Duration::from_secs(15);
                                     renewal = Some(renew(api.clone(), token, id));
                                 }
                                 DeviceEvent::SessionClosed { session_id } => {
@@ -313,7 +314,6 @@ impl AgentService {
                                         }
                                     }
                                 }
-                                next_renew = Instant::now() + Duration::from_secs(15);
                             }
                             Ok((_, _, Err(remotevnc_device::Error::Unauthorized))) => end = true,
                             // A transient HTTP failure cannot create new authority. Retain the
@@ -733,7 +733,7 @@ impl Live {
                 .is_some_and(|d| d.generation == frame.generation)
             {
                 match self.peer.push_video(frame) {
-                    Ok(()) | Err(TransportError::QueueFull) => {}
+                    Ok(()) | Err(TransportError::QueueFull | TransportError::NotReady) => {}
                     Err(e) => return Err(e.into()),
                 }
             }

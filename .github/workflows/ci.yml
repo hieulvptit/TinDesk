@@ -27,6 +27,7 @@ jobs:
       - run: scripts/check.sh
       - run: python3 scripts/test-backend-ingress.py
       - run: scripts/test-x11.sh
+      - run: scripts/test-e2e.sh
       - run: scripts/build-linux.sh
   macos-native:
     runs-on: macos-15

@@ -58,6 +58,9 @@ impl Peer {
             return Err(ProtocolError::WrongGeneration.into());
         }
         if sender.needs_keyframe && !(frame.keyframe && has_config_idr(&frame.data)) {
+            if !engine.keyframe_requested.swap(true, Ordering::AcqRel) {
+                self.shared.emit_at(engine.epoch, PeerEvent::KeyframeNeeded);
+            }
             return Err(TransportError::NotReady);
         }
         if sender.source.property::<u64>("current-level-buffers") >= 2 {
@@ -351,6 +354,48 @@ mod tests {
         delta.keyframe = false;
         assert_eq!(peer.push_video(delta), Err(TransportError::NotReady));
         pad.remove_probe(block);
+        peer.close();
+    }
+
+    #[test]
+    fn initial_delta_requests_one_keyframe_until_config_idr_arrives() {
+        let mut peer = Peer::new(super::super::tests::config(PeerRole::Agent)).unwrap();
+        peer.enable_h264().unwrap();
+        let delta = EncodedFrame {
+            generation: 7,
+            pts_ns: 0,
+            keyframe: false,
+            data: vec![0, 0, 0, 1, 0x41],
+        };
+        for _ in 0..4 {
+            assert_eq!(
+                peer.push_video(delta.clone()),
+                Err(TransportError::NotReady)
+            );
+        }
+        assert_eq!(
+            peer.events()
+                .try_iter()
+                .filter(|e| matches!(e, PeerEvent::KeyframeNeeded))
+                .count(),
+            1,
+            "multiple buffered P-frames must request exactly one replacement keyframe"
+        );
+        peer.push_video(EncodedFrame {
+            generation: 7,
+            pts_ns: 1,
+            keyframe: true,
+            data: vec![0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68, 0, 0, 0, 1, 0x65],
+        })
+        .unwrap();
+        assert!(
+            !peer
+                .shared
+                .engine()
+                .unwrap()
+                .keyframe_requested
+                .load(Ordering::Acquire)
+        );
         peer.close();
     }
 

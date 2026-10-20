@@ -210,7 +210,7 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
                 let frame = EncodedFrame {
                     generation: 1,
                     pts_ns: pts,
-                    keyframe: true,
+                    keyframe: pts != 0,
                     data: encoded.clone(),
                 };
                 pts += 100_000_000;
@@ -269,6 +269,7 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
     let mut released = false;
     let mut decoded_after_release = false;
     let mut renewed = false;
+    let mut keyframe_requested = false;
     loop {
         tokio::select! {
           event=incoming.next()=>match event.unwrap().unwrap(){
@@ -348,11 +349,12 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
                     assert!(deadline_boot_ms >= started.unwrap() + 14_000);
                     renewed = true;
                 }
+                HelperRequest::RequestKeyframe { .. } => keyframe_requested = true,
                 HelperRequest::Stop { .. } => panic!("ordinary focus loss must preserve capture"),
                 _ => {}
             }
         }
-        if released && decoded_after_release && renewed {
+        if released && decoded_after_release && renewed && keyframe_requested {
             break;
         }
         assert!(
@@ -813,20 +815,32 @@ async fn renewal_denial_closes_locally_without_any_backend_close_event() {
     };
     let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = count.clone();
+    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_starts = starts.clone();
     let app = remotevnc_backend::router(state).layer(axum::middleware::from_fn(
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let seen = seen.clone();
+            let starts = observed_starts.clone();
             async move {
-                if request.uri().path().ends_with("/renew")
-                    && seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
-                {
+                let renewal = request.uri().path().ends_with("/renew");
+                let deny = if renewal {
+                    starts.lock().unwrap().push(tokio::time::Instant::now());
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
+                } else {
+                    false
+                };
+                if deny {
                     // Return an explicit denial without changing backend session/socket state.
                     axum::response::Response::builder()
                         .status(401)
                         .body(axum::body::Body::empty())
                         .unwrap()
                 } else {
-                    next.run(request).await
+                    let response = next.run(request).await;
+                    if renewal {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                    response
                 }
             }
         },
@@ -844,14 +858,48 @@ async fn renewal_denial_closes_locally_without_any_backend_close_event() {
     let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
     let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
     let helper = std::thread::spawn(move || {
-        use std::io::Read;
+        use std::io::{ErrorKind, Read};
         let (mut peer, _) = listener.accept().unwrap();
         write_helper_output(&mut peer, &HelperOutput::Event(HelperEvent::Ready)).unwrap();
+        write_helper_output(
+            &mut peer,
+            &HelperOutput::Event(HelperEvent::DisplayChanged(DisplayInfo {
+                generation: 1,
+                width: 640,
+                height: 480,
+            })),
+        )
+        .unwrap();
         connected_tx.send(()).unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(20)))
             .unwrap();
-        let mut byte = [0];
-        assert_eq!(peer.read(&mut byte).unwrap(), 0);
+        let mut saw_start = false;
+        loop {
+            let mut size = [0; 4];
+            match peer.read_exact(&mut size) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("helper: {e}"),
+            }
+            let mut bytes = vec![0; u32::from_be_bytes(size) as usize];
+            peer.read_exact(&mut bytes).unwrap();
+            if let HelperRequest::Start {
+                deadline_boot_ms, ..
+            } = decode_control(&bytes).unwrap()
+            {
+                let remaining =
+                    deadline_boot_ms.saturating_sub(remotevnc_agent::service::boot_time_ms());
+                assert!(
+                    (55_000..58_000).contains(&remaining),
+                    "3-second delayed successful response must retain request-start authority: {remaining}ms"
+                );
+                saw_start = true;
+            }
+        }
+        assert!(
+            saw_start,
+            "independent helper deadline assertion must execute"
+        );
         closed_tx.send(()).unwrap();
     });
     let config = Config {
@@ -887,6 +935,14 @@ async fn renewal_denial_closes_locally_without_any_backend_close_event() {
         .unwrap()
         .unwrap();
     assert!(count.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    let spacing = {
+        let starts = starts.lock().unwrap();
+        starts[1] - starts[0]
+    };
+    assert!(
+        spacing >= Duration::from_secs(14) && spacing < Duration::from_millis(16_500),
+        "renewal dispatch must stay on request-start cadence despite delayed success: {spacing:?}"
+    );
     stop.cancel();
     run.await.unwrap().unwrap();
     helper.join().unwrap();

@@ -39,3 +39,12 @@ x11rb = { version = "0.13", features = ["xtest", "xinput"] }
 name = "seat_service"
 path = "tests/fixtures/seat_service.rs"
 harness = false
+
+[[test]]
+name = "e2e_fixture"
+path = "../../tests/e2e/fixture.rs"
+harness = false
+
+[[test]]
+name = "e2e_session"
+path = "../../tests/e2e/session.rs"
