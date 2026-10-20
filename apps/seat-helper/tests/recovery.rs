@@ -27,6 +27,204 @@ fn target() -> DisplayTarget {
         height: 600,
     }
 }
+fn private_send(stream: &mut std::os::unix::net::UnixStream, value: serde_json::Value) {
+    use std::io::Write;
+    let bytes = serde_json::to_vec(&value).unwrap();
+    stream
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .unwrap();
+    stream.write_all(&bytes).unwrap();
+}
+fn private_receive(stream: &mut std::os::unix::net::UnixStream) -> serde_json::Value {
+    use std::io::Read;
+    let mut size = [0; 4];
+    stream.read_exact(&mut size).unwrap();
+    let mut bytes = vec![0; u32::from_be_bytes(size) as usize];
+    stream.read_exact(&mut bytes).unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+fn raw_guardian(
+    c: &x11rb::rust_connection::RustConnection,
+    socket: &std::path::Path,
+    deadline: u64,
+) -> (std::os::unix::net::UnixStream, u32) {
+    use x11rb::{
+        protocol::xproto::{self, CreateWindowAux, PropMode, WindowClass},
+        wrapper::ConnectionExt as _,
+    };
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    private_send(
+        &mut stream,
+        serde_json::json!({"Begin":{"target":target(),"deadline":deadline}}),
+    );
+    let anchor = private_receive(&mut stream);
+    let window = anchor["Anchor"]["window"].as_u64().unwrap() as u32;
+    let atom = anchor["Anchor"]["atom"].as_u64().unwrap() as u32;
+    let nonce: Vec<u8> = anchor["Anchor"]["nonce"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u8)
+        .collect();
+    assert_eq!(
+        c.get_property(false, window, atom, xproto::AtomEnum::STRING, 0, 16)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .value,
+        nonce
+    );
+    let lifetime = c.generate_id().unwrap();
+    c.create_window(
+        0,
+        lifetime,
+        c.setup().roots[0].root,
+        0,
+        0,
+        1,
+        1,
+        0,
+        WindowClass::INPUT_ONLY,
+        0,
+        &CreateWindowAux::new(),
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    c.change_property8(
+        PropMode::REPLACE,
+        lifetime,
+        atom,
+        xproto::AtomEnum::STRING,
+        &nonce,
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    private_send(
+        &mut stream,
+        serde_json::json!({"Ready":{"lifetime_window":lifetime}}),
+    );
+    assert_eq!(private_receive(&mut stream), serde_json::json!("Ack"));
+    (stream, lifetime)
+}
+// Test-process-only syscall denial. No production bypass or seccomp policy.
+fn deny_syscall(number: libc::c_long, errno: u32, allow_signal_zero: bool) {
+    let mut filter = vec![
+        libc::sock_filter {
+            code: 0x20,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: 0x15,
+            jt: 0,
+            jf: if allow_signal_zero { 3 } else { 1 },
+            k: number as u32,
+        },
+    ];
+    if allow_signal_zero {
+        filter.push(libc::sock_filter {
+            code: 0x20,
+            jt: 0,
+            jf: 0,
+            k: 24,
+        });
+        filter.push(libc::sock_filter {
+            code: 0x15,
+            jt: 1,
+            jf: 0,
+            k: 0,
+        });
+    }
+    filter.push(libc::sock_filter {
+        code: 0x06,
+        jt: 0,
+        jf: 0,
+        k: 0x0005_0000 | errno,
+    });
+    filter.push(libc::sock_filter {
+        code: 0x06,
+        jt: 0,
+        jf: 0,
+        k: 0x7fff_0000,
+    });
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) },
+        0
+    );
+}
+fn paused_producer(role: &str, socket: &std::path::Path) {
+    use x11rb::protocol::{xproto, xtest::ConnectionExt as _};
+    let c = remotevnc_seat_helper::x11::connect(&target()).unwrap();
+    c.xtest_get_version(2, 2).unwrap().reply().unwrap();
+    let min = c.setup().min_keycode;
+    let map = c
+        .get_keyboard_mapping(min, c.setup().max_keycode - min + 1)
+        .unwrap()
+        .reply()
+        .unwrap();
+    let code = min
+        + map
+            .keysyms
+            .chunks(map.keysyms_per_keycode as usize)
+            .position(|v| v.contains(&0x61))
+            .unwrap() as u8;
+    let deadline = recovery::boot_time_ms().unwrap() + 300;
+    let (mut stream, lifetime) = raw_guardian(&c, socket, deadline);
+    private_send(
+        &mut stream,
+        serde_json::json!({"State":{"keys":[code],"buttons":[],"text":null}}),
+    );
+    assert_eq!(private_receive(&mut stream), serde_json::json!("Ack"));
+    std::fs::write(
+        socket.with_extension("ready.tmp"),
+        format!("{deadline} {lifetime} {code}"),
+    )
+    .unwrap();
+    std::fs::rename(
+        socket.with_extension("ready.tmp"),
+        socket.with_extension("ready"),
+    )
+    .unwrap();
+    if role == "late_eof" {
+        drop(stream);
+    }
+    unsafe {
+        libc::raise(libc::SIGSTOP);
+    }
+    let request = c
+        .xtest_fake_input(
+            xproto::KEY_PRESS_EVENT,
+            code,
+            0,
+            c.setup().roots[0].root,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+    if role != "queued_key" {
+        request.check().unwrap();
+    }
+    c.flush().unwrap();
+    std::fs::write(socket.with_extension("injected"), []).unwrap();
+    unsafe {
+        libc::raise(libc::SIGSTOP);
+    }
+}
 #[test]
 #[ignore = "subprocess entry point for Xvfb recovery fixtures"]
 fn recovery_child() {
@@ -34,17 +232,26 @@ fn recovery_child() {
         return;
     };
     let socket = std::env::var("REMOTEVNC_RECOVERY_TEST_SOCKET").unwrap();
-    if role == "guardian" {
+    if matches!(role.as_str(), "late_key" | "late_eof" | "queued_key") {
+        paused_producer(&role, socket.as_ref());
+        return;
+    }
+    if role.starts_with("guardian") {
         let listener = UnixListener::bind(socket).unwrap();
         let (mut stream, _) = listener.accept().unwrap();
-        let _ = recovery::serve(&mut stream);
+        if role == "guardian_no_pidfd" {
+            deny_syscall(libc::SYS_getsockopt, libc::ENOPROTOOPT as u32, false);
+        } else if role == "guardian_no_kill" {
+            deny_syscall(libc::SYS_pidfd_send_signal, libc::EPERM as u32, true);
+        }
+        let result = recovery::serve(&mut stream);
+        if role != "guardian" {
+            assert!(result.is_err());
+        }
     } else {
-        let mut input = X11Input::connect_guarded(
-            &target(),
-            socket.as_ref(),
-            recovery::boot_time_ms().unwrap() + 60_000,
-        )
-        .unwrap();
+        let deadline =
+            recovery::boot_time_ms().unwrap() + if role == "deadline" { 200 } else { 60_000 };
+        let mut input = X11Input::connect_guarded(&target(), socket.as_ref(), deadline).unwrap();
         if role == "text" || role == "text_short" {
             input
                 .apply(&InputEvent::Text {
@@ -58,6 +265,22 @@ fn recovery_child() {
                     pressed: true,
                 })
                 .unwrap();
+            if role == "setup_loss" {
+                std::fs::write(std::path::Path::new(&socket).with_extension("ready"), []).unwrap();
+                wait(|| !input.guardian_healthy());
+                assert!(
+                    input
+                        .apply(&InputEvent::Button {
+                            button: MouseButton::Left,
+                            pressed: true,
+                            x: 10,
+                            y: 10,
+                        })
+                        .is_err(),
+                    "setup must fail closed after guardian loss"
+                );
+                return;
+            }
             input
                 .apply(&InputEvent::Button {
                     button: MouseButton::Left,
@@ -66,6 +289,7 @@ fn recovery_child() {
                     y: 10,
                 })
                 .unwrap();
+            std::fs::write(std::path::Path::new(&socket).with_extension("ready"), []).unwrap();
             let end = Instant::now() + Duration::from_secs(10);
             while Instant::now() < end {
                 if input
@@ -91,6 +315,8 @@ impl Drop for Fixture {
         let _ = self.guardian.kill();
         let _ = self.guardian.wait();
         let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_file(self.socket.with_extension("ready"));
+        let _ = std::fs::remove_file(self.socket.with_extension("injected"));
     }
 }
 fn launch(role: &str, socket: &std::path::Path) -> Child {
@@ -326,21 +552,20 @@ fn physical_overlap(kill_guardian: bool) {
 #[test]
 #[ignore = "requires isolated Xvfb"]
 fn guardian_death_makes_helper_fail_closed_and_release() {
+    guardian_loss("held");
+}
+#[test]
+#[ignore = "requires isolated Xvfb"]
+fn guardian_loss_during_setup_fails_closed_and_releases() {
+    guardian_loss("setup_loss");
+}
+fn guardian_loss(role: &str) {
     let c = remotevnc_seat_helper::x11::connect(&target()).unwrap();
-    let mut f = fixture("held");
-    wait(|| {
-        c.query_keymap()
-            .unwrap()
-            .reply()
-            .unwrap()
-            .keys
-            .iter()
-            .any(|b| *b != 0)
-    });
+    let mut f = fixture(role);
+    wait(|| f.socket.with_extension("ready").exists());
     f.guardian.kill().unwrap();
     f.guardian.wait().unwrap();
     wait(|| f.helper.try_wait().unwrap().is_some());
-    assert!(f.helper.wait().unwrap().success());
     assert!(
         c.query_keymap()
             .unwrap()
@@ -360,6 +585,7 @@ fn guardian_death_makes_helper_fail_closed_and_release() {
         ) & 0x100,
         0
     );
+    assert!(f.helper.wait().unwrap().success());
 }
 
 #[test]
@@ -483,25 +709,12 @@ fn graceful_input_cleanup_releases_before_guardian_eof() {
 #[test]
 #[ignore = "requires isolated Xvfb"]
 fn guardian_enforces_absolute_deadline_without_helper_traffic_extension() {
-    let t = target();
-    let c = remotevnc_seat_helper::x11::connect(&t).unwrap();
-    let socket =
-        std::env::temp_dir().join(format!("remotevnc-deadline-{}.sock", uuid::Uuid::new_v4()));
-    let mut guardian = launch("guardian", &socket);
-    wait(|| socket.exists());
-    let deadline = recovery::boot_time_ms().unwrap() + 200;
-    let mut input = X11Input::connect_guarded(&t, &socket, deadline).unwrap();
-    input
-        .apply(&InputEvent::Key {
-            keysym: 0x61,
-            pressed: true,
-        })
-        .unwrap();
-    while recovery::boot_time_ms().unwrap() < deadline {
-        let _ = input.apply(&InputEvent::PointerMove { x: 20, y: 20 });
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    wait(|| {
+    let c = remotevnc_seat_helper::x11::connect(&target()).unwrap();
+    let mut f = fixture("deadline");
+    wait(|| f.socket.with_extension("ready").exists());
+    wait(|| f.helper.try_wait().unwrap().is_some());
+    wait(|| f.guardian.try_wait().unwrap().is_some());
+    assert!(
         c.query_keymap()
             .unwrap()
             .reply()
@@ -509,11 +722,17 @@ fn guardian_enforces_absolute_deadline_without_helper_traffic_extension() {
             .keys
             .iter()
             .all(|v| *v == 0)
-    });
-    assert!(!input.guardian_healthy());
-    drop(input);
-    wait(|| guardian.try_wait().unwrap().is_some());
-    std::fs::remove_file(socket).unwrap();
+    );
+    assert_eq!(
+        u16::from(
+            c.query_pointer(c.setup().roots[0].root)
+                .unwrap()
+                .reply()
+                .unwrap()
+                .mask
+        ) & 0x100,
+        0
+    );
 }
 
 #[test]
@@ -616,7 +835,6 @@ fn physical_modifier(kill_helper: bool) {
 #[test]
 #[ignore = "requires isolated Xvfb"]
 fn write_ahead_mapping_accepts_before_after_and_preserves_unrelated_changes() {
-    use std::io::{Read, Write};
     let t = target();
     let c = remotevnc_seat_helper::x11::connect(&t).unwrap();
     let min = c.setup().min_keycode;
@@ -629,64 +847,28 @@ fn write_ahead_mapping_accepts_before_after_and_preserves_unrelated_changes() {
             .chunks(per)
             .rposition(|v| v.iter().all(|s| *s == 0))
             .unwrap() as u8;
-    // The third symbol is an unrelated local map change and must survive.
-    for actual in [0x01001ebfu32, 0x01001ec7, 0x7a] {
+    let mut rearranged = vec![0u32; per];
+    rearranged[2] = 0x01001ebf;
+    rearranged[3] = 0x01001ebf;
+    // An unrelated symbol AND the same symbol in another group must survive.
+    for (actual, restore) in [
+        (vec![0x01001ebfu32; per], true),
+        (vec![0x01001ec7; per], true),
+        (vec![0x7a; per], false),
+        (rearranged, false),
+    ] {
         let socket =
             std::env::temp_dir().join(format!("remotevnc-map-{}.sock", uuid::Uuid::new_v4()));
         let mut guardian = launch("guardian", &socket);
         wait(|| socket.exists());
-        let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let send = |s: &mut std::os::unix::net::UnixStream, value: serde_json::Value| {
-            let bytes = serde_json::to_vec(&value).unwrap();
-            s.write_all(&(bytes.len() as u32).to_be_bytes()).unwrap();
-            s.write_all(&bytes).unwrap();
-        };
-        let receive = |s: &mut std::os::unix::net::UnixStream| {
-            let mut size = [0; 4];
-            s.read_exact(&mut size).unwrap();
-            let mut bytes = vec![0; u32::from_be_bytes(size) as usize];
-            s.read_exact(&mut bytes).unwrap();
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
-        };
-        send(
-            &mut stream,
-            serde_json::json!({"Begin":{"target":t,"deadline":recovery::boot_time_ms().unwrap()+10_000}}),
-        );
-        let anchor = receive(&mut stream);
-        let window = anchor["Anchor"]["window"].as_u64().unwrap() as u32;
-        let atom = anchor["Anchor"]["atom"].as_u64().unwrap() as u32;
-        let nonce: Vec<u8> = anchor["Anchor"]["nonce"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_u64().unwrap() as u8)
-            .collect();
-        assert_eq!(
-            c.get_property(
-                false,
-                window,
-                atom,
-                x11rb::protocol::xproto::AtomEnum::STRING,
-                0,
-                16
-            )
-            .unwrap()
-            .reply()
-            .unwrap()
-            .value,
-            nonce
-        );
-        send(&mut stream, serde_json::json!("Ready"));
-        assert_eq!(receive(&mut stream), serde_json::json!("Ack"));
-        send(
+        let (mut stream, lifetime) =
+            raw_guardian(&c, &socket, recovery::boot_time_ms().unwrap() + 10_000);
+        private_send(
             &mut stream,
             serde_json::json!({"State":{"keys":[spare],"buttons":[],"text":{"code":spare,"original":vec![0u32;per],"expected":[vec![0x01001ebfu32;per],vec![0x01001ec7u32;per]],"local_modifiers":[],"locked_mods":0,"locked_group":0}}}),
         );
-        assert_eq!(receive(&mut stream), serde_json::json!("Ack"));
-        c.change_keyboard_mapping(1, spare, per as u8, &vec![actual; per])
+        assert_eq!(private_receive(&mut stream), serde_json::json!("Ack"));
+        c.change_keyboard_mapping(1, spare, per as u8, &actual)
             .unwrap()
             .check()
             .unwrap();
@@ -696,6 +878,9 @@ fn write_ahead_mapping_accepts_before_after_and_preserves_unrelated_changes() {
             .reply()
             .unwrap()
             .keysyms;
+        c.destroy_window(lifetime).unwrap().check().unwrap();
+        private_send(&mut stream, serde_json::json!("Finish"));
+        assert_eq!(private_receive(&mut stream), serde_json::json!("Ack"));
         drop(stream);
         wait(|| guardian.try_wait().unwrap().is_some());
         let after = c
@@ -709,7 +894,7 @@ fn write_ahead_mapping_accepts_before_after_and_preserves_unrelated_changes() {
             .check()
             .unwrap();
         std::fs::remove_file(socket).unwrap();
-        if actual == 0x7a {
+        if !restore {
             assert_eq!(after, changed, "unrelated map must survive");
         } else {
             assert_eq!(
@@ -718,4 +903,276 @@ fn write_ahead_mapping_accepts_before_after_and_preserves_unrelated_changes() {
             );
         }
     }
+}
+
+#[test]
+#[ignore = "requires isolated Xvfb"]
+fn expiry_keeps_acknowledged_mutation_covered_until_producer_death() {
+    delayed_mutation("late_key");
+}
+#[test]
+#[ignore = "requires isolated Xvfb"]
+fn ipc_eof_keeps_acknowledged_mutation_covered_until_producer_death() {
+    delayed_mutation("late_eof");
+}
+fn delayed_mutation(role: &str) {
+    use x11rb::protocol::{
+        Event,
+        xproto::{self, ChangeWindowAttributesAux, EventMask},
+        xtest::ConnectionExt as _,
+    };
+    let c = remotevnc_seat_helper::x11::connect(&target()).unwrap();
+    c.change_window_attributes(
+        c.setup().roots[0].root,
+        &ChangeWindowAttributesAux::new().event_mask(EventMask::KEY_PRESS),
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    let mut f = fixture(role);
+    wait(|| f.socket.with_extension("ready").exists());
+    let fields: Vec<u64> = std::fs::read_to_string(f.socket.with_extension("ready"))
+        .unwrap()
+        .split_whitespace()
+        .map(|v| v.parse().unwrap())
+        .collect();
+    wait(|| recovery::boot_time_ms().unwrap() > fields[0] + 100);
+    wait(|| f.helper.try_wait().unwrap().is_some());
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        f.helper.wait().unwrap().signal(),
+        Some(libc::SIGKILL),
+        "guardian must terminate the paused producer"
+    );
+    wait(|| f.guardian.try_wait().unwrap().is_some());
+    let code = fields[2] as u8;
+    let down = c.query_keymap().unwrap().reply().unwrap().keys;
+    let mut late_press = false;
+    while let Some(event) = c.poll_for_event().unwrap() {
+        late_press |= matches!(event, Event::KeyPress(_));
+    }
+    c.xtest_fake_input(
+        xproto::KEY_RELEASE_EVENT,
+        code,
+        0,
+        c.setup().roots[0].root,
+        0,
+        0,
+        0,
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    assert!(
+        !late_press,
+        "paused producer must not inject after expiry/EOF quiescence"
+    );
+    assert!(!f.socket.with_extension("injected").exists());
+    assert_eq!(down[code as usize / 8] & (1 << (code % 8)), 0);
+}
+
+#[test]
+#[ignore = "requires isolated Xvfb; server grab exists only in this fixture"]
+fn queued_x11_mutation_cannot_follow_producer_lifetime_destruction() {
+    use x11rb::protocol::{
+        Event,
+        xproto::{self, ChangeWindowAttributesAux, EventMask},
+        xtest::ConnectionExt as _,
+    };
+    let c = remotevnc_seat_helper::x11::connect(&target()).unwrap();
+    let root = c.setup().roots[0].root;
+    c.change_window_attributes(
+        root,
+        &ChangeWindowAttributesAux::new().event_mask(EventMask::KEY_PRESS),
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    let mut f = fixture("queued_key");
+    wait(|| f.socket.with_extension("ready").exists());
+    let fields: Vec<u64> = std::fs::read_to_string(f.socket.with_extension("ready"))
+        .unwrap()
+        .split_whitespace()
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let lifetime = fields[1] as u32;
+    let code = fields[2] as u8;
+    c.change_window_attributes(
+        lifetime,
+        &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    // Queue a real request in the helper's X socket while Xvfb cannot process it.
+    // No production path grabs the server.
+    c.grab_server().unwrap().check().unwrap();
+    assert_eq!(
+        unsafe { libc::kill(f.helper.id() as i32, libc::SIGCONT) },
+        0
+    );
+    wait(|| f.socket.with_extension("injected").exists());
+    wait(|| f.helper.try_wait().unwrap().is_some());
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(f.helper.wait().unwrap().signal(), Some(libc::SIGKILL));
+    assert!(
+        f.guardian.try_wait().unwrap().is_none(),
+        "guardian must await queued X11 processing before retirement"
+    );
+    c.ungrab_server().unwrap().check().unwrap();
+    wait(|| f.guardian.try_wait().unwrap().is_some());
+    let down = c.query_keymap().unwrap().reply().unwrap().keys;
+    let mut destroyed = false;
+    while let Some(event) = c.poll_for_event().unwrap() {
+        match event {
+            Event::DestroyNotify(e) if e.window == lifetime => destroyed = true,
+            Event::KeyPress(_) => assert!(
+                !destroyed,
+                "queued input executed after lifetime destruction"
+            ),
+            _ => {}
+        }
+    }
+    assert!(
+        destroyed,
+        "must observe real helper Xclient resource destruction"
+    );
+    assert!(c.get_window_attributes(lifetime).unwrap().reply().is_err());
+    c.xtest_fake_input(xproto::KEY_RELEASE_EVENT, code, 0, root, 0, 0, 0)
+        .unwrap()
+        .check()
+        .unwrap();
+    assert_eq!(
+        down[code as usize / 8] & (1 << (code % 8)),
+        0,
+        "guardian final cleanup follows all old queued requests"
+    );
+}
+
+#[test]
+#[ignore = "requires isolated Xvfb and Linux seccomp fixture"]
+fn unsupported_peer_pidfd_rejects_admission_before_input() {
+    let c = remotevnc_seat_helper::x11::connect(&target()).unwrap();
+    let before = c.query_keymap().unwrap().reply().unwrap().keys;
+    let socket =
+        std::env::temp_dir().join(format!("remotevnc-pidfd-{}.sock", uuid::Uuid::new_v4()));
+    let mut guardian = launch("guardian_no_pidfd", &socket);
+    wait(|| socket.exists());
+    assert!(
+        X11Input::connect_guarded(
+            &target(),
+            &socket,
+            recovery::boot_time_ms().unwrap() + 60_000
+        )
+        .is_err()
+    );
+    wait(|| guardian.try_wait().unwrap().is_some());
+    assert!(guardian.wait().unwrap().success());
+    assert_eq!(c.query_keymap().unwrap().reply().unwrap().keys, before);
+    std::fs::remove_file(socket).unwrap();
+}
+#[test]
+#[ignore = "requires isolated Xvfb and Linux seccomp fixture"]
+fn denied_pidfd_termination_retains_recovery_until_producer_is_gone() {
+    let socket =
+        std::env::temp_dir().join(format!("remotevnc-pidfd-{}.sock", uuid::Uuid::new_v4()));
+    let guardian = launch("guardian_no_kill", &socket);
+    wait(|| socket.exists());
+    let helper = launch("late_key", &socket);
+    let mut f = Fixture {
+        guardian,
+        helper,
+        socket,
+    };
+    wait(|| f.socket.with_extension("ready").exists());
+    let fields: Vec<u64> = std::fs::read_to_string(f.socket.with_extension("ready"))
+        .unwrap()
+        .split_whitespace()
+        .map(|v| v.parse().unwrap())
+        .collect();
+    wait(|| recovery::boot_time_ms().unwrap() > fields[0] + 100);
+    assert!(
+        f.helper.try_wait().unwrap().is_none(),
+        "fixture must really deny the kill"
+    );
+    assert!(
+        f.guardian.try_wait().unwrap().is_none(),
+        "denied termination must retain recovery responsibility"
+    );
+    f.helper.kill().unwrap();
+    f.helper.wait().unwrap();
+    wait(|| f.guardian.try_wait().unwrap().is_some());
+    assert!(
+        f.guardian.wait().unwrap().success(),
+        "guardian serve must report the denied termination"
+    );
+}
+
+#[test]
+#[ignore = "requires isolated Xvfb"]
+fn normal_unicode_cleanup_preserves_local_same_symbol_remap() {
+    let t = target();
+    let c = remotevnc_seat_helper::x11::connect(&t).unwrap();
+    let min = c.setup().min_keycode;
+    let count = c.setup().max_keycode - min + 1;
+    let original = c.get_keyboard_mapping(min, count).unwrap().reply().unwrap();
+    let per = original.keysyms_per_keycode as usize;
+    let socket =
+        std::env::temp_dir().join(format!("remotevnc-local-map-{}.sock", uuid::Uuid::new_v4()));
+    let mut guardian = launch("guardian", &socket);
+    wait(|| socket.exists());
+    let mut input =
+        X11Input::connect_guarded(&t, &socket, recovery::boot_time_ms().unwrap() + 60_000).unwrap();
+    let changed = std::cell::RefCell::new(None);
+    let result = input.apply_with_cancel(&InputEvent::Text { text: "ế".into() }, || {
+        let map = c
+            .get_keyboard_mapping(min, count)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .keysyms;
+        if let Some(index) = map
+            .chunks(per)
+            .zip(original.keysyms.chunks(per))
+            .position(|(a, b)| a != b)
+        {
+            let mut local = vec![0; per];
+            local[2] = 0x01001ebf;
+            local[3] = 0x01001ebf;
+            c.change_keyboard_mapping(1, min + index as u8, per as u8, &local)
+                .unwrap()
+                .check()
+                .unwrap();
+            *changed.borrow_mut() = Some(
+                c.get_keyboard_mapping(min, count)
+                    .unwrap()
+                    .reply()
+                    .unwrap()
+                    .keysyms,
+            );
+            true
+        } else {
+            false
+        }
+    });
+    assert!(result.is_err());
+    drop(input);
+    wait(|| guardian.try_wait().unwrap().is_some());
+    let after = c
+        .get_keyboard_mapping(min, count)
+        .unwrap()
+        .reply()
+        .unwrap()
+        .keysyms;
+    c.change_keyboard_mapping(count, min, per as u8, &original.keysyms)
+        .unwrap()
+        .check()
+        .unwrap();
+    assert_eq!(
+        after,
+        changed
+            .into_inner()
+            .expect("fixture must make completed same-symbol local change")
+    );
+    std::fs::remove_file(socket).unwrap();
 }

@@ -464,12 +464,7 @@ impl X11Input {
         let mapping_restore = (|| -> Result<()> {
             let current = c.get_keyboard_mapping(spare.0, 1)?.reply()?;
             let text_state = self.recovery.text.as_ref().unwrap();
-            if !text_state.expected.iter().any(|expected| {
-                current
-                    .keysyms
-                    .iter()
-                    .all(|sym| *sym == 0 || expected.contains(sym))
-            }) {
+            if !crate::recovery::mapping_owned(&current.keysyms, &text_state.expected) {
                 return Ok(()); // Preserve a mapping changed by another local owner.
             }
             if crate::recovery::physical_state(c)?.keys.contains(&spare.0) {
@@ -596,6 +591,9 @@ impl Drop for X11Input {
                 break; // That exact X server is gone; never reconnect for cleanup.
             }
             thread::sleep(Duration::from_millis(10));
+        }
+        if let Some(guardian) = self.guardian.as_mut() {
+            let _ = guardian.quiesce(&self.connection);
         }
     }
 }

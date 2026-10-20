@@ -41,8 +41,11 @@ enum Request {
         target: DisplayTarget,
         deadline: u64,
     },
-    Ready,
+    Ready {
+        lifetime_window: u32,
+    },
     State(Snapshot),
+    Finish,
     Renew {
         deadline: u64,
     },
@@ -68,6 +71,81 @@ pub fn boot_time_ms() -> Result<u64> {
 #[cfg(not(target_os = "linux"))]
 pub fn boot_time_ms() -> Result<u64> {
     Err(error("guardian requires Linux CLOCK_BOOTTIME"))
+}
+/// Kernel-held identity of the authenticated connecting process. Never reopen
+/// a numeric PID: it may have been reused after peer credential inspection.
+struct PeerProcess(std::os::fd::OwnedFd);
+impl PeerProcess {
+    #[cfg(target_os = "linux")]
+    fn from_socket(stream: &UnixStream) -> Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // Linux >= 6.5; libc does not yet expose this socket option everywhere.
+        const SO_PEERPIDFD: libc::c_int = 77;
+        let mut fd: libc::c_int = -1;
+        let mut size = std::mem::size_of_val(&fd) as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                SO_PEERPIDFD,
+                (&mut fd as *mut libc::c_int).cast(),
+                &mut size,
+            )
+        } != 0
+        {
+            return Err(error("guardian requires Linux SO_PEERPIDFD"));
+        }
+        if fd < 0 {
+            return Err(error("invalid peer pidfd"));
+        }
+        let process = Self(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        if size as usize != std::mem::size_of_val(&fd) {
+            return Err(error("invalid peer pidfd size"));
+        }
+        process.signal(0)?;
+        Ok(process)
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn from_socket(_stream: &UnixStream) -> Result<Self> {
+        Err(error("guardian requires Linux SO_PEERPIDFD"))
+    }
+    #[cfg(target_os = "linux")]
+    fn signal(&self, signal: libc::c_int) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        if unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.0.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        } != 0
+        {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::ESRCH) {
+                return Err(e.into());
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn signal(&self, _signal: libc::c_int) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        let _ = self.0.as_raw_fd();
+        Err(error("guardian requires Linux pidfd_send_signal"))
+    }
+}
+fn lifetime_exists(c: &RustConnection, window: u32) -> Result<bool> {
+    match c.get_window_attributes(window)?.reply() {
+        Ok(_) => Ok(true),
+        Err(x11rb::errors::ReplyError::X11Error(e))
+            if e.error_kind == x11rb::protocol::ErrorKind::Window =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 fn deadline_valid(deadline: u64) -> Result<()> {
     let now = boot_time_ms()?;
@@ -95,6 +173,7 @@ fn receive<T: serde::de::DeserializeOwned>(stream: &mut UnixStream) -> Result<T>
 }
 pub(crate) struct Client {
     stream: UnixStream,
+    lifetime_window: u32,
 }
 impl Client {
     pub fn connect(
@@ -135,11 +214,48 @@ impl Client {
         if property.value != nonce || property.bytes_after != 0 {
             return Err(error("guardian X server mismatch"));
         }
-        send(&mut stream, &Request::Ready)?;
+        let lifetime_window = c.generate_id()?;
+        c.create_window(
+            0,
+            lifetime_window,
+            c.setup().roots[0].root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_ONLY,
+            0,
+            &CreateWindowAux::new(),
+        )?
+        .check()?;
+        c.change_property8(
+            PropMode::REPLACE,
+            lifetime_window,
+            atom,
+            xproto::AtomEnum::STRING,
+            &nonce,
+        )?
+        .check()?;
+        send(&mut stream, &Request::Ready { lifetime_window })?;
         if !matches!(receive::<Reply>(&mut stream)?, Reply::Ack) {
             return Err(error("guardian acknowledgement required"));
         }
-        Ok(Self { stream })
+        Ok(Self {
+            stream,
+            lifetime_window,
+        })
+    }
+    /// Called only after the injector has stopped all mutations and drained its
+    /// local cleanup. Same-connection request ordering makes this a terminal
+    /// quiescence marker; connection death destroys it on abrupt helper loss.
+    pub fn quiesce(&mut self, c: &RustConnection) -> Result<()> {
+        c.destroy_window(self.lifetime_window)?.check()?;
+        send(&mut self.stream, &Request::Finish)?;
+        if !matches!(receive::<Reply>(&mut self.stream)?, Reply::Ack) {
+            return Err(error("guardian terminal acknowledgement required"));
+        }
+        Ok(())
     }
     pub fn state(&mut self, snapshot: &Snapshot) -> Result<()> {
         send(&mut self.stream, &Request::State(snapshot.clone()))?;
@@ -267,6 +383,22 @@ fn validate(snapshot: &Snapshot, c: &RustConnection) -> Result<()> {
     }
     Ok(())
 }
+/// Core XKB mapping replies normalize a repeated-symbol group to two pairs,
+/// zero-padding the remaining global keymap width. Preserve exact level/group
+/// positions and length: symbol membership does not establish ownership.
+pub(crate) fn mapping_owned(current: &[u32], expected: &[Vec<u32>]) -> bool {
+    expected.iter().any(|map| {
+        current == map
+            || (current.len() == map.len()
+                && map
+                    .first()
+                    .is_some_and(|symbol| map.iter().all(|v| v == symbol))
+                && current
+                    .iter()
+                    .enumerate()
+                    .all(|(i, v)| *v == if i < 4 { map[0] } else { 0 }))
+    })
+}
 fn fake(c: &RustConnection, kind: u8, code: u8) -> Result<()> {
     c.xtest_fake_input(kind, code, 0, c.setup().roots[0].root, 0, 0, 0)?
         .check()?;
@@ -282,12 +414,7 @@ pub(crate) fn restore(c: &RustConnection, snapshot: &mut Snapshot) -> Result<boo
         let current = c.get_keyboard_mapping(t.code, 1)?.reply()?;
         // XKB expands core groups and zero-pads the requested repeated-symbol
         // map. Only the formerly empty spare and recorded symbols are eligible.
-        let mapping_owned = t.expected.iter().any(|expected| {
-            current
-                .keysyms
-                .iter()
-                .all(|sym| *sym == 0 || expected.contains(sym))
-        });
+        let mapping_owned = mapping_owned(&current.keysyms, &t.expected);
         let mut mapping_pending = mapping_owned && physical_state(c)?.keys.contains(&t.code);
         if mapping_owned && !mapping_pending {
             fake(c, xproto::KEY_RELEASE_EVENT, t.code)?;
@@ -354,6 +481,7 @@ pub fn serve(stream: &mut UnixStream) -> Result<()> {
 fn serve_until(stream: &mut UnixStream, stop: &std::sync::atomic::AtomicBool) -> Result<()> {
     stream.set_read_timeout(Some(TIMEOUT))?;
     stream.set_write_timeout(Some(TIMEOUT))?;
+    let producer = PeerProcess::from_socket(stream)?;
     let Request::Begin {
         target,
         mut deadline,
@@ -398,17 +526,31 @@ fn serve_until(stream: &mut UnixStream, stop: &std::sync::atomic::AtomicBool) ->
         &Reply::Anchor {
             window,
             atom,
-            nonce,
+            nonce: nonce.clone(),
         },
     )?;
-    if !matches!(receive::<Request>(stream)?, Request::Ready) {
+    let Request::Ready { lifetime_window } = receive::<Request>(stream)? else {
         return Err(error("guardian Ready required"));
+    };
+    let lifetime = c
+        .get_property(
+            false,
+            lifetime_window,
+            atom,
+            xproto::AtomEnum::STRING,
+            0,
+            16,
+        )?
+        .reply()?;
+    if lifetime_window == window || lifetime.value != nonce || lifetime.bytes_after != 0 {
+        return Err(error("invalid helper lifetime binding"));
     }
     send(stream, &Reply::Ack)?;
     stream.set_read_timeout(Some(Duration::from_millis(5)))?;
     let mut snapshot = Snapshot::default();
     let mut decoder = FrameDecoder::default();
     let mut buffer = [0; 4096];
+    let mut finished = false;
     let result = (|| -> Result<()> {
         while boot_time_ms()? < deadline && !stop.load(std::sync::atomic::Ordering::Relaxed) {
             match stream.read(&mut buffer) {
@@ -425,6 +567,14 @@ fn serve_until(stream: &mut UnixStream, stop: &std::sync::atomic::AtomicBool) ->
                             Request::State(next) => {
                                 validate(&next, &c)?;
                                 snapshot = next;
+                            }
+                            Request::Finish => {
+                                if lifetime_exists(&c, lifetime_window)? {
+                                    return Err(error("helper has not quiesced its X11 producer"));
+                                }
+                                finished = true;
+                                send(stream, &Reply::Ack)?;
+                                return Ok(());
                             }
                             Request::Renew { deadline: next } => {
                                 deadline_valid(next)?;
@@ -450,10 +600,35 @@ fn serve_until(stream: &mut UnixStream, stop: &std::sync::atomic::AtomicBool) ->
         }
         Ok(())
     })();
-    let _ = stream.shutdown(std::net::Shutdown::Both);
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    // A write-ahead ACK is not completed execution. Kill only the kernel-bound
+    // producer on expiry/abnormal EOF, then await X11 quiescence before retiring
+    // its snapshot. Normal Drop proves quiescence via Finish and stays alive.
+    let termination = if finished {
+        Ok(())
+    } else {
+        producer.signal(libc::SIGKILL)
+    };
+    if termination.is_err() {
+        eprintln!("input guardian could not terminate producer; recovery remains pending");
+    }
     loop {
-        if restore(&c, &mut snapshot).is_ok_and(|done| done) {
-            break;
+        let producer_gone = !lifetime_exists(&c, lifetime_window)?;
+        if producer_gone {
+            if restore(&c, &mut snapshot).is_ok_and(|done| done) {
+                break;
+            }
+        } else {
+            // Keep the write-ahead record intact until the producer's X client
+            // is quiescent. Releasing currently clear keys does not retire an
+            // acknowledged future down. Map/lock restoration waits for this
+            // barrier so repeated cleanup cannot overwrite a later local edit.
+            let mut held = Snapshot {
+                keys: snapshot.keys.clone(),
+                buttons: snapshot.buttons.clone(),
+                text: None,
+            };
+            let _ = restore(&c, &mut held);
         }
         if c.get_input_focus()
             .ok()
@@ -462,11 +637,10 @@ fn serve_until(stream: &mut UnixStream, stop: &std::sync::atomic::AtomicBool) ->
         {
             break;
         }
-        // A live server with unavailable ownership information stays pending.
-        // Never discard the last recovery record on a transient source error.
+        // Unknown ownership and a live producer both retain this one record.
         std::thread::sleep(Duration::from_millis(10));
     }
-    result
+    result.and(termination)
 }
 
 /// Root-only local listener. The guardian is a separate systemd service/cgroup.
