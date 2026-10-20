@@ -11,6 +11,10 @@ pub use wire::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ProtocolError {
+    #[error("no physical display is available")]
+    DisplayUnavailable,
+    #[error("display generation has not been acknowledged")]
+    DisplayNotAcknowledged,
     #[error("unsupported wire version")]
     UnsupportedVersion,
     #[error("control payload exceeds 64 KiB")]

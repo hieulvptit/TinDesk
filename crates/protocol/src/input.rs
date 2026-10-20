@@ -125,8 +125,8 @@ impl InputGuard {
             _ => {}
         }
         encode_control(input)?;
-        // Reliable ordered events have an independent sequence space. Never let
-        // a delayed motion packet suppress a click, key release, or release-all.
+        // One sender sequence spans both channels. Reliable events are never
+        // suppressed, but position-bearing controls advance the motion high-water.
         if matches!(input.event, InputEvent::PointerMove { .. }) {
             if self
                 .last_motion_sequence
@@ -135,6 +135,12 @@ impl InputGuard {
                 return Err(ProtocolError::StaleSequence);
             }
             self.last_motion_sequence = Some(input.sequence);
+        } else if matches!(
+            input.event,
+            InputEvent::Button { .. } | InputEvent::Scroll { .. }
+        ) {
+            self.last_motion_sequence =
+                Some(self.last_motion_sequence.unwrap_or(0).max(input.sequence));
         }
         Ok(())
     }

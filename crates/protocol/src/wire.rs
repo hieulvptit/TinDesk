@@ -47,22 +47,31 @@ impl DisplayInfo {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SignalMessage {
+    /// Coordinated fresh PeerConnection; all subsequent messages carry this epoch.
+    Restart {
+        session_id: SessionId,
+        epoch: u64,
+    },
     Offer {
         session_id: SessionId,
+        epoch: u64,
         sdp: String,
     },
     Answer {
         session_id: SessionId,
+        epoch: u64,
         sdp: String,
     },
     IceCandidate {
         session_id: SessionId,
+        epoch: u64,
         candidate: String,
         sdp_mid: Option<String>,
         sdp_mline_index: Option<u16>,
     },
     End {
         session_id: SessionId,
+        epoch: u64,
     },
 }
 
@@ -105,5 +114,28 @@ impl std::io::Write for BoundedWriter {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// ICE configuration remains available without native media dependencies.
+/// URLs and credentials may both contain secrets and are redacted from Debug.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IceServer {
+    pub urls: Vec<String>,
+    pub username: Option<String>,
+    pub credential: Option<String>,
+    pub expires_at_unix_secs: Option<u64>,
+}
+impl std::fmt::Debug for IceServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IceServer")
+            .field("url_count", &self.urls.len())
+            .field("username", &self.username.as_ref().map(|_| "[redacted]"))
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "[redacted]"),
+            )
+            .field("expires_at_unix_secs", &self.expires_at_unix_secs)
+            .finish()
     }
 }

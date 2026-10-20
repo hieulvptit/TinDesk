@@ -74,6 +74,7 @@ fn frame_size_and_queue_are_bounded() {
 #[test]
 fn signaling_and_helper_messages_round_trip() {
     let signal = SignalMessage::Offer {
+        epoch: 0,
         session_id: SessionId::from_uuid(uuid::Uuid::nil()),
         sdp: "v=0\r\n".into(),
     };
@@ -97,4 +98,22 @@ fn signaling_and_helper_messages_round_trip() {
         decode_control::<HelperEvent>(&encode_control(&event).unwrap()).unwrap(),
         HelperEvent::DisplayChanged(DisplayInfo { width: 1920, .. })
     ));
+}
+
+#[test]
+fn ice_servers_round_trip_without_debugging_secrets() {
+    let server = IceServer {
+        urls: vec!["turn:example.test:3478?transport=udp".into()],
+        username: Some("temporary-user".into()),
+        credential: Some("temporary-secret".into()),
+        expires_at_unix_secs: Some(12345),
+    };
+    let decoded: IceServer = decode_control(&encode_control(&server).unwrap()).unwrap();
+    assert!(server == decoded);
+    assert!(!format!("{server:?}").contains("temporary-"));
+    let signal = SignalMessage::Restart {
+        session_id: SessionId::from_uuid(uuid::Uuid::nil()),
+        epoch: 2,
+    };
+    assert!(signal == decode_control(&encode_control(&signal).unwrap()).unwrap());
 }

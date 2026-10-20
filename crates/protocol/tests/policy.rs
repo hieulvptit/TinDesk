@@ -186,3 +186,77 @@ fn display_update_invalidates_old_input_and_resets_motion_sequence() {
         Err(ProtocolError::WrongGeneration)
     );
 }
+
+#[test]
+fn click_and_scroll_advance_motion_high_water_without_rejecting_reliable_input() {
+    let mut guard = guard();
+    guard
+        .accept(&envelope(InputEvent::PointerMove { x: 10, y: 20 }, 10), 0)
+        .unwrap();
+    guard
+        .accept(
+            &envelope(
+                InputEvent::Button {
+                    button: MouseButton::Left,
+                    pressed: true,
+                    x: 40,
+                    y: 50,
+                },
+                12,
+            ),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        guard.accept(&envelope(InputEvent::PointerMove { x: 20, y: 30 }, 11), 0),
+        Err(ProtocolError::StaleSequence)
+    );
+    guard
+        .accept(&envelope(InputEvent::PointerMove { x: 60, y: 70 }, 13), 0)
+        .unwrap();
+    guard
+        .accept(
+            &envelope(
+                InputEvent::Scroll {
+                    delta_x: 0,
+                    delta_y: 1,
+                    x: 80,
+                    y: 90,
+                },
+                15,
+            ),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        guard.accept(&envelope(InputEvent::PointerMove { x: 20, y: 30 }, 14), 0),
+        Err(ProtocolError::StaleSequence)
+    );
+    guard
+        .accept(
+            &envelope(
+                InputEvent::Button {
+                    button: MouseButton::Left,
+                    pressed: false,
+                    x: 40,
+                    y: 50,
+                },
+                9,
+            ),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        guard.accept(&envelope(InputEvent::PointerMove { x: 20, y: 30 }, 14), 0),
+        Err(ProtocolError::StaleSequence)
+    );
+}
+
+#[test]
+fn accepting_input_does_not_renew_the_lease() {
+    let mut guard = guard();
+    guard
+        .accept(&envelope(InputEvent::ReleaseAll, 1), 59_999)
+        .unwrap();
+    assert!(guard.expired(60_000));
+}
