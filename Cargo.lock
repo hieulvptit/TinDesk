@@ -797,8 +797,12 @@ dependencies = [
 name = "remotevnc-seat-helper"
 version = "0.1.0"
 dependencies = [
+ "gstreamer",
  "libc",
  "remotevnc-protocol",
+ "remotevnc-transport",
+ "serde",
+ "serde_json",
  "signal-hook",
  "uuid",
  "x11rb",

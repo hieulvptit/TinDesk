@@ -179,6 +179,9 @@ fn stalled_discovery_cannot_delay_responsive_input_cleanup() {
                 authority_modified_ns: 0,
                 connection_epoch: 0,
             },
+            output: "screen".into(),
+            origin_x: 0,
+            origin_y: 0,
             width: 800,
             height: 600,
         };
@@ -233,6 +236,13 @@ fn stalled_discovery_cannot_delay_responsive_input_cleanup() {
                 session_id: id,
                 display,
             },
+            HelperRequest::Input(InputEnvelope {
+                version: WIRE_VERSION,
+                session_id: id,
+                generation: display.generation,
+                sequence: 0,
+                event: InputEvent::DisplayAck,
+            }),
             HelperRequest::Input(InputEnvelope {
                 version: WIRE_VERSION,
                 session_id: id,
@@ -307,4 +317,40 @@ fn stalled_discovery_cannot_delay_responsive_input_cleanup() {
             "{reason} left button held"
         );
     }
+}
+
+#[test]
+fn display_reset_requires_ack_and_does_not_renew_lease() {
+    let id = SessionId(Uuid::nil());
+    let mut policy = SessionPolicy::default();
+    let display = DisplayInfo {
+        generation: 1,
+        width: 800,
+        height: 600,
+    };
+    policy.start(id, display, 0).unwrap();
+    let mut input = InputEnvelope {
+        version: WIRE_VERSION,
+        session_id: id,
+        generation: 1,
+        sequence: 0,
+        event: InputEvent::PointerMove { x: 1, y: 1 },
+    };
+    assert!(policy.accept(&input, 1).is_err());
+    input.event = InputEvent::DisplayAck;
+    policy.accept(&input, 2).unwrap();
+    policy
+        .update_display(DisplayInfo {
+            generation: 2,
+            ..display
+        })
+        .unwrap();
+    input.generation = 2;
+    input.event = InputEvent::PointerMove { x: 1, y: 1 };
+    assert!(policy.accept(&input, 3).is_err());
+    input.event = InputEvent::DisplayAck;
+    policy.accept(&input, 4).unwrap();
+    input.event = InputEvent::PointerMove { x: 1, y: 1 };
+    policy.accept(&input, 5).unwrap();
+    assert!(policy.expired(LEASE_DURATION_MS));
 }

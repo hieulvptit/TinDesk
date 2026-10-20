@@ -43,7 +43,7 @@ pub fn physical_session(s: &SessionProperties) -> bool {
         && s.get("VTNr").parse::<u32>().is_ok_and(|v| v > 0)
         && display_number(s.get("Display")).is_some()
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ServerIdentity {
     pub process_start: String,
     pub socket_inode: u64,
@@ -52,7 +52,7 @@ pub struct ServerIdentity {
     /// A persistent probe is lost on reset, even if the PID/socket have not changed.
     pub connection_epoch: u64,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DisplayTarget {
     pub seat: String,
     pub display: String,
@@ -60,6 +60,9 @@ pub struct DisplayTarget {
     pub identity: ServerIdentity,
     pub width: u32,
     pub height: u32,
+    pub output: String,
+    pub origin_x: u32,
+    pub origin_y: u32,
 }
 impl DisplayTarget {
     pub fn socket_path(&self) -> Result<PathBuf> {
@@ -69,6 +72,7 @@ impl DisplayTarget {
 }
 #[derive(Default)]
 pub struct SeatMonitor {
+    output_selector: Option<String>,
     #[cfg(target_os = "linux")]
     probe: x11::ServerProbe,
 }
@@ -154,6 +158,13 @@ fn loginctl(args: &[&str], cancelled: &dyn Fn() -> bool) -> Result<String> {
     )
 }
 impl SeatMonitor {
+    pub fn with_output(output_selector: Option<String>) -> Self {
+        Self {
+            output_selector,
+            #[cfg(target_os = "linux")]
+            probe: Default::default(),
+        }
+    }
     pub fn current(&mut self) -> Result<Option<DisplayTarget>> {
         self.current_with_cancel(&|| false)
     }
@@ -163,7 +174,7 @@ impl SeatMonitor {
     ) -> Result<Option<DisplayTarget>> {
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = cancelled;
+            let _ = (cancelled, &self.output_selector);
             Err(error("physical seat discovery requires Linux/logind"))
         }
         #[cfg(target_os = "linux")]
@@ -266,6 +277,9 @@ impl SeatMonitor {
                     authority_modified_ns: 0,
                     connection_epoch: 0,
                 },
+                output: String::new(),
+                origin_x: 0,
+                origin_y: 0,
                 width: 0,
                 height: 0,
             };
@@ -287,10 +301,48 @@ impl SeatMonitor {
         if cancelled() {
             return Err(error("seat discovery cancelled"));
         }
-        let (epoch, width, height) = self.probe.refresh(&target)?;
+        let (epoch, _, _) = self.probe.refresh(&target)?;
         target.identity.connection_epoch = epoch;
-        target.width = width;
-        target.height = height;
+        let output = x11::selected_output(&target, self.output_selector.as_deref())?;
+        target.width = output.width;
+        target.height = output.height;
+        target.output = output.name;
+        target.origin_x = output.x;
+        target.origin_y = output.y;
         Ok(Some(target))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputGeometry {
+    pub name: String,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub primary: bool,
+}
+impl OutputGeometry {
+    pub fn root_position(&self, x: u32, y: u32) -> Result<(i16, i16)> {
+        if x >= self.width || y >= self.height {
+            return Err(error("pointer outside selected output"));
+        }
+        Ok((
+            i16::try_from(self.x.checked_add(x).ok_or("pointer overflow")?)?,
+            i16::try_from(self.y.checked_add(y).ok_or("pointer overflow")?)?,
+        ))
+    }
+}
+pub fn select_output(outputs: &[OutputGeometry], name: Option<&str>) -> Result<OutputGeometry> {
+    let selected = if let Some(name) = name {
+        outputs.iter().find(|o| o.name == name)
+    } else {
+        outputs
+            .iter()
+            .find(|o| o.primary)
+            .or_else(|| outputs.first())
+    };
+    selected
+        .cloned()
+        .ok_or_else(|| error("selected physical RandR output unavailable"))
 }

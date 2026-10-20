@@ -293,16 +293,9 @@ fn reliable_event_overflow_closes_instead_of_silently_dropping_input() {
 }
 
 #[test]
-fn video_transceiver_can_be_configured_before_the_initial_offer() {
+fn structured_h264_is_configured_before_the_initial_offer() {
     let mut a = Peer::new(config(PeerRole::Controller)).unwrap();
-    let caps = gst::Caps::builder("application/x-rtp")
-        .field("media", "video")
-        .field("encoding-name", "H264")
-        .field("payload", 96i32)
-        .field("clock-rate", 90_000i32)
-        .build();
-    a.add_video_transceiver(gst_webrtc::WebRTCRTPTransceiverDirection::Recvonly, &caps)
-        .unwrap();
+    a.enable_h264().unwrap();
     a.start_negotiation().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

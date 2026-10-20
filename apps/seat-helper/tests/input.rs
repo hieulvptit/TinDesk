@@ -20,6 +20,9 @@ fn target() -> remotevnc_seat_helper::seat::DisplayTarget {
             authority_modified_ns: 0,
             connection_epoch: 0,
         },
+        output: "screen".into(),
+        origin_x: 0,
+        origin_y: 0,
         width: 800,
         height: 600,
     }

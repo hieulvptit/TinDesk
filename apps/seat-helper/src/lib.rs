@@ -1,3 +1,4 @@
+pub mod capture;
 pub mod input;
 pub mod ipc;
 pub mod seat;

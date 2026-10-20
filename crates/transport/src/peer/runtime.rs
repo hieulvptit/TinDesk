@@ -4,6 +4,7 @@ pub(super) fn build_engine(shared: &Arc<Shared>, epoch: u64) -> Result<Arc<Engin
     let config = shared.config.lock().unwrap().clone();
     let webrtc = gst::ElementFactory::make("webrtcbin")
         .property("bundle-policy", gst_webrtc::WebRTCBundlePolicy::MaxBundle)
+        .property("latency", 40u32)
         .property(
             "ice-transport-policy",
             if config.relay_only {
@@ -15,6 +16,18 @@ pub(super) fn build_engine(shared: &Arc<Shared>, epoch: u64) -> Result<Arc<Engin
         .build()
         .map_err(|_| TransportError::NativeDependency)?;
     configure_ice(&webrtc, &config.ice_servers)?;
+    webrtc
+        .clone()
+        .downcast::<gst::Bin>()
+        .map_err(|_| TransportError::NativeDependency)?
+        .connect_deep_element_added(|_, _, element| {
+            if element
+                .factory()
+                .is_some_and(|f| f.name() == "rtpjitterbuffer")
+            {
+                element.set_property("drop-on-latency", true);
+            }
+        });
     let pipeline = gst::Pipeline::new();
     pipeline
         .add(&webrtc)
@@ -26,6 +39,9 @@ pub(super) fn build_engine(shared: &Arc<Shared>, epoch: u64) -> Result<Arc<Engin
         channels: Mutex::new(HashMap::new()),
         signaling: Mutex::new(Signaling::default()),
         negotiating: AtomicBool::new(false),
+        stats_pending: AtomicBool::new(false),
+        keyframe_requested: AtomicBool::new(false),
+        video: Mutex::new(None),
     });
     let weak = Arc::downgrade(shared);
     engine
@@ -110,6 +126,9 @@ pub(super) fn build_engine(shared: &Arc<Shared>, epoch: u64) -> Result<Arc<Engin
             }
             None
         });
+    if shared.video_enabled.load(Ordering::Acquire) {
+        video::install(shared, &engine)?;
+    }
     if engine.pipeline.set_state(gst::State::Playing).is_err() {
         let _ = engine.pipeline.set_state(gst::State::Null);
         return Err(TransportError::NativeOperation);
@@ -326,12 +345,16 @@ pub(super) fn monitor_peer(shared: Arc<Shared>) {
         {
             shared.counters.motion.fetch_add(1, Ordering::Relaxed);
         }
-        if let Some(frame) = shared.frame.lock().unwrap().take()
+        let frame = shared.frame.lock().unwrap().take();
+        if let Some(frame) = frame
             && !shared.low_priority(PeerEvent::Frame(frame))
         {
             shared.counters.frames.fetch_add(1, Ordering::Relaxed);
         }
         if stats_at.elapsed() >= Duration::from_secs(1) {
+            if let Ok(engine) = shared.engine() {
+                video::query_stats(&shared, &engine);
+            }
             shared.low_priority(PeerEvent::Stats(shared.counters.snapshot()));
             stats_at = Instant::now();
         }

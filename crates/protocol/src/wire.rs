@@ -47,6 +47,17 @@ impl DisplayInfo {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SignalMessage {
+    /// Agent-owned physical geometry; sent in current epoch before its Restart.
+    Display {
+        session_id: SessionId,
+        epoch: u64,
+        display: DisplayInfo,
+    },
+    DisplayUnavailable {
+        session_id: SessionId,
+        epoch: u64,
+        generation: u64,
+    },
     /// Coordinated fresh PeerConnection; all subsequent messages carry this epoch.
     Restart {
         session_id: SessionId,

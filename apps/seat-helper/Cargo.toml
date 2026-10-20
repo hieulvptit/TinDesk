@@ -7,9 +7,13 @@ license.workspace = true
 
 [dependencies]
 remotevnc-protocol = { path = "../../crates/protocol" }
-x11rb = { version = "0.13", features = ["xtest", "xkb", "xinput"] }
+x11rb = { version = "0.13", features = ["xtest", "xkb", "xinput", "randr"] }
 libc = "0.2"
 signal-hook = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+gst = { package = "gstreamer", version = "0.24", features = ["v1_24"] }
 
 [dev-dependencies]
 uuid.workspace = true
+remotevnc-transport = { path = "../../crates/transport" }

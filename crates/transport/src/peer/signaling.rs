@@ -136,6 +136,13 @@ pub(super) fn apply_remote(
 
 pub(super) fn rebuild(shared: &Arc<Shared>, epoch: u64, ice: Option<Vec<IceServer>>) -> Result<()> {
     let _rebuild = shared.rebuild.lock().unwrap();
+    rebuild_locked(shared, epoch, ice)
+}
+pub(super) fn rebuild_locked(
+    shared: &Arc<Shared>,
+    epoch: u64,
+    ice: Option<Vec<IceServer>>,
+) -> Result<()> {
     shared.engine()?;
     if epoch
         != shared
@@ -172,6 +179,7 @@ pub(super) fn rebuild(shared: &Arc<Shared>, epoch: u64, ice: Option<Vec<IceServe
     shared.outgoing_motion.lock().unwrap().take();
     shared.incoming_motion.lock().unwrap().take();
     shared.frame.lock().unwrap().take();
+    *shared.counters.native.lock().unwrap() = crate::stats::NativeStats::default();
     let config = shared.config.lock().unwrap().clone();
     // A transport rebuild must not extend the authorization lease.
     let mut decoder = shared.input.lock().unwrap();
@@ -196,11 +204,51 @@ pub(super) fn rebuild(shared: &Arc<Shared>, epoch: u64, ice: Option<Vec<IceServe
         }
         *shared.engine.lock().unwrap() = Some(engine);
     }
+    if let Some(display) = config.display {
+        shared.emit_at(epoch, PeerEvent::DisplayChanged(display));
+        shared.emit_at(
+            epoch,
+            PeerEvent::InputReset {
+                generation: display.generation,
+            },
+        );
+    }
+    if config.display.is_none()
+        && let Some(generation) = *shared.display_generation.lock().unwrap()
+    {
+        shared.emit_at(epoch, PeerEvent::DisplayUnavailable { generation });
+        shared.emit_at(epoch, PeerEvent::InputReset { generation });
+    }
     if local_restart {
         #[cfg(test)]
         shared.hooks.before_restart_marker.pause();
         shared.engine()?;
         let session_id = shared.config.lock().unwrap().session_id;
+        if config.role == PeerRole::Agent
+            && let Some(display) = config.display
+        {
+            shared.emit_at(
+                epoch,
+                PeerEvent::Signal(SignalMessage::Display {
+                    session_id,
+                    epoch: epoch - 1,
+                    display,
+                }),
+            );
+        }
+        if config.role == PeerRole::Agent
+            && config.display.is_none()
+            && let Some(generation) = *shared.display_generation.lock().unwrap()
+        {
+            shared.emit_at(
+                epoch,
+                PeerEvent::Signal(SignalMessage::DisplayUnavailable {
+                    session_id,
+                    epoch: epoch - 1,
+                    generation,
+                }),
+            );
+        }
         shared.emit_at(
             epoch,
             PeerEvent::Signal(SignalMessage::Restart { session_id, epoch }),

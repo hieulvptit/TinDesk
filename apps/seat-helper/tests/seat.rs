@@ -50,6 +50,9 @@ fn live_probe_changes_epoch_on_same_pid_server_reset() {
             authority_modified_ns: 0,
             connection_epoch: 0,
         },
+        output: "screen".into(),
+        origin_x: 0,
+        origin_y: 0,
         width: 0,
         height: 0,
     };
@@ -107,4 +110,36 @@ fn stalled_discovery_subprocess_is_bounded_and_cancellable() {
         .unwrap(),
         "seat0\n"
     );
+}
+
+#[test]
+fn selects_one_active_randr_output_and_offsets_pointer() {
+    use remotevnc_seat_helper::seat::{OutputGeometry, select_output};
+    let left = OutputGeometry {
+        name: "HDMI-1".into(),
+        x: 0,
+        y: 0,
+        width: 1920,
+        height: 1080,
+        primary: false,
+    };
+    let right = OutputGeometry {
+        name: "DP-1".into(),
+        x: 1920,
+        y: 100,
+        width: 1280,
+        height: 720,
+        primary: true,
+    };
+    assert_eq!(
+        select_output(&[left.clone(), right.clone()], None).unwrap(),
+        right
+    );
+    assert_eq!(
+        select_output(&[left.clone(), right.clone()], Some("HDMI-1")).unwrap(),
+        left
+    );
+    assert!(select_output(std::slice::from_ref(&right), Some("missing")).is_err());
+    assert_eq!(right.root_position(100, 50).unwrap(), (2020, 150));
+    assert!(right.root_position(1280, 50).is_err());
 }

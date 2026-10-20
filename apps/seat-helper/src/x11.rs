@@ -91,3 +91,42 @@ impl ServerProbe {
         Ok((self.epoch, geometry.width.into(), geometry.height.into()))
     }
 }
+
+/// Query active connected RandR outputs, never silently capture the entire root.
+pub fn selected_output(
+    target: &DisplayTarget,
+    selector: Option<&str>,
+) -> Result<crate::seat::OutputGeometry> {
+    use x11rb::{
+        connection::Connection,
+        protocol::randr::{Connection as OutputConnection, ConnectionExt},
+    };
+    let c = connect(target)?;
+    let root = c.setup().roots[0].root;
+    let resources = c.randr_get_screen_resources_current(root)?.reply()?;
+    let primary = c.randr_get_output_primary(root)?.reply()?.output;
+    let mut outputs = Vec::new();
+    for id in resources.outputs {
+        let output = c
+            .randr_get_output_info(id, resources.config_timestamp)?
+            .reply()?;
+        if output.connection != OutputConnection::CONNECTED || output.crtc == 0 {
+            continue;
+        }
+        let crtc = c
+            .randr_get_crtc_info(output.crtc, resources.config_timestamp)?
+            .reply()?;
+        if crtc.mode == 0 || crtc.width == 0 || crtc.height == 0 || crtc.x < 0 || crtc.y < 0 {
+            continue;
+        }
+        outputs.push(crate::seat::OutputGeometry {
+            name: String::from_utf8(output.name)?,
+            x: crtc.x as u32,
+            y: crtc.y as u32,
+            width: crtc.width.into(),
+            height: crtc.height.into(),
+            primary: id == primary,
+        });
+    }
+    crate::seat::select_output(&outputs, selector)
+}

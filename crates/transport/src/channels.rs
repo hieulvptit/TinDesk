@@ -62,6 +62,10 @@ impl InputDecoder {
         self.acknowledged = false;
         Ok(())
     }
+    pub(crate) fn clear_display(&mut self) {
+        self.guard = None;
+        self.acknowledged = false;
+    }
     pub(crate) fn last_renewed_ms(&self) -> u64 {
         self.last_renewed_ms
     }

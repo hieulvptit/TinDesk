@@ -35,6 +35,8 @@ pub struct X11Input {
     pointer_device: u16,
     width: u32,
     height: u32,
+    origin_x: u32,
+    origin_y: u32,
     keys: BTreeMap<u32, u8>,
     buttons: BTreeSet<u8>,
 }
@@ -69,12 +71,19 @@ impl X11Input {
         }
         let root = connection.setup().roots[0].root;
         let geometry = connection.get_geometry(root)?.reply()?;
+        if target.origin_x.saturating_add(target.width) > u32::from(geometry.width)
+            || target.origin_y.saturating_add(target.height) > u32::from(geometry.height)
+        {
+            return Err(error("selected output outside root"));
+        }
         Ok(Self {
             connection,
             root,
             pointer_device,
-            width: geometry.width.into(),
-            height: geometry.height.into(),
+            width: target.width,
+            height: target.height,
+            origin_x: target.origin_x,
+            origin_y: target.origin_y,
             keys: BTreeMap::new(),
             buttons: BTreeSet::new(),
         })
@@ -92,8 +101,8 @@ impl X11Input {
         self.fake(
             xproto::MOTION_NOTIFY_EVENT,
             0,
-            i16::try_from(x)?,
-            i16::try_from(y)?,
+            i16::try_from(self.origin_x.checked_add(x).ok_or("pointer overflow")?)?,
+            i16::try_from(self.origin_y.checked_add(y).ok_or("pointer overflow")?)?,
         )
     }
     pub fn apply(&mut self, event: &InputEvent) -> Result<()> {

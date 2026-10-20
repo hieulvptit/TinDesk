@@ -27,13 +27,18 @@ fn main() {
     }
 }
 fn run() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--capture-worker") {
+        return remotevnc_seat_helper::capture::worker_main();
+    }
     let mut args = std::env::args().skip(1);
     let mut socket = PathBuf::from("/run/remotevnc/helper.sock");
     let mut agent_uid = None;
     let mut doctor = false;
+    let mut output_selector = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "doctor" => doctor = true,
+            "--output" => output_selector = Some(args.next().ok_or("missing --output value")?),
             "--socket" => socket = args.next().ok_or("missing --socket value")?.into(),
             "--agent-uid" => {
                 agent_uid = Some(
@@ -44,13 +49,13 @@ fn run() -> Result<()> {
             }
             _ => {
                 return Err(
-                    "usage: remotevnc-seat-helper [doctor] [--socket PATH] [--agent-uid UID]"
+                    "usage: remotevnc-seat-helper [doctor] [--socket PATH] [--agent-uid UID] [--output RANDR_NAME]"
                         .into(),
                 );
             }
         }
     }
-    let mut monitor = SeatMonitor::default();
+    let mut monitor = SeatMonitor::with_output(output_selector);
     if doctor {
         match monitor.current()? {
             Some(target) => {

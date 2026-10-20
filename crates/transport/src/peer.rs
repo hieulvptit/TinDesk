@@ -58,6 +58,23 @@ pub struct DecodedFrame {
     pub rgba: Vec<u8>,
     pub pts_ns: Option<u64>,
 }
+impl DecodedFrame {
+    /// Map a decoded image pixel into physical output coordinates. UI callers
+    /// first remove letterboxing/viewport scaling; helper adds the RandR origin.
+    pub fn physical_position(&self, display: DisplayInfo, x: u32, y: u32) -> Result<(u32, u32)> {
+        display.validate()?;
+        if self.generation != display.generation {
+            return Err(ProtocolError::WrongGeneration.into());
+        }
+        if self.width == 0 || self.height == 0 || x >= self.width || y >= self.height {
+            return Err(ProtocolError::InvalidCoordinates.into());
+        }
+        Ok((
+            (u64::from(x) * u64::from(display.width) / u64::from(self.width)) as u32,
+            (u64::from(y) * u64::from(display.height) / u64::from(self.height)) as u32,
+        ))
+    }
+}
 /// Secret-bearing variants deliberately prevent deriving Debug for this enum.
 pub enum PeerEvent {
     Signal(SignalMessage),
@@ -66,6 +83,15 @@ pub enum PeerEvent {
     ConnectionChanged(ConnectionState),
     ChannelsReady,
     NegotiationNeeded,
+    KeyframeNeeded,
+    DisplayChanged(DisplayInfo),
+    DisplayUnavailable {
+        generation: u64,
+    },
+    /// Consumers clear locally held key/button state; Agent releases helper input.
+    InputReset {
+        generation: u64,
+    },
     Stats(PeerStats),
     InputRejected(ProtocolError),
     Error(TransportError),
@@ -84,11 +110,16 @@ struct Engine {
     channels: Mutex<HashMap<String, gst_webrtc::WebRTCDataChannel>>,
     signaling: Mutex<Signaling>,
     negotiating: AtomicBool,
+    stats_pending: AtomicBool,
+    keyframe_requested: AtomicBool,
+    video: Mutex<Option<video::SenderState>>,
 }
 struct Shared {
     #[cfg(test)]
     hooks: lifecycle_tests::Hooks,
     config: Mutex<PeerConfig>,
+    display_generation: Mutex<Option<u64>>,
+    video_enabled: AtomicBool,
     engine: Mutex<Option<Arc<Engine>>>,
     rebuild: Mutex<()>,
     epoch: AtomicU64,
@@ -151,6 +182,49 @@ impl Shared {
             self.closed.store(true, Ordering::Release);
         }
     }
+    /// Caller holds the lifecycle mutex. Keep the input lock until callbacks
+    /// are fenced and queued input/media are removed; callbacks publish under it.
+    fn set_display_locked(&self, display: Option<DisplayInfo>, generation: u64) -> Result<()> {
+        if let Some(display) = display {
+            display.validate()?;
+        }
+        let mut high_water = self.display_generation.lock().unwrap();
+        if high_water.is_some_and(|old| generation <= old) {
+            if *high_water == Some(generation) && self.config.lock().unwrap().display == display {
+                return Ok(());
+            }
+            return Err(ProtocolError::WrongGeneration.into());
+        }
+        let mut input = self.input.lock().unwrap();
+        if let Some(display) = display {
+            input.update_display(display)?;
+        } else {
+            input.clear_display();
+        }
+        {
+            let _gate = self.event_gate.lock().unwrap();
+            self.config.lock().unwrap().display = display;
+            *high_water = Some(generation);
+            self.incoming_motion.lock().unwrap().take();
+            self.outgoing_motion.lock().unwrap().take();
+            self.frame.lock().unwrap().take();
+            let keep: Vec<_> = self
+                .events_drain
+                .try_iter()
+                .filter(|event| !matches!(event, PeerEvent::Input(_) | PeerEvent::Frame(_)))
+                .collect();
+            for event in keep {
+                let _ = self.events.try_send(event);
+            }
+        }
+        drop(input);
+        self.emit(PeerEvent::InputReset { generation });
+        self.emit(match display {
+            Some(d) => PeerEvent::DisplayChanged(d),
+            None => PeerEvent::DisplayUnavailable { generation },
+        });
+        Ok(())
+    }
     fn low_priority(&self, event: PeerEvent) -> bool {
         let _gate = self.event_gate.lock().unwrap();
         !self.closed.load(Ordering::Acquire)
@@ -183,7 +257,9 @@ impl Peer {
         let shared = Arc::new(Shared {
             #[cfg(test)]
             hooks: lifecycle_tests::Hooks::default(),
+            display_generation: Mutex::new(config.display.map(|d| d.generation)),
             config: Mutex::new(config),
+            video_enabled: AtomicBool::new(false),
             engine: Mutex::new(None),
             rebuild: Mutex::new(()),
             epoch: AtomicU64::new(0),
@@ -217,6 +293,16 @@ impl Peer {
                 return Err(TransportError::NativeOperation);
             }
         };
+        let config = shared.config.lock().unwrap().clone();
+        if config.role == PeerRole::Agent
+            && let Some(display) = config.display
+        {
+            shared.emit(PeerEvent::Signal(SignalMessage::Display {
+                session_id: config.session_id,
+                epoch: 0,
+                display,
+            }));
+        }
         Ok(Self {
             shared,
             events,
@@ -269,7 +355,13 @@ impl Peer {
     pub fn handle_signal(&self, message: SignalMessage) -> Result<()> {
         encode_control(&message)?;
         let (session_id, epoch) = match &message {
-            SignalMessage::Offer {
+            SignalMessage::Display {
+                session_id, epoch, ..
+            }
+            | SignalMessage::DisplayUnavailable {
+                session_id, epoch, ..
+            }
+            | SignalMessage::Offer {
                 session_id, epoch, ..
             }
             | SignalMessage::Answer {
@@ -317,6 +409,22 @@ impl Peer {
         let engine = self.shared.engine()?;
         match message {
             SignalMessage::End { .. } => unreachable!(),
+            SignalMessage::Display { display, .. } => {
+                if self.shared.config.lock().unwrap().role != PeerRole::Controller {
+                    return Err(TransportError::WrongRole);
+                }
+                display.validate()?;
+                if self.shared.config.lock().unwrap().display != Some(display) {
+                    self.shared
+                        .set_display_locked(Some(display), display.generation)?;
+                }
+            }
+            SignalMessage::DisplayUnavailable { generation, .. } => {
+                if self.shared.config.lock().unwrap().role != PeerRole::Controller {
+                    return Err(TransportError::WrongRole);
+                }
+                self.shared.set_display_locked(None, generation)?;
+            }
             SignalMessage::Offer { sdp, .. } => {
                 if self.shared.config.lock().unwrap().role != PeerRole::Agent {
                     return Err(TransportError::WrongRole);
@@ -404,30 +512,39 @@ impl Peer {
         self.shared.counters.sent.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+    /// Only the Agent owns physical generation changes. Metadata and Restart
+    /// are published in order within the same lifecycle transaction.
     pub fn update_display(&self, display: DisplayInfo) -> Result<()> {
         let _rebuild = self.shared.rebuild.lock().unwrap();
         self.shared.engine()?;
-        self.shared.input.lock().unwrap().update_display(display)?;
-        self.shared.config.lock().unwrap().display = Some(display);
-        self.shared.incoming_motion.lock().unwrap().take();
-        self.shared.outgoing_motion.lock().unwrap().take();
-        self.shared.frame.lock().unwrap().take();
-        {
-            let _gate = self.shared.event_gate.lock().unwrap();
-            let keep: Vec<_> = self
-                .shared
-                .events_drain
-                .try_iter()
-                .filter(|event| match event {
-                    PeerEvent::Input(input) => input.generation == display.generation,
-                    PeerEvent::Frame(frame) => frame.generation == display.generation,
-                    _ => true,
-                })
-                .collect();
-            for event in keep {
-                let _ = self.shared.events.try_send(event);
-            }
+        if self.shared.config.lock().unwrap().role != PeerRole::Agent {
+            return Err(TransportError::WrongRole);
         }
+        self.shared
+            .set_display_locked(Some(display), display.generation)?;
+        let epoch = self
+            .epoch()
+            .checked_add(1)
+            .ok_or(TransportError::StaleEpoch)?;
+        let ice = self.shared.config.lock().unwrap().ice_servers.clone();
+        rebuild_locked(&self.shared, epoch, Some(ice))
+    }
+    /// Pause a missing physical display without ending the authorized session.
+    /// The next available display must have a strictly newer helper generation.
+    pub fn display_unavailable(&self, generation: u64) -> Result<()> {
+        let _rebuild = self.shared.rebuild.lock().unwrap();
+        self.shared.engine()?;
+        let config = self.shared.config.lock().unwrap().clone();
+        if config.role != PeerRole::Agent {
+            return Err(TransportError::WrongRole);
+        }
+        self.shared.set_display_locked(None, generation)?;
+        self.shared
+            .emit(PeerEvent::Signal(SignalMessage::DisplayUnavailable {
+                session_id: config.session_id,
+                epoch: self.epoch(),
+                generation,
+            }));
         Ok(())
     }
     /// Invoke only following a successful authorized backend lease renewal.
@@ -451,29 +568,8 @@ impl Peer {
             .ok_or(TransportError::StaleEpoch)?;
         rebuild(&self.shared, epoch, Some(ice))
     }
-    /// Configure H264 RTP transceivers before start_negotiation. Task4 adds the
-    /// capture/decode graph inside this crate using the private engine handles.
-    pub fn add_video_transceiver(
-        &self,
-        direction: gst_webrtc::WebRTCRTPTransceiverDirection,
-        caps: &gst::Caps,
-    ) -> Result<()> {
-        let _rebuild = self.shared.rebuild.lock().unwrap();
-        let engine = self.shared.engine()?;
-        if caps.is_empty()
-            || caps
-                .iter()
-                .any(|s| s.name() != "application/x-rtp" || s.get::<&str>("media") != Ok("video"))
-        {
-            return Err(ProtocolError::InvalidPayload.into());
-        }
-        let _: gst_webrtc::WebRTCRTPTransceiver = engine
-            .webrtc
-            .emit_by_name("add-transceiver", &[&direction, caps]);
-        Ok(())
-    }
     /// Coalesce decoded frames; media never blocks input or shutdown. Generation
-    /// and tightly packed RGBA dimensions must match current display metadata.
+    /// must match current display metadata; encoded dimensions may be scaled.
     pub fn publish_frame(&self, frame: DecodedFrame) -> Result<()> {
         let _rebuild = self.shared.rebuild.lock().unwrap();
         self.shared.engine()?;
@@ -487,8 +583,10 @@ impl Peer {
         if frame.generation != display.generation {
             return Err(ProtocolError::WrongGeneration.into());
         }
-        if frame.width != display.width
-            || frame.height != display.height
+        if frame.width == 0
+            || frame.height == 0
+            || frame.width > 3840
+            || frame.height > 2160
             || frame.rgba.len() > 128 * 1024 * 1024
             || (frame.width as usize)
                 .checked_mul(frame.height as usize)
@@ -529,8 +627,10 @@ fn active(weak: &Weak<Shared>, epoch: u64) -> Option<Arc<Shared>> {
 
 mod runtime;
 mod signaling;
+#[path = "video.rs"]
+mod video;
 use runtime::{build_engine, monitor_peer};
-use signaling::{apply_remote, create_description, rebuild, validate_ice};
+use signaling::{apply_remote, create_description, rebuild, rebuild_locked, validate_ice};
 
 #[cfg(test)]
 mod tests {

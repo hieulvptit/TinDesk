@@ -1,4 +1,4 @@
-use crate::{Result, error, input::X11Input, seat::DisplayTarget};
+use crate::{Result, capture::Capture, error, input::X11Input, seat::DisplayTarget};
 use remotevnc_protocol::*;
 use std::{
     io::{ErrorKind, Read, Write},
@@ -47,6 +47,7 @@ pub fn send_event(writer: &mut impl Write, event: &HelperEvent) -> Result<()> {
 #[derive(Default)]
 pub struct SessionPolicy {
     session: Option<(SessionId, u64, InputGuard)>,
+    acknowledged: bool,
 }
 impl SessionPolicy {
     pub fn start(&mut self, id: SessionId, display: DisplayInfo, now: u64) -> Result<()> {
@@ -54,6 +55,7 @@ impl SessionPolicy {
             return Err(error("control session already active"));
         }
         self.session = Some((id, display.generation, InputGuard::new(id, display, now)?));
+        self.acknowledged = false;
         Ok(())
     }
     pub fn validate(&self, id: SessionId, generation: u64, now: u64) -> Result<()> {
@@ -69,12 +71,27 @@ impl SessionPolicy {
         }
         Ok(())
     }
+    pub fn update_display(&mut self, display: DisplayInfo) -> Result<()> {
+        let (_, generation, guard) = self.session.as_mut().ok_or("no session")?;
+        guard.update_display(display)?;
+        *generation = display.generation;
+        self.acknowledged = false;
+        Ok(())
+    }
     pub fn accept(&mut self, input: &InputEnvelope, now: u64) -> Result<()> {
+        if !self.acknowledged
+            && !matches!(input.event, InputEvent::DisplayAck | InputEvent::ReleaseAll)
+        {
+            return Err(error("display acknowledgement required"));
+        }
         let (_, _, guard) = self
             .session
             .as_mut()
             .ok_or_else(|| error("no active session"))?;
         guard.accept(input, now)?;
+        if matches!(input.event, InputEvent::DisplayAck) {
+            self.acknowledged = true;
+        }
         Ok(())
     }
     pub fn renew(&mut self, id: SessionId, generation: u64, now: u64) -> Result<()> {
@@ -143,49 +160,107 @@ pub fn serve(
     now_ms: impl Fn() -> u64,
     stop: &AtomicBool,
 ) -> Result<()> {
-    send_event(peer, &HelperEvent::Ready)?;
+    let output = Output::new(peer.try_clone()?)?;
+    output.event(HelperEvent::Ready)?;
+    let mut capture: Option<Capture> = None;
+    let mut recovering_video = false;
+    let mut last_scan = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    peer.set_read_timeout(Some(std::time::Duration::from_millis(5)))?;
     let mut target = None;
     let mut input: Option<X11Input> = None;
     let mut policy = SessionPolicy::default();
     let mut frames = FrameDecoder::default();
     loop {
         // Cancellation is checked before discovery and while loginctl is waiting.
-        let cancelled =
-            || stop.load(Ordering::Relaxed) || policy.expired(now_ms()) || disconnected(peer);
+        let cancelled = || {
+            stop.load(Ordering::Relaxed)
+                || output.failed.load(Ordering::Relaxed)
+                || policy.expired(now_ms())
+                || disconnected(peer)
+        };
         if cancelled() {
             input.take();
+            capture.take();
             if let Some(session_id) = policy.stop() {
-                send_event(peer, &HelperEvent::Stopped { session_id })?;
+                output.event(HelperEvent::Stopped { session_id })?;
             }
             return Ok(());
         }
-        let current = monitor(&cancelled).unwrap_or(None);
+        let current = if last_scan.elapsed() >= std::time::Duration::from_millis(100) {
+            last_scan = std::time::Instant::now();
+            monitor(&cancelled).unwrap_or(None)
+        } else {
+            target.clone()
+        };
         // Sample after discovery: its result never extends a control lease.
         let now = now_ms();
         if stop.load(Ordering::Relaxed) || policy.expired(now) || disconnected(peer) {
             input.take();
+            capture.take();
             if let Some(session_id) = policy.stop() {
-                send_event(peer, &HelperEvent::Stopped { session_id })?;
+                output.event(HelperEvent::Stopped { session_id })?;
             }
             return Ok(());
         }
         if current != target {
             input.take();
+            capture.take();
             if let Some(session_id) = policy.stop() {
-                send_event(peer, &HelperEvent::Stopped { session_id })?;
+                output.event(HelperEvent::Stopped { session_id })?;
             }
             *generation = generation.checked_add(1).ok_or("generation overflow")?;
             target = current;
+            output.generation.store(*generation, Ordering::Release);
             if let Some(t) = &target {
-                send_event(peer, &HelperEvent::DisplayChanged(info(t, *generation)))?;
+                output.event(HelperEvent::DisplayChanged(info(t, *generation)))?;
             } else {
-                send_event(
-                    peer,
-                    &HelperEvent::DisplayUnavailable {
-                        generation: *generation,
-                    },
-                )?;
+                output.event(HelperEvent::DisplayUnavailable {
+                    generation: *generation,
+                })?;
             }
+        }
+        let mut capture_stopped = false;
+        if let Some(capture) = capture.as_mut() {
+            loop {
+                match capture.frames().try_recv() {
+                    Ok(frame) => {
+                        if recovering_video && !frame.keyframe {
+                            continue;
+                        }
+                        if output.video.try_send(frame).is_err() {
+                            recovering_video = true;
+                            capture.request_keyframe()?;
+                            break;
+                        }
+                        recovering_video = false;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        capture_stopped = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if capture_stopped {
+            input.take();
+            capture.take();
+            if let Some(session_id) = policy.stop() {
+                output.event(HelperEvent::Stopped { session_id })?;
+            }
+            *generation = generation.checked_add(1).ok_or("generation overflow")?;
+            output.generation.store(*generation, Ordering::Release);
+            target =
+                monitor(&|| stop.load(Ordering::Relaxed) || disconnected(peer)).unwrap_or(None);
+            last_scan = std::time::Instant::now();
+            if let Some(t) = &target {
+                output.event(HelperEvent::DisplayChanged(info(t, *generation)))?;
+            } else {
+                output.event(HelperEvent::DisplayUnavailable {
+                    generation: *generation,
+                })?;
+            }
+            continue;
         }
         let mut bytes = [0u8; 4096];
         let count = match peer.read(&mut bytes) {
@@ -206,6 +281,40 @@ pub fn serve(
             let now = now_ms();
             let result = (|| -> Result<()> {
                 match request {
+                    HelperRequest::StartCapture {
+                        session_id,
+                        generation: requested,
+                        profile,
+                    } => {
+                        policy.validate(session_id, requested, now)?;
+                        if capture.is_some() {
+                            return Err(error("capture already running"));
+                        }
+                        capture = Some(Capture::start(
+                            target.as_ref().ok_or("no display")?,
+                            profile,
+                            *generation,
+                        )?);
+                    }
+                    HelperRequest::RequestKeyframe {
+                        session_id,
+                        generation: requested,
+                    } => {
+                        policy.validate(session_id, requested, now)?;
+                        capture.as_ref().ok_or("no capture")?.request_keyframe()?;
+                    }
+                    HelperRequest::UpdateProfile {
+                        session_id,
+                        generation: requested,
+                        profile,
+                    } => {
+                        policy.validate(session_id, requested, now)?;
+                        profile.validate()?;
+                        capture
+                            .as_mut()
+                            .ok_or("no capture")?
+                            .update_profile(profile)?;
+                    }
                     HelperRequest::Start {
                         session_id,
                         display,
@@ -247,24 +356,123 @@ pub fn serve(
                     } => {
                         policy.validate(session_id, generation, now)?;
                         input.take();
+                        capture.take();
                         policy.stop();
-                        send_event(peer, &HelperEvent::Stopped { session_id })?;
+                        output.event(HelperEvent::Stopped { session_id })?;
                     }
                 }
                 Ok(())
             })();
             if let Err(error) = result {
                 // Errors describe supported operations; submitted text is never formatted.
-                send_event(
-                    peer,
-                    &HelperEvent::Error {
-                        message: format!(
-                            "helper request rejected: {error}; control session stopped"
-                        ),
-                    },
-                )?;
+                output.event(HelperEvent::Error {
+                    message: format!("helper request rejected: {error}; control session stopped"),
+                })?;
                 return Err("helper request rejected".into());
             }
         }
+    }
+}
+
+/// Single writer prevents interleaving. Control has its own reserved queue;
+/// capture admission never waits, and write timeout closes a stalled stream.
+struct Output {
+    control: std::sync::mpsc::SyncSender<HelperEvent>,
+    video: std::sync::mpsc::SyncSender<EncodedFrame>,
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    failed: std::sync::Arc<AtomicBool>,
+    stop: std::sync::Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl Output {
+    fn new(mut peer: UnixStream) -> Result<Self> {
+        use std::{
+            sync::{Arc, mpsc},
+            time::Duration,
+        };
+        let (control, controls) = mpsc::sync_channel(32);
+        let (video, frames) = mpsc::sync_channel::<EncodedFrame>(2);
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let current = generation.clone();
+        let failed = Arc::new(AtomicBool::new(false));
+        let failure = failed.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        peer.set_write_timeout(Some(Duration::from_millis(100)))?;
+        let worker = std::thread::spawn(move || {
+            loop {
+                let next = if let Ok(event) = controls.try_recv() {
+                    Some(HelperOutput::Event(event))
+                } else if stopping.load(Ordering::Acquire) {
+                    break;
+                } else {
+                    frames
+                        .try_recv()
+                        .ok()
+                        .filter(|f| f.generation == current.load(Ordering::Acquire))
+                        .map(HelperOutput::Video)
+                };
+                if let Some(value) = next {
+                    if write_helper_output(&mut peer, &value).is_err() {
+                        failure.store(true, Ordering::Release);
+                        let _ = peer.shutdown(std::net::Shutdown::Both);
+                        break;
+                    }
+                } else {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        });
+        Ok(Self {
+            control,
+            video,
+            generation,
+            failed,
+            stop,
+            worker: Some(worker),
+        })
+    }
+    fn event(&self, event: HelperEvent) -> Result<()> {
+        self.control
+            .try_send(event)
+            .map_err(|_| error("helper control output full/disconnected"))
+    }
+}
+impl Drop for Output {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn stalled_video_writer_admission_and_shutdown_are_bounded() {
+        use std::time::{Duration, Instant};
+        let (peer, _stalled) = UnixStream::pair().unwrap();
+        let output = Output::new(peer).unwrap();
+        let started = Instant::now();
+        for _ in 0..20 {
+            let _ = output.video.try_send(EncodedFrame {
+                generation: 0,
+                pts_ns: 0,
+                keyframe: true,
+                data: vec![0; ENCODED_FRAME_LIMIT],
+            });
+        }
+        output.event(HelperEvent::Ready).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !output.failed.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let started = Instant::now();
+        drop(output);
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 }
