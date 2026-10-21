@@ -110,11 +110,13 @@ scripts/test-x11.sh
 ```
 
 Installer tests use private mount namespaces/chroots and actual account/file
-ownership; apt/systemctl are controlled stand-ins. They do not prove physical
-LightDM/locker acceptance. The existing reviewed units separately passed actual
-systemd/sandbox/cgroup tests. Native tests never use a production virtual-display
-bypass. Physical greeter/login/lock/logout, encoder load, CPU/bandwidth and
-local/remote ownership races still require the final acceptance matrix. X11
+ownership. Package operations and live service start/stop/reload are controlled
+stand-ins; enable/disable/is-enabled delegate to real offline `systemctl --root`
+inside the disposable chroot. No live system manager is contacted. These checks
+do not prove physical LightDM/locker acceptance. The existing reviewed units
+separately passed actual systemd/sandbox/cgroup tests. Native tests never use a
+production virtual-display bypass. Physical greeter/login/lock/logout, encoder
+load, CPU/bandwidth and local/remote ownership races still require the final acceptance matrix. X11
 query then restoration/release has concurrent physical-change windows; there is
 no atomic/race-free or hard real-time guarantee. A responding X server is
 required; simultaneous destruction of helper and guardian is unsupported.

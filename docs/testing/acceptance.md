@@ -28,15 +28,14 @@ the existing signed OIDC issuer with nonce/PKCE/exchange/confirmation and device
 proof. Account A must decode real H264 and send reliable-channel Unicode to GTK:
 `Tiếng Việt|é|é|中文|😀` (the second accented e is NFD). The receiver compares
 exact code points and rejects duplicate commits. Account B sees only its own
-device/presence and cannot create or signal into A's session. A bounded250ms agent
+device/presence and cannot create or signal into A's session. A bounded 250ms agent
 scheduling pause must preserve held input/session authority and restore freshly
-decoded source timestamps at the default1920x1080@60fps capture profile. Focused
+decoded source timestamps at the default 1920x1080@60fps capture profile. Focused
 service coverage separately uses measured IPC drops to require adaptive quality
-updates; config-bearing IDR recovery is bounded by one absolute20s episode.
-Backend fixture setup has a120s allowance for fresh RSA preparation, phase logs,
+updates; config-bearing IDR recovery is bounded by one absolute 20s episode.
+Backend fixture setup has a 120s allowance for fresh RSA preparation, phase logs,
 and prompt child-exit detection; native failure/authority bounds are separate.
-The harness kills
-the established controller without Signal::End, kills/restarts helper and
+The harness kills the established controller without Signal::End, kills/restarts helper and
 backend separately while Shift/left-button are held, verifies native X11 state
 release and nonrenewable closed sessions, reconnects with fresh sessions, and
 revokes the agent during live control. Ordinary workspace tests leave these
@@ -48,10 +47,10 @@ its nonsecret logs, then remove that exact owned directory when finished.
 
 SSH works to `clawmachine@172.22.8.59`; read-only preflight found Ubuntu **25.10**,
 GDM49/Wayland, AMD Raven/Vega, Xfce/LightDM packages and no passwordless sudo.
-This is not an accepted Ubuntu26.04/X11 deployment. No packages, display manager,
+This is not an accepted Ubuntu 26.04/X11 deployment. No packages, display manager,
 OS, reboot, ingress or routing change is authorized by these test instructions.
 The installer deliberately rejects 25.10. An administrator must first provide a
-reviewed supported26.04 installation/host and approve activation using
+reviewed supported 26.04 installation/host and approve activation using
 [the concrete install/rollback procedure](../setup/ubuntu.md). Do not bypass the
 version check, use privileged Docker as sudo, or remotely replace the active DM.
 
