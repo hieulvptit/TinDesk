@@ -1,0 +1,16 @@
+{
+  "tool": "Built-in image_gen.imagegen",
+  "created": "2026-10-21",
+  "client": {
+    "file": "client.png",
+    "prompt": "Use case: logo-brand. Asset type: production macOS app icon for RemoteVNC Client, a fast remote desktop controller. Create ONE exceptionally polished original app icon, square composition. A substantial dark midnight-navy rounded-square tile, smooth continuous rounded corners, centered with generous uniform transparent margin on all four sides. Main mark: a bold cyan-to-electric-blue geometric portal shaped like a computer display with two interlocking angular brackets suggesting a fast peer-to-peer link; a crisp white mouse pointer integrated into the lower-right of that portal, visibly part of the mark, clean large simple silhouette readable at 32px. Restrained depth from one subtle upper-left highlight on the tile and the blue mark, mostly flat vector-like precision, uniform thick strokes and meticulous optical alignment. The portal/display is the dominant single symbol. Premium modern native desktop utility, confident and calm. No text, no letters, no numbers, no badge, no label, no wordmark, no mockup, no perspective, no busy circuitry, no glow haze, no extraneous objects. True alpha transparency outside the tile, no checkerboard painted into image, no opaque canvas background. Deliver only the standalone app icon.",
+    "transparent_background": true
+  },
+  "server": {
+    "file": "server.png",
+    "prompt": "Use case: logo-brand. Asset type: RemoteVNC Server app icon, companion variant of the supplied RemoteVNC Client icon. Edit the supplied icon into its matching SERVER version. Preserve exactly the square canvas, transparent outer margin, dark midnight-navy rounded-square tile, smooth corner radius, front-facing view, visual weight, optical alignment, highlight direction, crisp polished vector-like rendering, and overall identity. Preserve the large central monitor/portal with the two opposing angular arrows representing peer-to-peer remote desktop. Change its cyan/electric-blue strokes to a rich amber-to-vivid-orange gradient, with restrained warm highlights. Replace the lower-right white mouse pointer entirely with a simple bold white server glyph in the same position and comparable scale: two small stacked rounded rectangular rack units, each with one tiny dark status cutout and one broad dark slot, clean silhouette, aligned parallel to the canvas, no perspective. Keep the main central orange portal legible and the server glyph subordinate. This should look like the other app in the same premium native software family, clearly distinct at small icon sizes. No mouse pointer remaining. No text, lettering, numbers, wordmark, extra badges, clouds, shields, cables or background objects. Preserve true alpha transparency outside the tile; no checkerboard, no opaque background. Output only the single finished Server icon.",
+    "reference": "client.png",
+    "transparent_background": true
+  },
+  "exports": "PNG sizes and ICNS exported using macOS sips/iconutil; generated alpha retained."
+}
