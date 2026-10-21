@@ -260,7 +260,7 @@ impl ControllerSession {
             || self.negotiation.is_some_and(|d| Instant::now() >= d)
             || (self.ready && self.frame_at.elapsed() > Duration::from_secs(20))
         {
-            return Err("session ended; connect again".into());
+            return Err("Session ended; waiting for a fresh authorized connection".into());
         }
         let mut commands = vec![];
         for _ in 0..64 {

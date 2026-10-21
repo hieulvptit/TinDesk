@@ -97,6 +97,7 @@ fn run() -> Result<()> {
             "socket parent must be owned by helper UID and not group/world writable".into(),
         );
     }
+    remotevnc_seat_helper::ipc::check_socket_traversal(parent, agent_uid)?;
     let listener = UnixListener::bind(&socket)?;
     let _cleanup = SocketCleanup(socket.clone());
     // Peer UID is checked as well. Agent can traverse the dedicated service directory.
@@ -117,13 +118,19 @@ fn run() -> Result<()> {
                 peer.set_read_timeout(Some(Duration::from_millis(100)))?;
                 peer.set_write_timeout(Some(Duration::from_millis(100)))?;
                 // Errors/disconnects drop the X11 input owner and release its tracked state.
-                let _ = serve(
+                if serve(
                     &mut peer,
                     &mut |cancelled| monitor.current_with_cancel(cancelled),
                     &mut generation,
                     || remotevnc_seat_helper::recovery::boot_time_ms().unwrap_or(u64::MAX),
                     &stop,
-                );
+                )
+                .is_err()
+                {
+                    eprintln!(
+                        "remotevnc-seat-helper: IPC session failed; capture stopped and input cleanup attempted"
+                    );
+                }
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(50)),
             Err(e) => return Err(e.into()),

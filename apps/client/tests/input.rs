@@ -358,3 +358,25 @@ fn composition_commit_is_not_lost_when_duplicate_text_precedes_commit() {
     let out = mapper.native_batch(&events, Modifiers::default(), None, v(), d(1));
     assert!(matches!(&out[..],[I::Text{text}] if text=="Tiếng Việt"));
 }
+
+#[test]
+fn egui_content_scroll_sign_is_preserved_on_both_axes() {
+    use eframe::egui::{Event, Modifiers, MouseWheelUnit, pos2, vec2};
+    for (x, y) in [(1., 0.), (-1., 0.), (0., 1.), (0., -1.)] {
+        let mut mapper = InputMapper::default();
+        let events = mapper.native_batch(
+            &[Event::MouseWheel {
+                unit: MouseWheelUnit::Line,
+                delta: vec2(x, y),
+                phase: eframe::egui::TouchPhase::Move,
+                source: eframe::egui::MouseWheelSource::Unknown,
+                modifiers: Modifiers::default(),
+            }],
+            Modifiers::default(),
+            Some(pos2(10., 10.)),
+            v(),
+            d(1),
+        );
+        assert!(events.iter().any(|event|matches!(event,I::Scroll{delta_x,delta_y,..} if *delta_x==x as i32 && *delta_y==y as i32)));
+    }
+}

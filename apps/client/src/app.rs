@@ -44,6 +44,7 @@ pub struct ViewState {
     pub epoch: u64,
     pub ready: bool,
     pub connected: bool,
+    pub connection_requested: bool,
     pub stats: PeerStats,
 }
 enum Command {
@@ -165,6 +166,7 @@ impl ClientApp {
             epoch,
             ready,
             connected,
+            connection_requested,
             stats,
         ) = {
             let s = self.state.lock().unwrap();
@@ -178,6 +180,7 @@ impl ClientApp {
                 s.epoch,
                 s.ready,
                 s.connected,
+                s.connection_requested,
                 s.stats,
             )
         };
@@ -276,7 +279,17 @@ impl ClientApp {
                     }
                 });
             }
-            if connected {
+            if connected || connection_requested {
+                let (decoded, fps) = self.frames.metrics();
+                ui.label(format!(
+                    "Video: {} · observed decode FPS: {} · physical display: {}",
+                    decoded.map_or_else(|| "unavailable".into(), |(w, h)| format!("{w}×{h}")),
+                    fps.map_or_else(|| "unavailable".into(), |fps| format!("{fps:.1}")),
+                    display.map_or_else(
+                        || "unavailable".into(),
+                        |d| format!("{}×{}", d.width, d.height)
+                    )
+                ));
                 ui.horizontal(|ui| {
                     if ui.button("Disconnect").clicked() {
                         self.release();

@@ -56,7 +56,70 @@ pub enum HelperEvent {
     DisplayUnavailable { generation: u64 },
     Stopped { session_id: SessionId },
     Error { message: String },
+    CaptureFailed(CaptureFailure),
 }
+
+/// Only fixed categories/identifiers and numeric codes may cross this diagnostic boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CapturePhase {
+    Startup,
+    Stream,
+    Header,
+    Framing,
+    Generation,
+    Eos,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CaptureDomain {
+    Core,
+    Library,
+    Resource,
+    Stream,
+    Unknown,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CaptureElement {
+    Source,
+    Encoder,
+    Profile,
+    Encoded,
+    Pipeline,
+    Unknown,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CaptureExit {
+    Running,
+    Success,
+    Code(i32),
+    Signal(i32),
+    Unknown,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureFailure {
+    pub phase: CapturePhase,
+    pub domain: CaptureDomain,
+    pub code: i32,
+    pub element: CaptureElement,
+    pub exit: CaptureExit,
+}
+impl CaptureFailure {
+    pub fn new(phase: CapturePhase) -> Self {
+        Self {
+            phase,
+            domain: CaptureDomain::Unknown,
+            code: 0,
+            element: CaptureElement::Unknown,
+            exit: CaptureExit::Unknown,
+        }
+    }
+}
+impl std::fmt::Display for CaptureFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "capture failure: {self:?}")
+    }
+}
+impl std::error::Error for CaptureFailure {}
 
 /// Encoded bytes use a separate binary IPC frame, not the JSON control codec.
 /// IPC readers must validate the announced data length before allocation.

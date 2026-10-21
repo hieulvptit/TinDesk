@@ -11,6 +11,8 @@ pub enum Error {
     PolicyClosed,
     #[error("backend rejected device authorization")]
     Unauthorized,
+    #[error("backend denied this operation")]
+    Denied,
     #[error("backend request failed")]
     Request,
     #[error("caller already has an active session")]

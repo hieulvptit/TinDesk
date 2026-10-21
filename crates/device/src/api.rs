@@ -304,6 +304,12 @@ fn check_status(response: &reqwest::Response) -> Result<()> {
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         return Err(Error::Unauthorized);
     }
+    if matches!(
+        response.status(),
+        reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::NOT_FOUND
+    ) {
+        return Err(Error::Denied);
+    }
     Err(
         match response
             .headers()

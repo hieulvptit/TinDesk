@@ -251,7 +251,7 @@ impl X11Input {
                     return Err(error("scroll exceeds 100 steps per axis"));
                 }
                 self.motion(*x, *y)?;
-                for (delta, negative, positive) in [(*delta_y, 4, 5), (*delta_x, 6, 7)] {
+                for (delta, negative, positive) in [(*delta_y, 5, 4), (*delta_x, 7, 6)] {
                     for _ in 0..delta.unsigned_abs() {
                         let button = if delta < 0 { negative } else { positive };
                         let state = self

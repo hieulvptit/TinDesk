@@ -68,9 +68,11 @@ impl ClientRuntime {
                 let mut state = state.lock().unwrap();
                 state.signed_in = false;
                 state.connected = false;
+                state.connection_requested = false;
                 state.ready = false;
                 state.display = None;
                 state.enrollment = None;
+                state.presence.clear();
                 if let Err(e) = result {
                     state.status = e.to_string();
                 }
@@ -259,6 +261,9 @@ async fn run(
         stop.clone(),
     ));
     let mut live: Option<ControllerSession> = None;
+    let mut desired: Option<DeviceId> = None;
+    let mut next_connect = Instant::now();
+    let mut connect_backoff = Duration::from_millis(250);
     let mut closing = tokio::task::JoinSet::new();
     let mut outage: Option<Instant> = None;
     let mut reconciled = false;
@@ -273,34 +278,24 @@ async fn run(
             _=stop.cancelled()=>break,
             command=commands.recv()=>match command {
                 None=>break,
-                Some(Command::Disconnect)=>{end=true;},
+                Some(Command::Disconnect)=>{desired=None;end=true;},
                 Some(Command::Refresh)=>next_list=Instant::now(),
                 Some(Command::Input{generation,epoch,events})=>{if let Some(l)=live.as_mut(){end=l.input(generation,epoch,events).is_err();}},
                 Some(Command::Connect(agent_id))=>{
-                    if live.is_some() || !reconciled {continue}
-                    let token=token_rx.borrow().clone();
-                    if let Some(token)=token {
-                        state.lock().unwrap().status="Connecting…".into();
-                        let started=Instant::now();
-                        match tokio::select!{biased;_=stop.cancelled()=>break,result=api.create_session(&token,agent_id)=>result} {
-                            Ok(grant)=>{
-                                let id=grant.session_id;
-                                if grant.client_id!=identity.device_id || grant.agent_id!=agent_id {close_remote(&mut closing,api.clone(),&token_rx,id);return Err("invalid session participants".into())}
-                                match ControllerSession::new(grant,started,config.relay_only,frames.clone()) {Ok(session)=>live=Some(session),Err(e)=>{close_remote(&mut closing,api.clone(),&token_rx,id);state.lock().unwrap().status=e.to_string();}}
-                            },
-                            Err(remotevnc_device::Error::Unauthorized)=>return Err("Reauthorization required; sign out and sign in again".into()),
-                            Err(e)=>state.lock().unwrap().status=e.to_string(),
-                        }
-                    } else {state.lock().unwrap().status="Offline — waiting for device service".into();}
+                    if live.is_none() {
+                        desired=Some(agent_id);
+                        next_connect=Instant::now();
+                        connect_backoff=Duration::from_millis(250);
+                    }
                 },
             },
             event=events.recv()=>match event {
                 None=>break,
                 Some(NetworkEvent::Denied)=>return Err("Reauthorization required; sign out and sign in again".into()),
-                Some(NetworkEvent::Offline)=>{reconciled=false;outage.get_or_insert(Instant::now()+Duration::from_secs(10));state.lock().unwrap().status="Reconnecting to device service…".into();},
+                Some(NetworkEvent::Offline)=>{state.lock().unwrap().presence.clear();reconciled=false;outage.get_or_insert(Instant::now()+Duration::from_secs(10));state.lock().unwrap().status="Reconnecting to device service…".into();},
                 Some(NetworkEvent::Event(event))=>{
                     let result=(||->Result<()> {match event {
-                        DeviceEvent::Presence{devices}=>{let mut s=state.lock().unwrap();for device in devices {s.presence.retain(|p|p.device_id!=device.device_id || p.role!=device.role);s.presence.push(device);}},
+                        DeviceEvent::Presence{devices}=>merge_presence(&mut state.lock().unwrap().presence, devices),
                         DeviceEvent::SessionSnapshot{session_ids}=>{
                             outage=None;reconciled=true;
                             if live.as_ref().is_some_and(|l|!session_ids.contains(&l.grant.session_id)) {end=true;}
@@ -311,7 +306,7 @@ async fn run(
                             if let Some(l)=live.as_mut().filter(|l|l.grant.session_id==grant.session_id) {l.refreshed(grant)?;}
                             else {close_remote(&mut closing,api.clone(),&token_rx,grant.session_id);}
                         },
-                        DeviceEvent::SessionClosed{session_id}=>{if live.as_ref().is_some_and(|l|l.grant.session_id==session_id){end=true;}},
+                        DeviceEvent::SessionClosed{session_id}=>{if live.as_ref().is_some_and(|l|l.grant.session_id==session_id){end=true;next_list=Instant::now();}},
                         DeviceEvent::Signal{sender,message}=>{if let Some(l)=live.as_mut(){l.signal(sender,message)?;}},
                         DeviceEvent::IceConfiguration{session_id,generation,requires_ack,ice_servers}=>{
                             if let Some(l)=live.as_mut() {if session_id!=l.grant.session_id {return Err("wrong ICE scope".into())}
@@ -331,21 +326,48 @@ async fn run(
                     let mut s=state.lock().unwrap();s.connected=true;s.display=l.display;s.epoch=l.peer.epoch();s.ready=l.ready;s.stats=l.peer.stats();
                     if outage.is_none() && !end {s.status=if l.ready {"Connected"} else if l.display.is_some(){"Display transition — waiting for video"}else{"Waiting for a physical display"}.into();}
                 }
+                let connect_token = token_rx.borrow().clone();
+                if !end && live.is_none() && reconciled && closing.is_empty() && Instant::now() >= next_connect
+                    && let Some(agent_id) = desired
+                    && state.lock().unwrap().presence.iter().any(|p|p.device_id==agent_id && p.role==DeviceRole::Agent && p.online)
+                    && let Some(token) = connect_token {
+                    state.lock().unwrap().status="Connecting…".into();
+                    let started=Instant::now();
+                    match tokio::select!{biased;_=stop.cancelled()=>break,result=api.create_session(&token,agent_id)=>result} {
+                        Ok(grant)=>{
+                            let id=grant.session_id;
+                            if grant.client_id!=identity.device_id || grant.agent_id!=agent_id {close_remote(&mut closing,api.clone(),&token_rx,id);return Err("invalid session participants".into())}
+                            match ControllerSession::new(grant,started,config.relay_only,frames.clone()) {
+                                Ok(session)=>live=Some(session),
+                                Err(e)=>{close_remote(&mut closing,api.clone(),&token_rx,id);state.lock().unwrap().status=e.to_string();}
+                            }
+                        },
+                        Err(remotevnc_device::Error::Unauthorized | remotevnc_device::Error::Denied)=>return Err("Reauthorization required; sign out and sign in again".into()),
+                        Err(e)=>state.lock().unwrap().status=e.to_string(),
+                    }
+                    next_connect=Instant::now()+connect_backoff;
+                    connect_backoff=(connect_backoff*2).min(Duration::from_secs(8));
+                }
                 if Instant::now()>=next_list && refresh.is_none() {
                     if let Some(token)=token_rx.borrow().clone(){let api=api.clone();refresh=Some(tokio::spawn(async move{api.list_devices(&token).await}));}
                     next_list=Instant::now()+Duration::from_secs(15);
                 }
                 if refresh.as_ref().is_some_and(|job|job.is_finished()) {
-                    match refresh.take().unwrap().await {Ok(Ok(devices))=>state.lock().unwrap().devices=devices.into_iter().filter(|d|d.id!=identity.device_id && !d.revoked).collect(),Ok(Err(remotevnc_device::Error::Unauthorized))=>return Err("Reauthorization required".into()),_=>{}}
+                    match refresh.take().unwrap().await {Ok(Ok(devices))=>{
+                        if desired.is_some_and(|id| !devices.iter().any(|d|d.id==id && !d.revoked)) {desired=None;end=true;}
+                        state.lock().unwrap().devices=devices.into_iter().filter(|d|d.id!=identity.device_id && !d.revoked).collect();
+                    },Ok(Err(remotevnc_device::Error::Unauthorized))=>return Err("Reauthorization required".into()),_=>{}}
                 }
             },
         }
+        state.lock().unwrap().connection_requested = desired.is_some();
         if end {
             if let Some(l) = live.take() {
                 let id = l.grant.session_id;
                 drop(l);
                 close_remote(&mut closing, api.clone(), &token_rx, id);
             }
+            next_connect = Instant::now() + connect_backoff;
             let mut s = state.lock().unwrap();
             s.connected = false;
             s.ready = false;
@@ -460,5 +482,38 @@ async fn network(
         while commands.try_recv().is_ok() {}
         tokio::select! {_=stop.cancelled()=>return,_=tokio::time::sleep(backoff)=>{}}
         backoff = (backoff * 2).min(Duration::from_secs(5));
+    }
+}
+
+fn merge_presence(current: &mut Vec<DevicePresence>, devices: Vec<DevicePresence>) {
+    for device in devices {
+        current.retain(|p| p.device_id != device.device_id);
+        current.push(device);
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn fresh_presence_merges_all_chunks_and_replaces_roles() {
+        let id = |n| DeviceId::from_uuid(uuid::Uuid::from_u128(n));
+        let online = |n, role| DevicePresence {
+            device_id: id(n),
+            role,
+            online: true,
+        };
+        let mut presence = vec![online(1, DeviceRole::Agent)];
+        presence.clear(); // Every Offline socket boundary, before any new chunks.
+        merge_presence(&mut presence, vec![online(2, DeviceRole::Agent)]);
+        merge_presence(&mut presence, vec![online(3, DeviceRole::Agent)]);
+        assert!(!presence.iter().any(|p| p.device_id == id(1)));
+        assert_eq!(presence.len(), 2);
+        merge_presence(&mut presence, vec![online(2, DeviceRole::Client)]);
+        assert_eq!(presence.len(), 2);
+        assert!(
+            !presence
+                .iter()
+                .any(|p| p.device_id == id(2) && p.role == DeviceRole::Agent)
+        );
     }
 }

@@ -37,6 +37,8 @@ pub struct Capture {
     reader: Option<JoinHandle<()>>,
     encoder: Arc<AtomicU8>,
     profile: VideoProfile,
+    failure: Arc<Mutex<CaptureFailure>>,
+    diagnostic: Option<JoinHandle<Option<CaptureFailure>>>,
 }
 impl Capture {
     /// Spawn returns promptly; worker initialization failure disconnects frames.
@@ -68,9 +70,19 @@ impl Capture {
                 .env("XAUTHORITY", &target.authority)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()?,
         );
+        let stderr = child.0.stderr.take().ok_or("worker stderr missing")?;
+        let diagnostic = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr.take(4096).read_to_end(&mut bytes);
+            bytes
+                .split(|b| *b == b'\n')
+                .find_map(|line| serde_json::from_slice::<CaptureFailure>(line).ok())
+        });
+        let failure = Arc::new(Mutex::new(CaptureFailure::new(CapturePhase::Header)));
+        let read_failure = failure.clone();
         let mut commands = child.0.stdin.take().ok_or("worker stdin missing")?;
         nonblocking(commands.as_raw_fd())?;
         let mut packet = (config.len() as u32).to_be_bytes().to_vec();
@@ -93,9 +105,11 @@ impl Capture {
                     return;
                 }
                 selected.store(header[0], Ordering::Release);
+                read_failure.lock().unwrap().phase = CapturePhase::Framing;
                 let mut recovering = true;
                 while let Ok(frame) = read_video_frame(&mut output) {
                     if frame.generation != generation {
+                        read_failure.lock().unwrap().phase = CapturePhase::Generation;
                         break;
                     }
                     if recovering && !frame.keyframe {
@@ -118,7 +132,33 @@ impl Capture {
             reader: Some(reader),
             encoder,
             profile,
+            failure,
+            diagnostic: Some(diagnostic),
         })
+    }
+    pub fn failure(&mut self) -> CaptureFailure {
+        use std::os::unix::process::ExitStatusExt;
+        // Stream EOF has already occurred. Terminate/reap even a malformed writer
+        // before joining the bounded diagnostic reader.
+        let status = self.child.0.try_wait().ok().flatten();
+        let exit = status.map_or(CaptureExit::Running, |s| {
+            if s.success() {
+                CaptureExit::Success
+            } else if let Some(code) = s.code() {
+                CaptureExit::Code(code)
+            } else {
+                s.signal().map_or(CaptureExit::Unknown, CaptureExit::Signal)
+            }
+        });
+        let _ = self.child.0.kill();
+        let _ = self.child.0.wait();
+        let mut failure = self
+            .diagnostic
+            .take()
+            .and_then(|d| d.join().ok().flatten())
+            .unwrap_or_else(|| self.failure.lock().unwrap().clone());
+        failure.exit = exit;
+        failure
     }
     pub fn update_profile(&mut self, profile: VideoProfile) -> Result<()> {
         profile.validate()?;
@@ -157,6 +197,9 @@ impl Drop for Capture {
     fn drop(&mut self) {
         let _ = self.child.0.kill();
         let _ = self.child.0.wait();
+        if let Some(diagnostic) = self.diagnostic.take() {
+            let _ = diagnostic.join();
+        }
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -318,6 +361,17 @@ fn apply_profile(pipeline: &gst::Pipeline, profile: VideoProfile) -> Result<()> 
 }
 /// Called only by main before signal handlers, GStreamer, or any Rust threads.
 pub fn worker_main() -> Result<()> {
+    let result = worker_run();
+    if let Err(error) = &result {
+        let failure = error
+            .downcast_ref::<CaptureFailure>()
+            .cloned()
+            .unwrap_or_else(|| CaptureFailure::new(CapturePhase::Startup));
+        eprintln!("{}", serde_json::to_string(&failure)?);
+    }
+    result.map_err(|_| error("capture worker failed"))
+}
+fn worker_run() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         #[link(name = "X11")]
@@ -353,7 +407,7 @@ pub fn worker_main() -> Result<()> {
         let encoder = choose_encoder(config.profile)?;
         let t = &config.target;
         let source = format!(
-            "ximagesrc display-name={} use-damage=false show-pointer=true startx={} starty={} endx={} endy={}",
+            "ximagesrc name=source display-name={} use-damage=false show-pointer=true startx={} starty={} endx={} endy={}",
             t.display,
             t.origin_x,
             t.origin_y,
@@ -370,6 +424,7 @@ pub fn worker_main() -> Result<()> {
             VideoEncoder::Nv => 3,
             _ => unreachable!(),
         }])?;
+        output.flush()?;
         pipeline.set_state(gst::State::Playing)?;
         let mut base = None;
         let mut pending = Vec::new();
@@ -411,11 +466,40 @@ pub fn worker_main() -> Result<()> {
                 }
                 if let Some(bus) = pipeline.bus() {
                     for msg in bus.iter() {
-                        if matches!(
-                            msg.view(),
-                            gst::MessageView::Error(_) | gst::MessageView::Eos(_)
-                        ) {
-                            return Err(error("capture pipeline stopped"));
+                        match msg.view() {
+                            gst::MessageView::Error(e) => {
+                                let err = e.error();
+                                let domain = match err.domain().as_str().as_str() {
+                                    "gst-core-error-quark" => CaptureDomain::Core,
+                                    "gst-library-error-quark" => CaptureDomain::Library,
+                                    "gst-resource-error-quark" => CaptureDomain::Resource,
+                                    "gst-stream-error-quark" => CaptureDomain::Stream,
+                                    _ => CaptureDomain::Unknown,
+                                };
+                                let element = match e.src().map(|s| s.name()).as_deref() {
+                                    Some("source") => CaptureElement::Source,
+                                    Some("encoder") => CaptureElement::Encoder,
+                                    Some("profile") => CaptureElement::Profile,
+                                    Some("encoded") => CaptureElement::Encoded,
+                                    _ => CaptureElement::Unknown,
+                                };
+                                return Err(CaptureFailure {
+                                    phase: CapturePhase::Stream,
+                                    domain,
+                                    code: if domain == CaptureDomain::Unknown {
+                                        0
+                                    } else {
+                                        err.code()
+                                    },
+                                    element,
+                                    exit: CaptureExit::Unknown,
+                                }
+                                .into());
+                            }
+                            gst::MessageView::Eos(_) => {
+                                return Err(CaptureFailure::new(CapturePhase::Eos).into());
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -436,7 +520,7 @@ pub fn worker_main() -> Result<()> {
                     keyframe: !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT),
                     data: data.as_slice().to_vec(),
                 };
-                write_video_frame(&mut output, &frame)?;
+                write_capture_frame(&mut output, &frame)?;
             }
         })();
         let _ = pipeline.set_state(gst::State::Null);
@@ -444,9 +528,47 @@ pub fn worker_main() -> Result<()> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn write_capture_frame(output: &mut impl Write, frame: &EncodedFrame) -> Result<()> {
+    write_video_frame(output, frame)?;
+    output.flush()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_binary_frame_is_visible_before_the_next_frame_or_eof() {
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut stdout = std::io::LineWriter::new(Sink(bytes.clone()));
+        let frame = EncodedFrame {
+            generation: 1,
+            pts_ns: 1,
+            keyframe: true,
+            data: vec![1, 2, 3],
+        };
+        let mut expected = Vec::new();
+        write_video_frame(&mut expected, &frame).unwrap();
+        assert!(!expected.contains(&b'\n'));
+        write_capture_frame(&mut stdout, &frame).unwrap();
+        let received = bytes.lock().unwrap().clone();
+        assert_eq!(
+            received, expected,
+            "capture must flush a complete binary access unit even without a newline"
+        );
+    }
     #[test]
     fn real_pattern_encoder_has_config_keyframes_and_no_reordering() {
         gst::init().unwrap();

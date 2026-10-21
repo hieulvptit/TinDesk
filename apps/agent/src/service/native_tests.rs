@@ -418,3 +418,131 @@ async fn transport_recovers_before_absolute_budget() {
 async fn transport_stall_closes_despite_healthy_renewals() {
     transport_gap(false).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "explicit disposable GTK/Xvfb long text fixture"]
+async fn long_text_keeps_video_renewals_and_cancellation_live() {
+    let mut session = Session::start().await;
+    session.input(InputEvent::ReleaseAll);
+    let path = std::env::var_os("REMOTEVNC_GTK_RESULT").unwrap();
+    let received = || std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(received().is_empty(), "requires fresh GTK entry");
+    let original_deadline = session
+        .live
+        .as_ref()
+        .unwrap()
+        .authority
+        .deadline
+        .load(Ordering::Acquire);
+    let text = "ế😀e\u{301}中".repeat(200);
+    assert_eq!(text.chars().count(), 1000);
+    session.input(InputEvent::Text { text: text.clone() });
+    let start = Instant::now();
+    let mut renewed = 0;
+    let mut next_renew = Instant::now() + Duration::from_secs(15);
+    let mut pts = session.pts.unwrap();
+    let mut frame_at = Instant::now();
+    let mut advancing = 0;
+    while received() != text {
+        session.tick().unwrap();
+        if session.pts.unwrap() > pts {
+            advancing += 1;
+            pts = session.pts.unwrap();
+            frame_at = Instant::now();
+        }
+        assert!(
+            frame_at.elapsed() < Duration::from_secs(3),
+            "media stalled during accepted text"
+        );
+        let live = session.live.as_mut().unwrap();
+        assert_eq!(
+            live.helper
+                .video_health(std::time::Instant::now())
+                .unwrap()
+                .0,
+            0
+        );
+        if Instant::now() >= next_renew {
+            let now = boot_time_ms();
+            live.renewed(now).unwrap();
+            // Raw controller fixture has no SDK grant listener; mirror the same
+            // authenticated renewal normally applied by ControllerSession.
+            session.controller.renew_input_lease().unwrap();
+            assert_eq!(
+                live.authority.deadline.load(Ordering::Acquire),
+                now + 60_000
+            );
+            next_renew += Duration::from_secs(15);
+            renewed += 1;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(90),
+            "exact1000-scalar text incomplete: {} scalars",
+            received().chars().count()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(renewed >= 2 && advancing > 100);
+    println!(
+        "PASS exact1000 Unicode scalars; elapsed={:?}, advancing_frames={advancing}, renewals={renewed}",
+        start.elapsed()
+    );
+    // Prove the helper/guardian actually consumed renewals, not only the agent
+    // deadline store: keep real capture alive beyond the initial helper lease.
+    while boot_time_ms() <= original_deadline + 250 {
+        session.tick().unwrap();
+        assert!(frame_at.elapsed() < Duration::from_secs(3));
+        if session.pts.unwrap() > pts {
+            pts = session.pts.unwrap();
+            frame_at = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(received(), text);
+    println!(
+        "PASS real helper/guardian remain alive beyond original absolute lease after renewals"
+    );
+    // Focus loss cancels queued text and releases; video/session must survive.
+    session.input(InputEvent::Text {
+        text: "x".repeat(1000),
+    });
+    let until = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < until {
+        session.tick().unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    session.input(InputEvent::ReleaseAll);
+    let until = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < until {
+        session.tick().unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let after_focus = received();
+    assert!(after_focus.len() > text.len() && after_focus.len() < text.len() + 1000);
+    let until = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < until {
+        session.tick().unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        received(),
+        after_focus,
+        "focus cancellation cannot reinject queued text"
+    );
+    assert_eq!(session.held(), (false, false));
+    session.input(InputEvent::Text {
+        text: "y".repeat(1000),
+    });
+    let until = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < until {
+        session.tick().unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    session.closed_and_released().await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let after_disconnect = received();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(received(), after_disconnect);
+    assert!(after_disconnect.len() < after_focus.len() + 1000);
+    println!("PASS focus/disconnect cancel pending Unicode; bounded release; no reinjection");
+}

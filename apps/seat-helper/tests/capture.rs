@@ -634,3 +634,67 @@ fn repeated_1080p_rtp_stream_stays_bounded_and_stops_cleanly() {
         );
     }
 }
+
+#[test]
+fn injected_worker_failure_retains_only_allowlisted_category_and_exit() {
+    use remotevnc_protocol::*;
+    use remotevnc_seat_helper::{capture::Capture, seat::*};
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("remotevnc-failure-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let worker = dir.join("worker");
+    let failure = CaptureFailure {
+        phase: CapturePhase::Stream,
+        domain: CaptureDomain::Stream,
+        code: 1,
+        element: CaptureElement::Encoder,
+        exit: CaptureExit::Unknown,
+    };
+    std::fs::write(
+        &worker,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{}' >&2\nsleep .1\nexit 42\n",
+            serde_json::to_string(&failure).unwrap()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let target = DisplayTarget {
+        seat: "test".into(),
+        display: ":99".into(),
+        authority: dir.join("private-authority-must-never-appear"),
+        identity: ServerIdentity {
+            process_start: "test".into(),
+            socket_inode: 0,
+            authority_inode: 0,
+            authority_modified_ns: 0,
+            connection_epoch: 0,
+        },
+        output: "screen".into(),
+        origin_x: 0,
+        origin_y: 0,
+        width: 320,
+        height: 240,
+    };
+    let mut capture =
+        Capture::start_with_worker(&worker, &target, VideoProfile::default(), 1).unwrap();
+    assert!(
+        capture
+            .frames()
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_err()
+    );
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let actual = capture.failure();
+    assert_eq!(actual.phase, CapturePhase::Stream);
+    assert_eq!(actual.element, CaptureElement::Encoder);
+    assert_eq!(actual.exit, CaptureExit::Code(42));
+    assert!(!actual.to_string().contains("private-authority"));
+    let encoded = encode_control(&HelperEvent::CaptureFailed(actual)).unwrap();
+    assert!(matches!(
+        decode_control::<HelperEvent>(&encoded).unwrap(),
+        HelperEvent::CaptureFailed(_)
+    ));
+    drop(capture);
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -6,6 +6,73 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+/// Check kernel traversal as the configured identity, including supplementary
+/// groups and ACLs. Never alter an existing ancestor's ownership or mode.
+#[cfg(target_os = "linux")]
+pub fn check_socket_traversal(parent: &std::path::Path, uid: u32) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut record: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut storage = vec![0u8; 65536];
+    let mut found = std::ptr::null_mut();
+    if unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut record,
+            storage.as_mut_ptr().cast(),
+            storage.len(),
+            &mut found,
+        )
+    } != 0
+        || found.is_null()
+    {
+        return Err(error(
+            "configured agent UID has no resolvable system identity",
+        ));
+    }
+    let mut groups = vec![0; 1024];
+    let mut count = groups.len() as libc::c_int;
+    if unsafe {
+        libc::getgrouplist(
+            record.pw_name,
+            record.pw_gid,
+            groups.as_mut_ptr(),
+            &mut count,
+        )
+    } < 0
+    {
+        return Err(error("configured agent group list unavailable"));
+    }
+    groups.truncate(count as usize);
+    let gid = record.pw_gid;
+    let parent = parent.canonicalize()?;
+    for ancestor in parent.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        let mut command = std::process::Command::new("/usr/bin/test");
+        command.arg("-x").arg(ancestor);
+        if unsafe { libc::geteuid() } != uid {
+            let groups = groups.clone();
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::setgroups(groups.len(), groups.as_ptr()) != 0
+                        || libc::setgid(gid) != 0
+                        || libc::setuid(uid) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        if !command.status()?.success() {
+            return Err(format!("agent UID {uid} cannot traverse {}; choose a socket directory accessible to that identity", ancestor.display()).into());
+        }
+    }
+    Ok(())
+}
+#[cfg(not(target_os = "linux"))]
+pub fn check_socket_traversal(_: &std::path::Path, _: u32) -> Result<()> {
+    Err(error("helper requires Linux identity checks"))
+}
+
 pub fn authorize_uid(actual: u32, allowed: u32) -> Result<()> {
     if actual != allowed {
         return Err(error("unauthorized Unix peer UID"));
@@ -43,6 +110,61 @@ pub fn send_event(writer: &mut impl Write, event: &HelperEvent) -> Result<()> {
     writer.write_all(&(data.len() as u32).to_be_bytes())?;
     writer.write_all(&data)?;
     Ok(())
+}
+/// Ordered input pending behind text. Adjacent pointer moves replace one another;
+/// buttons retain their own coordinates and no reliable event is coalesced.
+#[derive(Default)]
+struct PendingInput(std::collections::VecDeque<InputEnvelope>);
+impl PendingInput {
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+    fn push(&mut self, event: InputEnvelope) -> Result<()> {
+        if let InputEvent::Text { text } = &event.event {
+            for ch in text.chars() {
+                crate::input::unicode_keysym(ch)?;
+            }
+        }
+        if matches!(event.event, InputEvent::PointerMove { .. })
+            && self
+                .0
+                .back()
+                .is_some_and(|e| matches!(e.event, InputEvent::PointerMove { .. }))
+        {
+            self.0.pop_back();
+        }
+        let bytes: usize = self
+            .0
+            .iter()
+            .map(|e| match &e.event {
+                InputEvent::Text { text } => text.len(),
+                _ => 0,
+            })
+            .sum();
+        let added = match &event.event {
+            InputEvent::Text { text } => text.len(),
+            _ => 0,
+        };
+        if self.0.len() >= 64 || bytes + added > CONTROL_PAYLOAD_LIMIT {
+            return Err(error("pending input queue full"));
+        }
+        self.0.push_back(event);
+        Ok(())
+    }
+    fn next(&mut self) -> Option<InputEnvelope> {
+        let mut event = self.0.pop_front()?;
+        if let InputEvent::Text { text } = &mut event.event
+            && let Some(ch) = text.chars().next()
+        {
+            let rest = text.split_off(ch.len_utf8());
+            if !rest.is_empty() {
+                let mut remaining = event.clone();
+                remaining.event = InputEvent::Text { text: rest };
+                self.0.push_front(remaining);
+            }
+        }
+        Some(event)
+    }
 }
 #[derive(Default)]
 pub struct SessionPolicy {
@@ -219,6 +341,7 @@ pub fn serve_with_guardian(
     let mut input: Option<X11Input> = None;
     let mut capture: Option<Capture> = None;
     let mut recovering_video = false;
+    let mut pending_input = PendingInput::default();
     let mut last_scan = std::time::Instant::now() - std::time::Duration::from_secs(1);
     peer.set_read_timeout(Some(std::time::Duration::from_millis(5)))?;
     let mut target = None;
@@ -266,6 +389,7 @@ pub fn serve_with_guardian(
             return Ok(());
         }
         if current != target {
+            pending_input.clear();
             capture.take();
             input.take();
             if let Some(session_id) = policy.stop() {
@@ -306,6 +430,12 @@ pub fn serve_with_guardian(
             }
         }
         if capture_stopped {
+            if let Some(capture) = capture.as_mut() {
+                let failure = capture.failure();
+                eprintln!("remotevnc-seat-helper: {failure}");
+                output.event(HelperEvent::CaptureFailed(failure))?;
+            }
+            pending_input.clear();
             capture.take();
             input.take();
             if let Some(session_id) = policy.stop() {
@@ -324,6 +454,17 @@ pub fn serve_with_guardian(
                 })?;
             }
             continue;
+        }
+        // One scalar (including its full restoration) or one ordinary event per
+        // turn. No accepted input can extend authority; recheck at delivery.
+        if let Some(event) = pending_input.next() {
+            policy.validate(event.session_id, event.generation, now_ms())?;
+            input
+                .as_mut()
+                .ok_or("no active X11 input")?
+                .apply_with_cancel(&event.event, || {
+                    stop.load(Ordering::Relaxed) || policy.expired(now_ms()) || disconnected(peer)
+                })?;
         }
         let mut bytes = [0u8; 4096];
         let count = match peer.read(&mut bytes) {
@@ -396,14 +537,12 @@ pub fn serve_with_guardian(
                     }
                     HelperRequest::Input(event) => {
                         policy.accept(&event, now)?;
-                        input
-                            .as_mut()
-                            .ok_or("no active X11 input")?
-                            .apply_with_cancel(&event.event, || {
-                                stop.load(Ordering::Relaxed)
-                                    || policy.expired(now_ms())
-                                    || disconnected(peer)
-                            })?;
+                        if matches!(event.event, InputEvent::ReleaseAll) {
+                            pending_input.clear();
+                            input.as_mut().ok_or("no input")?.release_all()?;
+                        } else {
+                            pending_input.push(event)?;
+                        }
                     }
                     HelperRequest::RenewLease {
                         session_id,
@@ -421,6 +560,7 @@ pub fn serve_with_guardian(
                         generation,
                     } => {
                         policy.validate(session_id, generation, now)?;
+                        pending_input.clear();
                         input.as_mut().ok_or("no input")?.release_all()?;
                     }
                     HelperRequest::Stop {
@@ -428,6 +568,7 @@ pub fn serve_with_guardian(
                         generation,
                     } => {
                         policy.validate(session_id, generation, now)?;
+                        pending_input.clear();
                         capture.take();
                         input.take();
                         policy.stop();
@@ -539,6 +680,58 @@ impl Drop for Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn queued_text_is_scalar_bounded_ordered_and_cancellable() {
+        let event = |event| InputEnvelope {
+            version: WIRE_VERSION,
+            session_id: SessionId::from_uuid(uuid::Uuid::nil()),
+            generation: 1,
+            sequence: 1,
+            event,
+        };
+        let mut queue = PendingInput::default();
+        queue
+            .push(event(InputEvent::Text {
+                text: "ế😀".into()
+            }))
+            .unwrap();
+        for x in 0..1000 {
+            queue
+                .push(event(InputEvent::PointerMove { x, y: 0 }))
+                .unwrap();
+        }
+        queue
+            .push(event(InputEvent::Key {
+                keysym: 65,
+                pressed: true,
+            }))
+            .unwrap();
+        assert_eq!(queue.0.len(), 3);
+        assert!(matches!(queue.next().unwrap().event,InputEvent::Text{text} if text=="ế"));
+        assert!(matches!(queue.next().unwrap().event,InputEvent::Text{text} if text=="😀"));
+        assert!(matches!(
+            queue.next().unwrap().event,
+            InputEvent::PointerMove { x: 999, .. }
+        ));
+        queue.clear();
+        assert!(queue.next().is_none());
+        for _ in 0..64 {
+            queue
+                .push(event(InputEvent::Key {
+                    keysym: 65,
+                    pressed: true,
+                }))
+                .unwrap();
+        }
+        assert!(
+            queue
+                .push(event(InputEvent::Key {
+                    keysym: 65,
+                    pressed: false
+                }))
+                .is_err()
+        );
+    }
     #[test]
     fn stalled_video_writer_admission_and_shutdown_are_bounded() {
         use std::time::{Duration, Instant};

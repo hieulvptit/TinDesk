@@ -407,3 +407,23 @@ fn explicit_deadline_survives_display_restart_and_rejects_extension_by_traffic()
         "expired sessions cannot be revived"
     );
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn custom_socket_checks_actual_agent_traversal_without_chmod() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("remotevnc-traverse-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let error = remotevnc_seat_helper::ipc::check_socket_traversal(&dir, 65534)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(dir.to_str().unwrap()) && error.contains("cannot traverse"));
+    assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711)).unwrap();
+    remotevnc_seat_helper::ipc::check_socket_traversal(&dir, 65534).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+}

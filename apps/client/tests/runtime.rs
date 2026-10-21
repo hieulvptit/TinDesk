@@ -86,6 +86,7 @@ struct Control {
     deny_challenge: AtomicUsize,
     revoke_unavailable: AtomicBool,
     rotate: AtomicBool,
+    offline_events: AtomicBool,
 }
 struct Server {
     base: String,
@@ -122,6 +123,9 @@ async fn server(db: Database, store: Arc<MemoryStore>) -> Server {
             let checks = checks.clone();
             async move {
                 let path = request.uri().path().to_string();
+                if path == "/v1/events" && checks.offline_events.load(Ordering::SeqCst) {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
                 if path == "/v1/enrollments" {
                     checks.begins.fetch_add(1, Ordering::SeqCst);
                     assert!(
@@ -150,7 +154,16 @@ async fn server(db: Database, store: Arc<MemoryStore>) -> Server {
                         _ => {}
                     }
                 }
-                if request.method() == Method::DELETE && path.starts_with("/v1/devices/") {
+                if request.method() == Method::DELETE
+                    && path.starts_with("/v1/devices/")
+                    && store
+                        .record
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|c| c.device_id)
+                        .is_some_and(|id| path.ends_with(&id.0.to_string()))
+                {
                     checks.revokes.fetch_add(1, Ordering::SeqCst);
                     assert!(
                         !store.view.lock().unwrap().connected,
@@ -477,4 +490,205 @@ async fn rotating_signed_sockets_keep_native_video_then_lost_restart_has_bounded
         "ordinary window close preserves enrollment"
     );
     assert_eq!(server.control.revokes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_connect_recovers_fresh_video_and_ack_then_disconnect_cancels_intent() {
+    recover_then_cancel(false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revocation_cancels_recovery_intent() {
+    recover_then_cancel(true).await;
+}
+async fn recover_then_cancel(revoke: bool) {
+    use remotevnc_device::DeviceApi;
+    use remotevnc_transport::{Peer, PeerConfig, PeerEvent, PeerRole};
+    let f = session_fixture();
+    let store = store(Some(StoredCredentials {
+        device_id: Some(f.ids[0]),
+        signing_key: device_key(1),
+    }));
+    let server = server(f.db.clone(), store.clone()).await;
+    let api = DeviceApi::new(&server.base, device_key(2)).unwrap();
+    let token = AccessToken {
+        token: f.tokens[1].clone(),
+        expires_at_unix_ms: unix_ms() + 300_000,
+    };
+    let (mut sender, mut incoming) = api.events(&token, DeviceRole::Agent).await.unwrap().split();
+    let frames = LatestFrame::default();
+    let runtime = ClientRuntime::start_with_store(
+        Config::new(&server.base).unwrap(),
+        store.view.clone(),
+        frames.clone(),
+        store.clone(),
+    )
+    .unwrap();
+    wait_for(|| store.view.lock().unwrap().status == "Choose an online Ubuntu agent").await;
+    runtime.connect(f.ids[1]); // The only Connect command in this recovery exercise.
+    let mut peer: Option<Peer> = None;
+    let mut sessions = Vec::new();
+    let mut ack = false;
+    let mut decoded = 0;
+    let mut video = encoded();
+    let mut last_video = Instant::now();
+    let until = Instant::now() + Duration::from_secs(25);
+    loop {
+        tokio::select! {
+            event=incoming.next()=>match event.unwrap().unwrap() {
+                DeviceEvent::Session { grant } if sessions.last()!=Some(&grant.session_id)=>{
+                    assert!(!sessions.contains(&grant.session_id),"old authority revived");
+                    let p=Peer::new(PeerConfig { session_id:grant.session_id,local_peer_id:grant.agent_id,remote_peer_id:grant.client_id,role:PeerRole::Agent,display:None,ice_servers:grant.ice_servers,relay_only:false }).unwrap();
+                    p.enable_h264().unwrap(); p.update_display(DisplayInfo{generation:1,width:640,height:480}).unwrap();
+                    sessions.push(grant.session_id); peer=Some(p); ack=false; decoded=0;
+                },
+                DeviceEvent::Signal { message,.. }=>{if let Some(p)=&peer {let _=p.handle_signal(message);}},
+                _=>{}
+            },
+            _=tokio::time::sleep(Duration::from_millis(5))=>{}
+        }
+        if let Some(p) = &mut peer {
+            for event in p.events().try_iter() {
+                match event {
+                    PeerEvent::Signal(message) => sender
+                        .send(&DeviceCommand::Signal {
+                            receiver: f.ids[0],
+                            message,
+                        })
+                        .await
+                        .unwrap(),
+                    PeerEvent::Input(input)
+                        if matches!(input.event, InputEvent::DisplayAck) && !ack =>
+                    {
+                        assert_eq!(
+                            input.session_id,
+                            *sessions.last().unwrap(),
+                            "fresh input scope"
+                        );
+                        ack = true;
+                    }
+                    _ => {}
+                }
+            }
+            if last_video.elapsed() > Duration::from_millis(100) {
+                video.pts_ns += 100_000_000;
+                let _ = p.push_video(video.clone());
+                last_video = Instant::now();
+            }
+        }
+        if frames.take().is_some() {
+            decoded += 1;
+        }
+        if ack && decoded >= 3 {
+            if sessions.len() == 1 {
+                api.close_session(&token, sessions[0]).await.unwrap();
+                peer.take();
+                decoded = 0;
+                ack = false;
+            } else {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < until,
+            "fresh controller session/video/ACK missing after loss: {}",
+            store.view.lock().unwrap().status
+        );
+    }
+    assert_eq!(sessions.len(), 2);
+    if revoke {
+        api.revoke_device(&token, f.ids[1]).await.unwrap();
+    } else {
+        runtime.disconnect();
+    }
+    wait_for(|| {
+        let s = store.view.lock().unwrap();
+        !s.connected && !s.connection_requested
+    })
+    .await;
+    let until = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < until {
+        tokio::select! {event=incoming.next()=>{if let Ok(Some(DeviceEvent::Session{grant}))=event {assert!(sessions.contains(&grant.session_id),"Disconnect recreated authority");}},_=tokio::time::sleep(Duration::from_millis(10))=>{}}
+    }
+    tokio::task::spawn_blocking(move || drop(runtime))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn socket_outage_invalidates_missed_presence_and_role_change() {
+    use remotevnc_device::DeviceApi;
+    let f = session_fixture();
+    let store = store(Some(StoredCredentials {
+        device_id: Some(f.ids[0]),
+        signing_key: device_key(1),
+    }));
+    let server = server(f.db.clone(), store.clone()).await;
+    server.control.rotate.store(true, Ordering::SeqCst);
+    let api = DeviceApi::new(&server.base, device_key(2)).unwrap();
+    let token = AccessToken {
+        token: f.tokens[1].clone(),
+        expires_at_unix_ms: unix_ms() + 300_000,
+    };
+    let agent = api.events(&token, DeviceRole::Agent).await.unwrap();
+    let runtime = run(&server, &store);
+    wait_for(|| {
+        store
+            .view
+            .lock()
+            .unwrap()
+            .presence
+            .iter()
+            .any(|p| p.device_id == f.ids[1] && p.online)
+    })
+    .await;
+    server.control.offline_events.store(true, Ordering::SeqCst);
+    wait_for(|| store.view.lock().unwrap().presence.is_empty()).await;
+    drop(agent); // Offline announcement is missed during this socket outage.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    server.control.offline_events.store(false, Ordering::SeqCst);
+    wait_for(|| store.view.lock().unwrap().status == "Choose an online Ubuntu agent").await;
+    assert!(
+        !store
+            .view
+            .lock()
+            .unwrap()
+            .presence
+            .iter()
+            .any(|p| p.device_id == f.ids[1] && p.online)
+    );
+    let agent = api.events(&token, DeviceRole::Agent).await.unwrap();
+    wait_for(|| {
+        store
+            .view
+            .lock()
+            .unwrap()
+            .presence
+            .iter()
+            .any(|p| p.device_id == f.ids[1] && p.role == DeviceRole::Agent && p.online)
+    })
+    .await;
+    drop(agent);
+    let _client = api.events(&token, DeviceRole::Client).await.unwrap();
+    wait_for(|| {
+        store
+            .view
+            .lock()
+            .unwrap()
+            .presence
+            .iter()
+            .any(|p| p.device_id == f.ids[1] && p.role == DeviceRole::Client && p.online)
+    })
+    .await;
+    assert!(
+        !store
+            .view
+            .lock()
+            .unwrap()
+            .presence
+            .iter()
+            .any(|p| p.device_id == f.ids[1] && p.role == DeviceRole::Agent && p.online)
+    );
+    tokio::task::spawn_blocking(move || drop(runtime))
+        .await
+        .unwrap();
 }

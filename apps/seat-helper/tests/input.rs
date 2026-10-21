@@ -368,3 +368,64 @@ fn remote_cleanup_preserves_local_back_and_forward_buttons() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires disposable Xvfb"]
+fn content_scroll_signs_reach_actual_x11_buttons_on_both_axes() {
+    use remotevnc_protocol::InputEvent;
+    use remotevnc_seat_helper::{input::X11Input, x11};
+    use x11rb::{
+        connection::Connection,
+        protocol::{Event, xproto::*},
+    };
+    let t = target();
+    let c = x11::connect(&t).unwrap();
+    let window = c.generate_id().unwrap();
+    c.create_window(
+        x11rb::COPY_DEPTH_FROM_PARENT,
+        window,
+        c.setup().roots[0].root,
+        0,
+        0,
+        300,
+        300,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        0,
+        &CreateWindowAux::new().event_mask(EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE),
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    c.map_window(window).unwrap().check().unwrap();
+    let mut input = X11Input::connect(&t).unwrap();
+    for (dx, dy, expected) in [(0, 1, 4), (0, -1, 5), (1, 0, 6), (-1, 0, 7)] {
+        input
+            .apply(&InputEvent::Scroll {
+                delta_x: dx,
+                delta_y: dy,
+                x: 50,
+                y: 50,
+            })
+            .unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut pressed = false;
+        loop {
+            match c.poll_for_event().unwrap() {
+                Some(Event::ButtonPress(event)) => {
+                    assert_eq!(event.detail, expected);
+                    pressed = true;
+                }
+                Some(Event::ButtonRelease(event)) => {
+                    assert_eq!(event.detail, expected);
+                    assert!(pressed);
+                    break;
+                }
+                _ => {}
+            }
+            assert!(std::time::Instant::now() < until);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    c.destroy_window(window).unwrap().check().unwrap();
+}

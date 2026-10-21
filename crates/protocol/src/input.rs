@@ -46,6 +46,7 @@ pub enum InputEvent {
         text: String,
     },
     /// Signed wheel steps at the supplied pixel position.
+    /// Content motion: positive Y scrolls up (X11 button 4), positive X left (6).
     Scroll {
         delta_x: i32,
         delta_y: i32,

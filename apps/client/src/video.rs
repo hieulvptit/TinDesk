@@ -42,16 +42,80 @@ impl Viewport {
     }
 }
 /// A single replaceable frame; a slow UI never accumulates decoded images.
+#[derive(Default)]
+struct FrameState {
+    frame: Option<DecodedFrame>,
+    dimensions: Option<(u32, u32)>,
+    arrivals: std::collections::VecDeque<std::time::Instant>,
+}
 #[derive(Clone, Default)]
-pub struct LatestFrame(Arc<Mutex<Option<DecodedFrame>>>);
+pub struct LatestFrame(Arc<Mutex<FrameState>>);
 impl LatestFrame {
     pub fn replace(&self, frame: DecodedFrame) {
-        *self.0.lock().unwrap() = Some(frame);
+        let mut state = self.0.lock().unwrap();
+        let now = std::time::Instant::now();
+        state.dimensions = Some((frame.width, frame.height));
+        state.arrivals.push_back(now);
+        while state.arrivals.len() > 128
+            || state
+                .arrivals
+                .front()
+                .is_some_and(|t| now.duration_since(*t).as_secs_f64() > 2.)
+        {
+            state.arrivals.pop_front();
+        }
+        state.frame = Some(frame);
+    }
+    /// Observed decoded arrivals over at most two seconds, never target FPS.
+    pub fn metrics(&self) -> (Option<(u32, u32)>, Option<f64>) {
+        let state = self.0.lock().unwrap();
+        let fps = state
+            .arrivals
+            .back()
+            .filter(|t| t.elapsed().as_secs_f64() <= 2.)
+            .and_then(|last| {
+                state
+                    .arrivals
+                    .front()
+                    .filter(|first| *first < last)
+                    .map(|first| {
+                        (state.arrivals.len() - 1) as f64
+                            / last.duration_since(*first).as_secs_f64()
+                    })
+            });
+        (state.dimensions, fps)
     }
     pub fn take(&self) -> Option<DecodedFrame> {
-        self.0.lock().unwrap().take()
+        self.0.lock().unwrap().frame.take()
     }
     pub fn clear(&self) {
-        self.0.lock().unwrap().take();
+        *self.0.lock().unwrap() = FrameState::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    #[test]
+    fn observed_rate_is_unavailable_without_samples_and_after_stall() {
+        let frames = LatestFrame::default();
+        assert_eq!(frames.metrics(), (None, None));
+        let now = Instant::now();
+        {
+            let mut state = frames.0.lock().unwrap();
+            state.dimensions = Some((320, 180));
+            state
+                .arrivals
+                .extend([now - Duration::from_millis(100), now]);
+        }
+        assert_eq!(frames.metrics(), (Some((320, 180)), Some(10.)));
+        frames.0.lock().unwrap().arrivals = std::collections::VecDeque::from([
+            now - Duration::from_secs(4),
+            now - Duration::from_secs(3),
+        ]);
+        assert_eq!(frames.metrics(), (Some((320, 180)), None));
+        frames.clear();
+        assert_eq!(frames.metrics(), (None, None));
     }
 }

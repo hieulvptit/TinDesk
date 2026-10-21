@@ -625,6 +625,7 @@ impl Live {
             };
             match event {
                 HelperEvent::Ready => {}
+                HelperEvent::CaptureFailed(failure) => eprintln!("remotevnc-agent: {failure}"),
                 HelperEvent::Error { .. } => {
                     eprintln!(
                         "remotevnc-agent: helper input unavailable or recovery pending; session closed"
