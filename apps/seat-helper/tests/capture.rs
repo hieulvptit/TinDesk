@@ -326,6 +326,197 @@ fn cropped_capture_hot_profile_decodes_over_rtp_without_input_reset() {
 }
 
 #[test]
+#[ignore = "requires Xvfb fixture and Linux capture worker"]
+fn hot_profile_renegotiation_preserves_capture_and_held_input() {
+    use gst::prelude::*;
+    use remotevnc_seat_helper::{input::X11Input, x11};
+    use x11rb::{
+        connection::Connection,
+        protocol::xproto::{ConnectionExt, KeyButMask},
+    };
+    // A panic must stop the test decoder before GStreamer elements are dropped.
+    struct Decoder(gst::Pipeline);
+    impl Drop for Decoder {
+        fn drop(&mut self) {
+            let _ = self.0.set_state(gst::State::Null);
+        }
+    }
+    let target = DisplayTarget {
+        seat: "test-only".into(),
+        display: std::env::var("DISPLAY").unwrap(),
+        authority: std::env::var_os("XAUTHORITY").unwrap().into(),
+        identity: ServerIdentity {
+            process_start: "fixture".into(),
+            socket_inode: 0,
+            authority_inode: 0,
+            authority_modified_ns: 0,
+            connection_epoch: 0,
+        },
+        output: "screen".into(),
+        origin_x: 0,
+        origin_y: 0,
+        width: 1920,
+        height: 1080,
+    };
+    let high = VideoProfile {
+        width: 320,
+        height: 180,
+        fps: 10,
+        bitrate_kbps: 512,
+        encoder: VideoEncoder::X264,
+    };
+    let low = VideoProfile {
+        width: 240,
+        height: 134,
+        fps: 7,
+        bitrate_kbps: 384,
+        encoder: VideoEncoder::X264,
+    };
+    high.validate().unwrap();
+    low.validate().unwrap();
+    let profiles = [high, low, high, low, high];
+    let x = x11::connect(&target).unwrap();
+    let root = x.setup().roots[0].root;
+    let min = x.setup().min_keycode;
+    let mapping = x
+        .get_keyboard_mapping(min, x.setup().max_keycode - min + 1)
+        .unwrap()
+        .reply()
+        .unwrap();
+    let shift = min as usize
+        + mapping
+            .keysyms
+            .chunks(mapping.keysyms_per_keycode as usize)
+            .position(|keys| keys.contains(&0xffe1))
+            .unwrap();
+    let held = || {
+        let keys = x.query_keymap().unwrap().reply().unwrap().keys;
+        let pointer = x.query_pointer(root).unwrap().reply().unwrap();
+        (
+            keys[shift / 8] & (1 << (shift % 8)) != 0,
+            pointer.mask.contains(KeyButMask::BUTTON1),
+        )
+    };
+    assert_eq!(held(), (false, false));
+    let mut input = X11Input::connect(&target).unwrap();
+    input
+        .apply(&InputEvent::Key {
+            keysym: 0xffe1,
+            pressed: true,
+        })
+        .unwrap();
+    input
+        .apply(&InputEvent::Button {
+            button: MouseButton::Left,
+            pressed: true,
+            x: 20,
+            y: 20,
+        })
+        .unwrap();
+    assert_eq!(held(), (true, true));
+    gst::init().unwrap();
+    let decoder = Decoder(gst::parse::launch(
+        "appsrc name=input is-live=true format=time block=false max-buffers=2 caps=\"video/x-h264,stream-format=byte-stream,alignment=au\" ! h264parse ! avdec_h264 ! appsink name=decoded sync=false max-buffers=2 drop=false"
+    ).unwrap().downcast::<gst::Pipeline>().unwrap());
+    let source = decoder.0.by_name("input").unwrap();
+    let sink = decoder.0.by_name("decoded").unwrap();
+    decoder.0.set_state(gst::State::Playing).unwrap();
+    let mut capture = Capture::start_with_worker(
+        Path::new(env!("CARGO_BIN_EXE_remotevnc-seat-helper")),
+        &target,
+        high,
+        7,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut previous_pts = None;
+    let mut stage = 0;
+    let mut stage_started = Instant::now();
+    let mut stage_pts = None;
+    let mut config_pts = None;
+    let mut new_output = false;
+    let mut keyframe_requested = Instant::now();
+    loop {
+        if let Some(bus) = decoder.0.bus() {
+            for message in bus.iter() {
+                if let gst::MessageView::Error(error) = message.view() {
+                    panic!("decoder stage{stage}: {}", error.error());
+                }
+            }
+        }
+        while let Ok(frame) = capture.frames().try_recv() {
+            assert_eq!(frame.generation, 7, "quality change cannot replace display");
+            assert!(
+                previous_pts.is_none_or(|pts| frame.pts_ns > pts),
+                "source PTS must advance stage{stage}"
+            );
+            previous_pts = Some(frame.pts_ns);
+            if frame.is_config_keyframe() && stage_pts.is_none_or(|pts| frame.pts_ns > pts) {
+                config_pts = Some(frame.pts_ns);
+            }
+            let mut buffer = gst::Buffer::from_mut_slice(frame.data);
+            let data = buffer.get_mut().unwrap();
+            data.set_pts(gst::ClockTime::from_nseconds(frame.pts_ns));
+            data.set_dts(gst::ClockTime::from_nseconds(frame.pts_ns));
+            if !frame.keyframe {
+                data.set_flags(gst::BufferFlags::DELTA_UNIT);
+            }
+            let flow: gst::FlowReturn = source.emit_by_name("push-buffer", &[&buffer]);
+            flow.into_result().unwrap();
+        }
+        loop {
+            let sample: Option<gst::Sample> = sink.emit_by_name("try-pull-sample", &[&0u64]);
+            let Some(sample) = sample else {
+                break;
+            };
+            let caps = sample.caps().unwrap().structure(0).unwrap();
+            let dimensions = (
+                caps.get::<i32>("width").unwrap(),
+                caps.get::<i32>("height").unwrap(),
+            );
+            let pts = sample.buffer().unwrap().pts().unwrap().nseconds();
+            let expected = profiles[stage];
+            if dimensions == (expected.width as i32, expected.height as i32)
+                && config_pts.is_some_and(|config| pts >= config)
+            {
+                new_output = true;
+            }
+        }
+        assert_eq!(
+            held(),
+            (true, true),
+            "quality-only update released input stage{stage}"
+        );
+        if new_output && stage_started.elapsed() >= Duration::from_secs(2) {
+            if stage == 4 {
+                break;
+            }
+            stage += 1;
+            stage_pts = previous_pts;
+            config_pts = None;
+            new_output = false;
+            capture.update_profile(profiles[stage]).unwrap();
+            stage_started = Instant::now();
+        }
+        if keyframe_requested.elapsed() > Duration::from_secs(1) {
+            capture.request_keyframe().unwrap_or_else(|error| {
+                panic!("capture ended during profile stage{stage}: {error}")
+            });
+            keyframe_requested = Instant::now();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "hot profile stage{stage} lacks fresh decoded config-IDR output, lastPTS{previous_pts:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    capture.stop();
+    assert_eq!(held(), (true, true));
+    input.release_all().unwrap();
+    assert_eq!(held(), (false, false));
+}
+
+#[test]
 #[ignore = "requires 1920x1080 Xvfb fixture and Linux capture worker"]
 fn repeated_1080p_rtp_stream_stays_bounded_and_stops_cleanly() {
     use remotevnc_transport::*;

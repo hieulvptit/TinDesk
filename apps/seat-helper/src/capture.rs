@@ -205,7 +205,7 @@ fn encoder_description(encoder: VideoEncoder, p: VideoProfile) -> String {
 fn pipeline(source: &str, p: VideoProfile, encoder: VideoEncoder) -> Result<gst::Pipeline> {
     // Drop raw frames before inter-frame encoding. Never leak encoded deltas.
     let text = format!(
-        "{source} ! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream ! videoconvert ! videoscale ! videorate drop-only=true ! capsfilter name=profile caps=\"video/x-raw,format=I420,width={},height={},framerate={}/1\" ! {} ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline ! appsink name=encoded max-buffers=2 drop=false sync=false",
+        "{source} ! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream ! videoconvert ! videoscale ! videorate drop-only=true ! capsfilter name=profile caps-change-mode=delayed caps=\"video/x-raw,format=I420,width={},height={},framerate={}/1\" ! {} ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline ! appsink name=encoded max-buffers=2 drop=false sync=false",
         p.width,
         p.height,
         p.fps,

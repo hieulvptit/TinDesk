@@ -69,5 +69,6 @@ PY
 # Native capture/media and independent guardian recovery on this disposable display.
 cargo test -p remotevnc-seat-helper --test capture physical_capture -- --ignored --test-threads=1
 cargo test -p remotevnc-seat-helper --test capture cropped_capture -- --ignored --test-threads=1
+cargo test -p remotevnc-seat-helper --test capture hot_profile_renegotiation -- --ignored --test-threads=1
 cargo test -p remotevnc-seat-helper --test recovery guardian_releases_real -- --ignored --test-threads=1
 cargo test -p remotevnc-seat-helper --test recovery guardian_restores_unicode -- --ignored --test-threads=1
