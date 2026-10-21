@@ -479,6 +479,9 @@ struct Live {
     turn_due: Option<u64>,
     negotiation_until: Option<Instant>,
     helper_transition_until: Option<Instant>,
+    profile: VideoProfile,
+    adaptation: remotevnc_transport::stats::AdaptiveProfile,
+    next_media_sample: Instant,
 }
 impl Live {
     fn new(
@@ -562,6 +565,9 @@ impl Live {
             restarted_generation: 0,
             negotiation_until: None,
             helper_transition_until: None,
+            profile: VideoProfile::default(),
+            adaptation: remotevnc_transport::stats::AdaptiveProfile::new(VideoProfile::default())?,
+            next_media_sample: Instant::now() + Duration::from_secs(1),
         })
     }
     fn renewed(&mut self, started: u64) -> Result<()> {
@@ -635,6 +641,7 @@ impl Live {
                     self.helper_transition_until = Some(Instant::now() + Duration::from_secs(1));
                 }
                 HelperEvent::DisplayUnavailable { generation } => {
+                    self.helper.retire_video();
                     self.helper_transition_until = None;
                     self.display = None;
                     self.guard = None;
@@ -653,7 +660,7 @@ impl Live {
                     self.helper.send(HelperRequest::StartCapture {
                         session_id: self.grant.session_id,
                         generation: display.generation,
-                        profile: VideoProfile::default(),
+                        profile: self.profile,
                     })?;
                     self.guard = Some(InputGuard::new(
                         self.grant.session_id,
@@ -724,15 +731,45 @@ impl Live {
         if self.negotiation_until.is_some_and(|t| Instant::now() >= t) {
             return Err("fresh session required after lost signaling".into());
         }
+        let now = Instant::now();
+        let (helper_drops, request_keyframe) = self.helper.video_health(now.into_std())?;
+        if let Some(display) = self.display {
+            if request_keyframe {
+                self.helper.send(HelperRequest::RequestKeyframe {
+                    session_id: self.grant.session_id,
+                    generation: display.generation,
+                })?;
+            }
+            if now >= self.next_media_sample {
+                self.next_media_sample = now + Duration::from_secs(1);
+                let mut stats = self.peer.stats();
+                stats.dropped_encoded_frames =
+                    stats.dropped_encoded_frames.saturating_add(helper_drops);
+                if let Some(profile) = self.adaptation.observe(&stats) {
+                    self.helper.send(HelperRequest::UpdateProfile {
+                        session_id: self.grant.session_id,
+                        generation: display.generation,
+                        profile,
+                    })?;
+                    self.profile = profile;
+                }
+            }
+        }
         for _ in 0..2 {
-            let Ok(frame) = self.helper.video.try_recv() else {
+            let Ok(received) = self.helper.video.try_recv() else {
                 break;
             };
+            let frame = received.frame;
             if self
                 .display
                 .is_some_and(|d| d.generation == frame.generation)
             {
+                let generation = frame.generation;
+                let config = frame.is_config_keyframe();
                 match self.peer.push_video(frame) {
+                    Ok(()) if config => self
+                        .helper
+                        .video_accepted(generation, received.recovery_revision),
                     Ok(()) | Err(TransportError::QueueFull | TransportError::NotReady) => {}
                     Err(e) => return Err(e.into()),
                 }

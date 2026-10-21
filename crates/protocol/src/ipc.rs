@@ -69,6 +69,24 @@ pub struct EncodedFrame {
 }
 
 impl EncodedFrame {
+    /// A fresh Annex-B SPS/PPS and IDR can restart decoding after encoded loss.
+    pub fn is_config_keyframe(&self) -> bool {
+        if !self.keyframe {
+            return false;
+        }
+        let mut types = [false; 3];
+        for window in self.data.windows(4) {
+            if window[..3] == [0, 0, 1] {
+                match window[3] & 31 {
+                    7 => types[0] = true,
+                    8 => types[1] = true,
+                    5 => types[2] = true,
+                    _ => {}
+                }
+            }
+        }
+        types.into_iter().all(|v| v)
+    }
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.data.len() > ENCODED_FRAME_LIMIT {
             return Err(ProtocolError::FrameTooLarge);

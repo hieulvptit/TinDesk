@@ -55,7 +55,7 @@ pub struct NativeStats {
 }
 /// Observe at one-second intervals. Missing measurements are unavailable, never
 /// synthesized from ICE configuration. Three pressured samples trigger a step,
-/// followed by five samples of cooldown; Task7 applies it to the helper.
+/// followed by five samples of cooldown; the agent applies it to the helper.
 pub struct AdaptiveProfile {
     profile: remotevnc_protocol::VideoProfile,
     strikes: u8,

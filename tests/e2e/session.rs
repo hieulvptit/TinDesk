@@ -40,7 +40,11 @@ impl Drop for Process {
     }
 }
 fn spawn(dir: &Path, role: &str) -> Process {
-    let log = std::fs::File::create(dir.join(format!("{role}.log"))).unwrap();
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(format!("{role}.log")))
+        .unwrap();
     Process(
         Command::new(
             std::env::var_os("REMOTEVNC_E2E_FIXTURE").expect("explicit fixture executable"),
@@ -61,6 +65,26 @@ async fn wait(mut condition: impl FnMut() -> bool, duration: Duration, descripti
         assert!(Instant::now() < end, "timed out: {description}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+// Fresh test RSA keys are generated before listen and can take tens of seconds.
+// This setup allowance never changes native disconnect, HTTP or authority bounds.
+async fn backend_ready(dir: &Path, process: &mut Process, phase: &str) {
+    let started = Instant::now();
+    while !dir.join("backend.ready").exists() {
+        if let Some(status) = process.0.try_wait().unwrap() {
+            process.1 = false;
+            panic!("backend fixture {phase} exited before readiness: {status}; see backend.log");
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "backend fixture {phase} setup exceeded 120s; see backend.log"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    println!(
+        "backend fixture {phase} ready after {:?}",
+        started.elapsed()
+    );
 }
 fn held(connection: &x11rb::rust_connection::RustConnection) -> (bool, bool) {
     let min = connection.setup().min_keycode;
@@ -168,12 +192,7 @@ async fn signed_accounts_unicode_revocation_and_process_restarts_release_input()
     drop(listener);
     std::fs::write(dir.join("address"), address.to_string()).unwrap();
     let mut backend = spawn(dir, "backend");
-    wait(
-        || dir.join("backend.ready").exists(),
-        Duration::from_secs(30),
-        "signed OIDC backend startup",
-    )
-    .await;
+    backend_ready(dir, &mut backend, "initial").await;
     let ids: Vec<DeviceId> =
         serde_json::from_slice(&std::fs::read(dir.join("devices.json")).unwrap()).unwrap();
     let base = format!("http://{address}");
@@ -271,6 +290,42 @@ async fn signed_accounts_unicode_revocation_and_process_restarts_release_input()
         "exact end-to-end GTK Unicode",
     )
     .await;
+    let pts = || {
+        std::fs::read_to_string(dir.join("controller.pts"))
+            .ok()?
+            .parse::<u64>()
+            .ok()
+    };
+    let before_pause = pts().expect("decoded source PTS");
+    assert_eq!(
+        unsafe { libc::kill(_agent.0.id() as i32, libc::SIGSTOP) },
+        0
+    );
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        unsafe { libc::kill(_agent.0.id() as i32, libc::SIGCONT) },
+        0
+    );
+    wait(
+        || pts().is_some_and(|p| p > before_pause + 500_000_000),
+        Duration::from_secs(20),
+        "fresh decoded media after 250ms scheduling pressure",
+    )
+    .await;
+    assert_eq!(
+        held(&connection),
+        (true, true),
+        "video pressure must preserve held input"
+    );
+    assert!(
+        authority_api
+            .renew_session(&authority_token, grant.session_id)
+            .await
+            .is_ok()
+    );
+    println!(
+        "PASS 250ms agent scheduling pause: fresh decoded PTS, held input, generation/session and authority preserved"
+    );
     // Account B cannot signal into an established A session; its socket is policy-closed.
     let (mut bad_sender, mut bad_events) = other
         .events(&other_token, DeviceRole::Client)
@@ -373,12 +428,7 @@ async fn signed_accounts_unicode_revocation_and_process_restarts_release_input()
     drop(backend);
     std::fs::remove_file(dir.join("backend.ready")).unwrap();
     backend = spawn(dir, "backend");
-    wait(
-        || dir.join("backend.ready").exists(),
-        Duration::from_secs(30),
-        "backend restart",
-    )
-    .await;
+    backend_ready(dir, &mut backend, "restart").await;
     online(&api, &token, ids[1]).await;
     closed(&authority_api, &authority_token, grant.session_id).await;
     let (mut client, grant) = controller(dir, false, &connection).await;

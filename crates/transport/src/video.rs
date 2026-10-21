@@ -57,7 +57,7 @@ impl Peer {
         if sender.generation != frame.generation {
             return Err(ProtocolError::WrongGeneration.into());
         }
-        if sender.needs_keyframe && !(frame.keyframe && has_config_idr(&frame.data)) {
+        if sender.needs_keyframe && !frame.is_config_keyframe() {
             if !engine.keyframe_requested.swap(true, Ordering::AcqRel) {
                 self.shared.emit_at(engine.epoch, PeerEvent::KeyframeNeeded);
             }
@@ -91,20 +91,6 @@ impl Peer {
         sender.last_pts = Some(frame.pts_ns);
         Ok(())
     }
-}
-fn has_config_idr(data: &[u8]) -> bool {
-    let mut types = [false; 3];
-    for window in data.windows(4) {
-        if window[..3] == [0, 0, 1] {
-            match window[3] & 31 {
-                7 => types[0] = true,
-                8 => types[1] = true,
-                5 => types[2] = true,
-                _ => {}
-            }
-        }
-    }
-    types.into_iter().all(|v| v)
 }
 pub(super) fn install(shared: &Arc<Shared>, engine: &Arc<Engine>) -> Result<()> {
     let config = shared.config.lock().unwrap().clone();

@@ -28,7 +28,14 @@ the existing signed OIDC issuer with nonce/PKCE/exchange/confirmation and device
 proof. Account A must decode real H264 and send reliable-channel Unicode to GTK:
 `Tiếng Việt|é|é|中文|😀` (the second accented e is NFD). The receiver compares
 exact code points and rejects duplicate commits. Account B sees only its own
-device/presence and cannot create or signal into A's session. The harness kills
+device/presence and cannot create or signal into A's session. A bounded250ms agent
+scheduling pause must preserve held input/session authority and restore freshly
+decoded source timestamps at the default1920x1080@60fps capture profile. Focused
+service coverage separately uses measured IPC drops to require adaptive quality
+updates; config-bearing IDR recovery is bounded by one absolute20s episode.
+Backend fixture setup has a120s allowance for fresh RSA preparation, phase logs,
+and prompt child-exit detection; native failure/authority bounds are separate.
+The harness kills
 the established controller without Signal::End, kills/restarts helper and
 backend separately while Shift/left-button are held, verifies native X11 state
 release and nonrenewable closed sessions, reconnects with fresh sessions, and

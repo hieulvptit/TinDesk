@@ -183,6 +183,7 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
         .unwrap();
         let mut decoder = remotevnc_seat_helper::ipc::FrameDecoder::default();
         let mut capture = false;
+        let mut burst = 16;
         let encoded = encoded_fixture();
         let mut last = std::time::Instant::now();
         let mut pts = 0;
@@ -196,6 +197,9 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
                         if matches!(request, HelperRequest::StartCapture { .. }) {
                             capture = true;
                         }
+                        if matches!(request, HelperRequest::UpdateProfile { .. }) {
+                            burst = 1;
+                        }
                         requests_tx.blocking_send(request).unwrap();
                     }
                 }
@@ -207,17 +211,21 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
                 Err(_) => break,
             }
             if capture && last.elapsed() > Duration::from_millis(100) {
-                let frame = EncodedFrame {
-                    generation: 1,
-                    pts_ns: pts,
-                    keyframe: pts != 0,
-                    data: encoded.clone(),
-                };
-                pts += 100_000_000;
-                last = std::time::Instant::now();
-                if write_helper_output(&mut stream, &HelperOutput::Video(frame)).is_err() {
-                    break;
+                // Real encoded IPC bursts fill the actual two-frame reader queue.
+                // Sustained measured drops must reach the agent's adaptive policy.
+                for _ in 0..burst {
+                    let frame = EncodedFrame {
+                        generation: 1,
+                        pts_ns: pts,
+                        keyframe: pts != 0,
+                        data: encoded.clone(),
+                    };
+                    pts += 6_250_000;
+                    if write_helper_output(&mut stream, &HelperOutput::Video(frame)).is_err() {
+                        return;
+                    }
                 }
+                last = std::time::Instant::now();
             }
         }
     });
@@ -270,6 +278,7 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
     let mut decoded_after_release = false;
     let mut renewed = false;
     let mut keyframe_requested = false;
+    let mut adapted = false;
     loop {
         tokio::select! {
           event=incoming.next()=>match event.unwrap().unwrap(){
@@ -306,7 +315,6 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
                     keysym: 0x61,
                     pressed: true,
                 },
-                InputEvent::ReleaseAll,
             ]
             .into_iter()
             .enumerate()
@@ -349,12 +357,39 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
                     assert!(deadline_boot_ms >= started.unwrap() + 14_000);
                     renewed = true;
                 }
+                HelperRequest::UpdateProfile {
+                    session_id,
+                    generation,
+                    profile,
+                } => {
+                    assert_eq!(session_id, grant.session_id);
+                    assert_eq!(generation, 1);
+                    assert!(profile.width < VideoProfile::default().width);
+                    assert!(profile.fps < VideoProfile::default().fps);
+                    assert!(profile.bitrate_kbps < VideoProfile::default().bitrate_kbps);
+                    if !adapted {
+                        assert!(
+                            held && !released,
+                            "quality adaptation must preserve held input"
+                        );
+                        controller
+                            .send_input(InputEnvelope {
+                                version: WIRE_VERSION,
+                                session_id: grant.session_id,
+                                generation: 1,
+                                sequence: 2,
+                                event: InputEvent::ReleaseAll,
+                            })
+                            .unwrap();
+                    }
+                    adapted = true;
+                }
                 HelperRequest::RequestKeyframe { .. } => keyframe_requested = true,
                 HelperRequest::Stop { .. } => panic!("ordinary focus loss must preserve capture"),
                 _ => {}
             }
         }
-        if released && decoded_after_release && renewed && keyframe_requested {
+        if released && decoded_after_release && renewed && keyframe_requested && adapted {
             break;
         }
         assert!(

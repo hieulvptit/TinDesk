@@ -11,7 +11,12 @@ use remotevnc_seat_helper::{
     seat::{DisplayTarget, ServerIdentity},
 };
 use remotevnc_transport::{Peer, PeerConfig, PeerEvent, PeerRole};
-use std::{os::unix::net::UnixListener, path::PathBuf, sync::atomic::AtomicBool, time::Duration};
+use std::{
+    os::unix::net::UnixListener,
+    path::PathBuf,
+    sync::atomic::AtomicBool,
+    time::{Duration, Instant},
+};
 
 pub fn run() -> remotevnc_agent::Result<()> {
     // Capture::start self-execs its helper; this is exclusively a test executable.
@@ -92,8 +97,18 @@ fn helper(dir: &std::path::Path) -> remotevnc_agent::Result<()> {
     Ok(())
 }
 async fn backend(dir: &std::path::Path) -> remotevnc_agent::Result<()> {
+    let started = Instant::now();
+    eprintln!(
+        "backend fixture bootstrap started; restart={}",
+        dir.join("devices.json").exists()
+    );
     let db = Database::open(dir.join("backend.sqlite"))?;
+    eprintln!("backend fixture database ready: {:?}", started.elapsed());
     let issuer = Issuer::start().await;
+    eprintln!(
+        "backend fixture signed issuer ready (RSA preparation and discovery): {:?}",
+        started.elapsed()
+    );
     let auth = issuer.auth(db.clone());
     let devices = DeviceService::new(config(), db.clone());
     let manifest = dir.join("devices.json");
@@ -116,8 +131,13 @@ async fn backend(dir: &std::path::Path) -> remotevnc_agent::Result<()> {
     let sessions = SessionService::new(db, TurnClient::unavailable());
     sessions.expire_on_startup().await?;
     let address = std::fs::read_to_string(dir.join("address"))?;
+    eprintln!(
+        "backend fixture enrollment/session startup complete: {:?}",
+        started.elapsed()
+    );
     let listener = tokio::net::TcpListener::bind(address.trim()).await?;
     std::fs::write(dir.join("backend.ready"), b"ready")?;
+    eprintln!("backend fixture listening: {:?}", started.elapsed());
     // Keep issuer alive for the lifetime of the actual HTTP/WebSocket backend process.
     axum::serve(
         listener,
@@ -192,7 +212,16 @@ async fn controller(dir: &std::path::Path, unicode: bool) -> remotevnc_agent::Re
                         .await?;
                 }
                 PeerEvent::ChannelsReady => channels = true,
-                PeerEvent::Frame(_) => decoded = true,
+                PeerEvent::Frame(frame) => {
+                    decoded = true;
+                    if let Some(pts) = frame.pts_ns {
+                        std::fs::write(dir.join("controller.pts.next"), pts.to_string())?;
+                        std::fs::rename(
+                            dir.join("controller.pts.next"),
+                            dir.join("controller.pts"),
+                        )?;
+                    }
+                }
                 PeerEvent::Error(e) => return Err(e.into()),
                 _ => {}
             }

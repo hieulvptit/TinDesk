@@ -6,15 +6,49 @@ use std::{
     net::Shutdown,
     os::unix::net::UnixStream,
     path::Path,
-    sync::{Arc, mpsc},
-    time::Duration,
+    sync::{Arc, Mutex, mpsc},
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc as async_mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// Local queue metadata is never transmitted over IPC.
+pub struct ReceivedVideo {
+    pub frame: EncodedFrame,
+    pub recovery_revision: u64,
+}
+#[derive(Default)]
+struct VideoRecovery {
+    generation: Option<u64>,
+    recovering: bool,
+    started: Option<Instant>,
+    pending: bool,
+    dropped: u64,
+    revision: u64,
+}
+impl VideoRecovery {
+    fn dropped(&mut self, keyframe: bool) {
+        self.dropped = self.dropped.saturating_add(1);
+        self.revision = self.revision.wrapping_add(1);
+        self.pending |= !self.recovering || keyframe;
+        self.recovering = true;
+        self.started.get_or_insert_with(Instant::now);
+    }
+    fn health(&mut self, now: Instant) -> Result<(u64, bool)> {
+        if self
+            .started
+            .is_some_and(|t| now.saturating_duration_since(t) >= Duration::from_secs(20))
+        {
+            return Err("encoded video recovery timed out".into());
+        }
+        Ok((self.dropped, std::mem::take(&mut self.pending)))
+    }
+}
+
 pub struct Helper {
     pub events: async_mpsc::Receiver<HelperEvent>,
-    pub video: async_mpsc::Receiver<EncodedFrame>,
+    pub video: async_mpsc::Receiver<ReceivedVideo>,
+    recovery: Arc<Mutex<VideoRecovery>>,
     pub failed: CancellationToken,
     socket: Arc<UnixStream>,
     commands: mpsc::SyncSender<HelperRequest>,
@@ -31,6 +65,8 @@ impl Helper {
         let (video_tx, video) = async_mpsc::channel(2);
         let (commands, requests) = mpsc::sync_channel::<HelperRequest>(32);
         let failed = CancellationToken::new();
+        let recovery = Arc::new(Mutex::new(VideoRecovery::default()));
+        let video_recovery = recovery.clone();
         let failure = failed.clone();
         std::thread::Builder::new()
             .name("agent-helper-read".into())
@@ -42,11 +78,28 @@ impl Helper {
                                 break;
                             }
                         }
-                        // Never discard an encoded reference and continue its dependent deltas.
-                        // Saturation closes the session; controller can establish a fresh one.
                         HelperOutput::Video(frame) => {
-                            if video_tx.try_send(frame).is_err() {
-                                break;
+                            // Parsing validates size/metadata before ordinary stale-frame handling.
+                            let mut recovery = video_recovery.lock().unwrap();
+                            if recovery.generation != Some(frame.generation) {
+                                continue;
+                            }
+                            let config = frame.is_config_keyframe();
+                            if recovery.recovering && !config {
+                                recovery.dropped = recovery.dropped.saturating_add(1);
+                                continue;
+                            }
+                            let received = ReceivedVideo {
+                                frame,
+                                recovery_revision: recovery.revision,
+                            };
+                            match video_tx.try_send(received) {
+                                Ok(()) if config => recovery.recovering = false,
+                                Ok(()) => {}
+                                Err(async_mpsc::error::TrySendError::Full(_)) => {
+                                    recovery.dropped(config)
+                                }
+                                Err(async_mpsc::error::TrySendError::Closed(_)) => break,
                             }
                         }
                     }
@@ -73,15 +126,53 @@ impl Helper {
         Ok(Self {
             events,
             video,
+            recovery,
             failed,
             socket,
             commands,
         })
     }
     pub fn send(&self, request: HelperRequest) -> Result<()> {
+        let generation = match &request {
+            HelperRequest::StartCapture { generation, .. } => Some(*generation),
+            _ => None,
+        };
+        let mut recovery = self.recovery.lock().unwrap();
         self.commands
             .try_send(request)
-            .map_err(|_| "helper control queue unavailable".into())
+            .map_err(|_| "helper control queue unavailable")?;
+        if let Some(generation) = generation
+            && recovery.generation != Some(generation)
+        {
+            recovery.generation = Some(generation);
+            recovery.recovering = false;
+            recovery.started = None;
+            recovery.pending = false;
+            recovery.revision = recovery.revision.wrapping_add(1);
+        }
+        Ok(())
+    }
+    pub fn retire_video(&self) {
+        let mut recovery = self.recovery.lock().unwrap();
+        recovery.generation = None;
+        recovery.recovering = false;
+        recovery.started = None;
+        recovery.pending = false;
+        recovery.revision = recovery.revision.wrapping_add(1);
+    }
+    /// One bounded notice per recovery attempt; the absolute deadline is not renewed.
+    pub fn video_health(&self, now: Instant) -> Result<(u64, bool)> {
+        self.recovery.lock().unwrap().health(now)
+    }
+    pub fn video_accepted(&self, generation: u64, revision: u64) {
+        let mut recovery = self.recovery.lock().unwrap();
+        if recovery.generation == Some(generation)
+            && recovery.revision == revision
+            && !recovery.recovering
+        {
+            recovery.started = None;
+            recovery.pending = false;
+        }
     }
     pub fn disconnect(&self) {
         let _ = self.socket.shutdown(Shutdown::Both);
@@ -93,5 +184,26 @@ impl Helper {
 impl Drop for Helper {
     fn drop(&mut self) {
         self.disconnect();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn repeated_pressure_cannot_extend_recovery_deadline() {
+        let mut state = VideoRecovery::default();
+        state.dropped(false);
+        let started = state.started.unwrap();
+        assert!(state.health(started).unwrap().1);
+        state.dropped(false);
+        assert!(!state.health(started).unwrap().1);
+        state.dropped(true);
+        assert!(
+            state.health(started).unwrap().1,
+            "lost recovery IDR requests another attempt"
+        );
+        assert_eq!(state.started, Some(started));
+        assert!(state.health(started + Duration::from_secs(20)).is_err());
     }
 }
