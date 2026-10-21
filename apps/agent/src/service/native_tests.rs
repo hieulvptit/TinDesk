@@ -443,8 +443,34 @@ async fn long_text_keeps_video_renewals_and_cancellation_live() {
     let mut pts = session.pts.unwrap();
     let mut frame_at = Instant::now();
     let mut advancing = 0;
+    let mut motion_sent = false;
+    let mut motion_observed = false;
     while received() != text {
         session.tick().unwrap();
+        if !motion_sent && start.elapsed() >= Duration::from_millis(250) {
+            session.input(InputEvent::PointerMove { x: 137, y: 93 });
+            motion_sent = true;
+        }
+        if motion_sent && !motion_observed {
+            let pointer = session
+                .x
+                .query_pointer(session.x.setup().roots[0].root)
+                .unwrap()
+                .reply()
+                .unwrap();
+            if (pointer.root_x, pointer.root_y) == (137, 93) {
+                assert!(received().chars().count() < 1000);
+                motion_observed = true;
+                println!(
+                    "PASS actual X11 pointer moves during unfinished text at {:?}",
+                    start.elapsed()
+                );
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "pointer starved behind text"
+            );
+        }
         if session.pts.unwrap() > pts {
             advancing += 1;
             pts = session.pts.unwrap();
@@ -482,7 +508,7 @@ async fn long_text_keeps_video_renewals_and_cancellation_live() {
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert!(renewed >= 2 && advancing > 100);
+    assert!(motion_observed && renewed >= 2 && advancing > 100);
     println!(
         "PASS exact1000 Unicode scalars; elapsed={:?}, advancing_frames={advancing}, renewals={renewed}",
         start.elapsed()

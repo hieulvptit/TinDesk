@@ -425,5 +425,17 @@ fn custom_socket_checks_actual_agent_traversal_without_chmod() {
     assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711)).unwrap();
     remotevnc_seat_helper::ipc::check_socket_traversal(&dir, 65534).unwrap();
+    let hidden = dir.join("hidden");
+    std::fs::create_dir(&hidden).unwrap();
+    std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let forwarded = hidden.join("forward");
+    std::os::unix::fs::symlink(&dir, &forwarded).unwrap();
+    let error = remotevnc_seat_helper::ipc::check_socket_traversal(&forwarded, 65534)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(hidden.to_str().unwrap()) && error.contains("cannot traverse"));
+    assert_eq!(std::fs::metadata(&hidden).unwrap().mode() & 0o777, 0o700);
+    std::fs::remove_file(forwarded).unwrap();
+    std::fs::remove_dir(hidden).unwrap();
     std::fs::remove_dir(dir).unwrap();
 }

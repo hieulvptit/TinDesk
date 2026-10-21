@@ -44,8 +44,18 @@ pub fn check_socket_traversal(parent: &std::path::Path, uid: u32) -> Result<()> 
     }
     groups.truncate(count as usize);
     let gid = record.pw_gid;
-    let parent = parent.canonicalize()?;
-    for ancestor in parent.ancestors().collect::<Vec<_>>().into_iter().rev() {
+    // Keep the supplied lookup route: canonicalization alone hides inaccessible
+    // directories before a symlink. Absolute lexical paths also handle relative
+    // CLI paths without testing the empty ancestor of a relative Path.
+    let supplied = std::path::absolute(parent)?;
+    let canonical = supplied.canonicalize()?;
+    let ancestors = supplied
+        .ancestors()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .chain(canonical.ancestors().collect::<Vec<_>>().into_iter().rev());
+    for ancestor in ancestors {
         let mut command = std::process::Command::new("/usr/bin/test");
         command.arg("-x").arg(ancestor);
         if unsafe { libc::geteuid() } != uid {
@@ -111,13 +121,19 @@ pub fn send_event(writer: &mut impl Write, event: &HelperEvent) -> Result<()> {
     writer.write_all(&data)?;
     Ok(())
 }
-/// Ordered input pending behind text. Adjacent pointer moves replace one another;
-/// buttons retain their own coordinates and no reliable event is coalesced.
+/// Reliable events stay ordered; one latest motion can run between text scalars.
+/// Both lanes share the existing envelope cap and are cleared together.
 #[derive(Default)]
-struct PendingInput(std::collections::VecDeque<InputEnvelope>);
+struct PendingInput {
+    reliable: std::collections::VecDeque<InputEnvelope>,
+    motion: Option<InputEnvelope>,
+    motion_turn: bool,
+}
 impl PendingInput {
     fn clear(&mut self) {
-        self.0.clear();
+        self.reliable.clear();
+        self.motion = None;
+        self.motion_turn = false;
     }
     fn push(&mut self, event: InputEnvelope) -> Result<()> {
         if let InputEvent::Text { text } = &event.event {
@@ -125,16 +141,28 @@ impl PendingInput {
                 crate::input::unicode_keysym(ch)?;
             }
         }
-        if matches!(event.event, InputEvent::PointerMove { .. })
-            && self
-                .0
-                .back()
-                .is_some_and(|e| matches!(e.event, InputEvent::PointerMove { .. }))
+        if matches!(event.event, InputEvent::PointerMove { .. }) {
+            if self.reliable.len() >= 64 {
+                return Err(error("pending input queue full"));
+            }
+            self.motion = Some(event);
+            return Ok(());
+        }
+        // Position-bearing reliable controls supersede older queued motion, just
+        // as InputGuard's admission floor rejects late network motion. Their own
+        // coordinates remain authoritative when the reliable event is delivered.
+        if matches!(
+            event.event,
+            InputEvent::Button { .. } | InputEvent::Scroll { .. }
+        ) && self
+            .motion
+            .as_ref()
+            .is_some_and(|motion| motion.sequence <= event.sequence)
         {
-            self.0.pop_back();
+            self.motion = None;
         }
         let bytes: usize = self
-            .0
+            .reliable
             .iter()
             .map(|e| match &e.event {
                 InputEvent::Text { text } => text.len(),
@@ -145,14 +173,23 @@ impl PendingInput {
             InputEvent::Text { text } => text.len(),
             _ => 0,
         };
-        if self.0.len() >= 64 || bytes + added > CONTROL_PAYLOAD_LIMIT {
+        if self.reliable.len() + usize::from(self.motion.is_some()) >= 64
+            || bytes + added > CONTROL_PAYLOAD_LIMIT
+        {
             return Err(error("pending input queue full"));
         }
-        self.0.push_back(event);
+        self.reliable.push_back(event);
         Ok(())
     }
     fn next(&mut self) -> Option<InputEnvelope> {
-        let mut event = self.0.pop_front()?;
+        // Alternate when both lanes have work: an unending motion stream cannot
+        // starve text/reliable input, and text cannot starve the latest pointer.
+        if self.motion.is_some() && (self.motion_turn || self.reliable.is_empty()) {
+            self.motion_turn = false;
+            return self.motion.take();
+        }
+        let mut event = self.reliable.pop_front()?;
+        self.motion_turn = true;
         if let InputEvent::Text { text } = &mut event.event
             && let Some(ch) = text.chars().next()
         {
@@ -160,7 +197,7 @@ impl PendingInput {
             if !rest.is_empty() {
                 let mut remaining = event.clone();
                 remaining.event = InputEvent::Text { text: rest };
-                self.0.push_front(remaining);
+                self.reliable.push_front(remaining);
             }
         }
         Some(event)
@@ -706,13 +743,21 @@ mod tests {
                 pressed: true,
             }))
             .unwrap();
-        assert_eq!(queue.0.len(), 3);
+        assert_eq!(queue.reliable.len(), 2);
+        assert!(queue.motion.is_some());
         assert!(matches!(queue.next().unwrap().event,InputEvent::Text{text} if text=="ế"));
-        assert!(matches!(queue.next().unwrap().event,InputEvent::Text{text} if text=="😀"));
         assert!(matches!(
             queue.next().unwrap().event,
             InputEvent::PointerMove { x: 999, .. }
         ));
+        assert!(matches!(queue.next().unwrap().event,InputEvent::Text{text} if text=="😀"));
+        assert!(matches!(
+            queue.next().unwrap().event,
+            InputEvent::Key { .. }
+        ));
+        queue
+            .push(event(InputEvent::PointerMove { x: 1, y: 2 }))
+            .unwrap();
         queue.clear();
         assert!(queue.next().is_none());
         for _ in 0..64 {
@@ -730,6 +775,117 @@ mod tests {
                     pressed: false
                 }))
                 .is_err()
+        );
+    }
+    #[test]
+    fn latest_motion_is_fair_bounded_and_respects_control_floor() {
+        let event = |sequence, event| InputEnvelope {
+            version: WIRE_VERSION,
+            session_id: SessionId::from_uuid(uuid::Uuid::nil()),
+            generation: 1,
+            sequence,
+            event,
+        };
+        let mut queue = PendingInput::default();
+        queue
+            .push(event(1, InputEvent::Text { text: "abc".into() }))
+            .unwrap();
+        for sequence in 2..5 {
+            queue
+                .push(event(sequence, InputEvent::PointerMove { x: 9, y: 8 }))
+                .unwrap();
+            assert!(matches!(
+                queue.next().unwrap().event,
+                InputEvent::Text { .. }
+            ));
+            assert!(matches!(
+                queue.next().unwrap().event,
+                InputEvent::PointerMove { .. }
+            ));
+        }
+        queue
+            .push(event(5, InputEvent::PointerMove { x: 1, y: 2 }))
+            .unwrap();
+        queue
+            .push(event(
+                6,
+                InputEvent::Button {
+                    button: MouseButton::Left,
+                    pressed: true,
+                    x: 7,
+                    y: 8,
+                },
+            ))
+            .unwrap();
+        assert!(
+            queue.motion.is_none(),
+            "older motion must not follow a positioned control"
+        );
+        assert!(matches!(
+            queue.next().unwrap().event,
+            InputEvent::Button { x: 7, y: 8, .. }
+        ));
+        assert!(queue.next().is_none());
+        // A newer motion is independent; it cannot remove the reliable click.
+        queue
+            .push(event(
+                7,
+                InputEvent::Button {
+                    button: MouseButton::Left,
+                    pressed: false,
+                    x: 7,
+                    y: 8,
+                },
+            ))
+            .unwrap();
+        queue
+            .push(event(8, InputEvent::PointerMove { x: 9, y: 10 }))
+            .unwrap();
+        queue
+            .push(event(
+                7,
+                InputEvent::Scroll {
+                    delta_x: 0,
+                    delta_y: 1,
+                    x: 7,
+                    y: 8,
+                },
+            ))
+            .unwrap();
+        assert_eq!(queue.motion.as_ref().unwrap().sequence, 8);
+        queue.clear();
+        queue
+            .push(event(9, InputEvent::PointerMove { x: 0, y: 0 }))
+            .unwrap();
+        for sequence in 10..73 {
+            queue
+                .push(event(
+                    sequence,
+                    InputEvent::Key {
+                        keysym: 65,
+                        pressed: true,
+                    },
+                ))
+                .unwrap();
+        }
+        assert!(
+            queue
+                .push(event(
+                    73,
+                    InputEvent::Key {
+                        keysym: 65,
+                        pressed: false
+                    }
+                ))
+                .is_err()
+        );
+        // Replacing latest motion does not allocate another envelope.
+        queue
+            .push(event(74, InputEvent::PointerMove { x: 2, y: 3 }))
+            .unwrap();
+        assert_eq!(
+            queue.reliable.len() + usize::from(queue.motion.is_some()),
+            64
         );
     }
     #[test]

@@ -21,7 +21,9 @@ RestartSec=2
 KillMode=control-group
 TimeoutStopSec=5
 NoNewPrivileges=yes
-CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_KILL
+# SETUID/SETGID let the preflight child check socket traversal as the agent
+# with its actual primary/supplementary groups before the helper binds.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_KILL CAP_SETUID CAP_SETGID
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=no
