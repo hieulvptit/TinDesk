@@ -10,7 +10,9 @@ no capabilities and no exposed public backend port.
 `https://amio.vnoffice.io.vn/login/callback` is the registered Google callback.
 The owner confirmed that the Cloudflare-proxied `amio.vnoffice.io.vn` domain is
 **dedicated to RemoteVNC**. TURN supports a private JSON key list; see
-[the Cloudflare token and multi-key guide](cloudflare-turn.md). Existing host nginx already owns 80/443. Add only the reviewed
+[the Cloudflare token and multi-key guide](cloudflare-turn.md) and the
+[amio deployment record](deployment-amio.md).
+Existing host nginx already owns 80/443. Add only the reviewed
 server-name-specific routing for this domain; preserve other nginx hosts, ingress,
 DNS, tunnels and services. Do not install a catch-all server. RemoteVNC uses `/v1`,
 `/auth/google` and `/login/callback` at the origin root; prefix mounting is not
