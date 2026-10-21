@@ -19,6 +19,32 @@ fn native<T, E>(result: std::result::Result<T, E>) -> Result<T> {
     result.map_err(|_| TransportError::NativeOperation)
 }
 impl Peer {
+    /// Test-only downstream stall, independent of healthy input/signaling channels.
+    #[cfg(feature = "native-test")]
+    pub fn hold_video_for_native_test(&self) -> Result<NativeVideoHold> {
+        let engine = self.shared.engine()?;
+        let source = engine
+            .video
+            .lock()
+            .unwrap()
+            .as_ref()
+            .ok_or(TransportError::WrongRole)?
+            .source
+            .clone();
+        let pad = source
+            .static_pad("src")
+            .ok_or(TransportError::NativeOperation)?;
+        let probe = pad
+            .add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, |_, _| {
+                gst::PadProbeReturn::Ok
+            })
+            .ok_or(TransportError::NativeOperation)?;
+        Ok(NativeVideoHold {
+            pad,
+            probe: Some(probe),
+        })
+    }
+
     /// Configure both peers before the controller's first offer. Persists across
     /// native rebuilds and is reattached synchronously before a remote offer.
     pub fn enable_h264(&self) -> Result<()> {

@@ -701,7 +701,9 @@ impl Live {
                     }
                     self.helper.send(HelperRequest::Input(input))?;
                 }
-                PeerEvent::InputReset { .. } => self.release()?,
+                PeerEvent::InputReset { .. } => {
+                    self.release()?;
+                }
                 PeerEvent::KeyframeNeeded => {
                     if let Some(display) = self.display {
                         self.helper.send(HelperRequest::RequestKeyframe {
@@ -770,7 +772,10 @@ impl Live {
                     Ok(()) if config => self
                         .helper
                         .video_accepted(generation, received.recovery_revision),
-                    Ok(()) | Err(TransportError::QueueFull | TransportError::NotReady) => {}
+                    Ok(()) => {}
+                    Err(TransportError::QueueFull | TransportError::NotReady) => self
+                        .helper
+                        .video_rejected(generation, std::time::Instant::now()),
                     Err(e) => return Err(e.into()),
                 }
             }
@@ -806,3 +811,6 @@ fn signal_scope(message: &SignalMessage) -> (SessionId, u64) {
         | SignalMessage::End { session_id, epoch } => (*session_id, *epoch),
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod native_tests;

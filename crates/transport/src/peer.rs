@@ -75,6 +75,22 @@ impl DecodedFrame {
         ))
     }
 }
+/// Explicit native tests hold only the video appsrc branch; Drop always unblocks it.
+#[cfg(feature = "native-test")]
+#[must_use]
+pub struct NativeVideoHold {
+    pad: gst::Pad,
+    probe: Option<gst::PadProbeId>,
+}
+#[cfg(feature = "native-test")]
+impl Drop for NativeVideoHold {
+    fn drop(&mut self) {
+        if let Some(probe) = self.probe.take() {
+            self.pad.remove_probe(probe);
+        }
+    }
+}
+
 /// Secret-bearing variants deliberately prevent deriving Debug for this enum.
 pub enum PeerEvent {
     Signal(SignalMessage),

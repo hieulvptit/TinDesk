@@ -58,4 +58,5 @@ PY
 gtk_pid=$!
 for _ in {1..100}; do [[ -f "$REMOTEVNC_GTK_RESULT.ready" ]] && break; sleep .05; done
 [[ -f "$REMOTEVNC_GTK_RESULT.ready" ]]
+cargo test -p remotevnc-agent --lib service::native_tests:: --locked -- --ignored --nocapture --test-threads=1
 cargo test -p remotevnc-agent --test e2e_session --locked -- --ignored --nocapture --test-threads=1

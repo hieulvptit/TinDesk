@@ -34,6 +34,11 @@ impl VideoRecovery {
         self.recovering = true;
         self.started.get_or_insert_with(Instant::now);
     }
+    fn rejected(&mut self, generation: u64, now: Instant) {
+        if self.generation == Some(generation) {
+            self.started = Some(self.started.map_or(now, |started| started.min(now)));
+        }
+    }
     fn health(&mut self, now: Instant) -> Result<(u64, bool)> {
         if self
             .started
@@ -164,6 +169,10 @@ impl Helper {
     pub fn video_health(&self, now: Instant) -> Result<(u64, bool)> {
         self.recovery.lock().unwrap().health(now)
     }
+    /// Downstream rejection shares the earliest budget with local encoded loss.
+    pub(crate) fn video_rejected(&self, generation: u64, now: Instant) {
+        self.recovery.lock().unwrap().rejected(generation, now);
+    }
     pub fn video_accepted(&self, generation: u64, revision: u64) {
         let mut recovery = self.recovery.lock().unwrap();
         if recovery.generation == Some(generation)
@@ -190,6 +199,29 @@ impl Drop for Helper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn helper_and_transport_loss_share_the_earliest_generation_budget() {
+        let mut state = VideoRecovery {
+            generation: Some(7),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        state.rejected(8, start);
+        assert!(
+            state.started.is_none(),
+            "stale generation cannot start current recovery"
+        );
+        state.rejected(7, start - Duration::from_secs(5));
+        state.dropped(false);
+        state.rejected(7, start);
+        assert_eq!(state.started, Some(start - Duration::from_secs(5)));
+        assert!(state.health(start + Duration::from_secs(15)).is_err());
+        state.started = None;
+        state.dropped(false);
+        let first_helper_drop = state.started.unwrap();
+        state.rejected(7, first_helper_drop + Duration::from_secs(5));
+        assert_eq!(state.started, Some(first_helper_drop));
+    }
     #[test]
     fn repeated_pressure_cannot_extend_recovery_deadline() {
         let mut state = VideoRecovery::default();

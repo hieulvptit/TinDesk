@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Explicit native fixture support; omitted from normal release builds.
+native-test = []
+
 [dependencies]
 remotevnc-protocol = { path = "../protocol" }
 gst = { package = "gstreamer", version = "0.24", features = ["v1_24"] }

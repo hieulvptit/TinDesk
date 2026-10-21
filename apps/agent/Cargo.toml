@@ -19,6 +19,7 @@ rand = "0.8"
 base64 = "0.22"
 
 [dev-dependencies]
+remotevnc-transport = { path = "../../crates/transport", features = ["native-test"] }
 tokio = { version = "1", features = ["test-util"] }
 uuid.workspace = true
 tempfile = "3"
