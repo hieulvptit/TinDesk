@@ -20,6 +20,12 @@ scripts/test-e2e.sh
 sudo python3 scripts/test-ubuntu-installer.py
 ```
 
+`test-x11.sh` includes the explicit real-capture four-transition hot-profile
+regression. Valid 320x180@10/512kbps and 240x134@7/384kbps profiles must produce fresh
+config-IDR and actual new decoded dimensions while source PTS advances, display
+generation stays fixed and real held Shift/left-button survives until release.
+The existing 60fps cropped native RTP test remains separate.
+
 `test-e2e.sh` creates authenticated Xvfb and a GTK entry, then runs separate
 backend, agent CLI, controller native Peer, helper/capture and input guardian
 processes. Test-only discovery selects Xvfb through the existing library API;

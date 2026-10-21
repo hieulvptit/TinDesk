@@ -52,16 +52,42 @@ existing real capture tests cover profile updates preserving generation and PTS.
 The real E2E pause requires freshly decoded advancing source PTS, held input and
 session authority to survive at default 1920x1080@60fps; fixture quality is not lowered.
 
+The controlled post-review capture probe also proved a separate live-profile
+renegotiation failure: DOWN succeeded, then UP ended ximagesrc with
+`not-negotiated (-4)`, worker exit1 and reader EOF. Capture now selects the
+supported delayed caps-change mode so in-flight previous-format data remains
+acceptable while the new caps negotiate. The same four transitions then passed.
+This is consistent with [GStreamer's documented capsfilter behavior](https://gstreamer.freedesktop.org/documentation/coreelements/capsfilter.html).
+The original AMD64 DOWN-adjacent held loss is not attributed to this cause.
+
 ## Current source and covering checks
 
-The post-review I1 code/test source is commit
+The post-review I2 helper/test source is commit
+`836669191498645ae4e448557b16c0ec31d01cd2`, tree
+`cf3b9090e22ae7e8c52188643b278684b2a49d5e`. The agent runtime remains
 `748b230a6d9fe98294af1a7920ddac792605d448`, tree
-`ab1262fceac114bc5fc4cde84b0aab479d977fe8`. Its agent fix shares the existing
+`ab1262fceac114bc5fc4cde84b0aab479d977fe8`; its I1 fix shares the existing
 absolute 20s recovery clock between helper and transport rejection. Accepted
 current-generation config-IDR plus the helper loss-revision check alone clears
 it. No production timing, authority, input or profile invariant was relaxed.
 
-| Post-I1 check (Rust 1.95.0, locked, one compiler job) | Result |
+| Post-I2 check (Rust 1.95.0, locked, one compiler job) | Result |
+| --- | --- |
+| macOS ARM64 affected helper/agent/transport | All-target/all-feature clippy with `-D warnings` and helper unit 4 passed. |
+| Ubuntu ARM64 Lima affected paths | Scoped clippy, helper unit 4 and agent unit/helper/service 12 passed; service 43.15s. Existing physical capture 2.01s/cropped 60fps RTP 2.42s and new hot-profile regression 10.05s passed. |
+| Ubuntu AMD64 affected paths | Scoped clippy/helper unit 4 and capture 3 passed (physical 2.15s/cropped 2.44s/new regression 10.09s). Normal native invocation: recovery passed, persistent isolation failed (helper drops 1). Separate instrumented persistent case passed in 21.91s, terminal 20.001512402s/helper0. Original signed process E2E passed in 102.11s; outcomes remain separate. |
+
+The new ignored capture regression applies four literal DOWN/UP/DOWN/UP updates
+between 320x180@10/512kbps and 240x134@7/384kbps. Each stage requires actual decoded
+new dimensions, fresh config-IDR, advancing original source PTS, generation 7 and
+actual held Shift/left-button; explicit release is verified at the end. The old
+60fps cropped-RTP test and default 1080p60 process E2E are unchanged. The regression
+failed old-code staged tree 41e2e6b in 5.85s when the worker closed its command pipe.
+
+Earlier I1 coverage below used helper adf6de8 and unchanged agent748; current helper836
+coverage is the post-I2 table above:
+
+| Post-I1 check | Result |
 | --- | --- |
 | macOS ARM64 affected agent/transport | All-target/all-feature clippy with `-D warnings`, fmt, 8 ordinary agent unit/helper tests passed. Linux-only native cases are target-gated. |
 | Ubuntu 26.04 ARM64 Lima affected agent/transport | All-target/all-feature clippy with `-D warnings`; 12 ordinary unit/helper/service tests passed (39.23s service target); 3 explicit ignores remain outside ordinary coverage. |
@@ -91,9 +117,10 @@ HTTP/native setup and retains the separate 23s native-loop budget, 14s lower
 bound, independent helper deadline interval and delayed-success 14–16.5s check.
 
 These 142-test matrices remain baseline coverage for unchanged paths, not a new
-whole-workspace run of 748b230. The scoped post-I1 checks above cover the changed
-agent/transport paths; unchanged workspace/X11/installer suites and client/helper/
-backend artifacts were not repeated. Every run selects Rust 1.95.0, Cargo.lock
+whole-workspace run of 8366691. The scoped post-review checks above cover the changed
+agent/transport/capture paths. Unchanged workspace/installer suites and client/
+agent/backend builds were not repeated for the capture-only change. Runs select
+Rust 1.95.0, Cargo.lock
 and one compiler job. AMD64 uses exact Git archives. The later completion commit
 changes documentation only.
 
@@ -112,18 +139,18 @@ Container tests do not establish physical seat0 or a running systemd manager.
 Existing Tasks7/8 separately exercised actual sandbox/cgroup cleanup with the
 independent guardian; those unit policies are unchanged.
 
-Current post-I1 production-source fault observations (Lima):
+Current component-source fault observations:
 
-| Fault/action | Observed release/closure |
-| --- | --- |
-| Established controller SIGKILL, no Signal::End | 28.840815025s |
-| Helper group SIGKILL, independent guardian | 24.432495ms |
-| Backend SIGKILL | 10.012455743s |
-| Live agent revoke during a fresh session | 46.468861ms |
+| Fault/action | Agent748/helper adf6de8 ARM64 Lima | Agent748/helper836 AMD64 |
+| --- | --- | --- |
+| Established controller SIGKILL, no Signal::End | 28.840815025s | 28.145969127s |
+| Helper group SIGKILL, independent guardian | 24.432495ms | 78.957633ms |
+| Backend SIGKILL | 10.012455743s | 10.066235202s |
+| Live agent revoke during a fresh session | 46.468861ms | 448.355503ms |
 
 Each includes actual held-input release and nonrenewable closed access. Backend
 restart rejects the old session, and revocation denies a fresh session. Fixture
-setup was 7.219477489s initial/4.150397906s restart, within its separate 120s bound.
+setup was 7.219477489s initial/4.150397906s restart on ARM64 and 30.039345455s/24.663595111s on AMD64, within the separate 120s bound.
 The baseline broad-run observations were ARM64 controller 28.826s/helper 23.27ms/
 backend 10.024s/revoke 68.95ms and AMD64 controller 27.570s/helper 79.56ms/backend 10.076s/
 revoke 407.34ms; AMD64 setup 37.734s initial/25.008s restart.
@@ -144,8 +171,11 @@ Agents below are refreshed from post-I1 commit 748b230/tree ab1262f with
 source, SHA256 and normal agent/transport feature arrays (both empty). ARM64
 release passed in 42.44s; AMD64 release passed in 2m59s.
 
-Unchanged client/helper artifacts retain runtime source adf6de8/tree bbbf819 and
-`SOURCE_DATE_EPOCH=1792541164`; they were not rebuilt for agent-only recovery.
+Helpers are refreshed from 8366691/tree cf3b909 with
+`SOURCE_DATE_EPOCH=1792545632`; release/task11-fix2-helper-provenance.json records
+normal helper features and unchanged agent748 bytes. ARM64 release passed in 21.12s;
+AMD64 passed in 1m37s. Unchanged client artifacts retain runtime source
+adf6de8/tree bbbf819 and `SOURCE_DATE_EPOCH=1792541164`.
 Build manifests record toolchain/native versions; ignored
 `target/release/task11-macos-source-provenance.json` binds the actual Mac source
 and bytes. The later docs-only commit is not an artifact source.
@@ -156,9 +186,9 @@ and bytes. The later docs-only commit is not an artifact source.
 | macOS Info.plist | `7c99c50714b4ed8d3e2fb0d4299c220bb9e49b0862db300ea324389e70332b07` |
 | macOS bundled nice plugin | `e8577f9b207dc671dae5f54677f0728d93ad100a66d8ddd45b51fa3ad765d238` |
 | Ubuntu ARM64 agent | `8c2ed689493cff37a46f8ce841731a255ca3a9637e987dc2c60a7ebbd07c5f3d` |
-| Ubuntu ARM64 helper | `0103465073745d055af1130d3b326fb3c6576dfc21942f2674ca05e3f854f548` |
+| Ubuntu ARM64 helper | `1c8702a29834f7913452561e6fbcf201f5ffc744bda1e0c108f5d54ba56fad3f` |
 | Ubuntu AMD64 agent | `f2ac9aa7499459d85489cab5625a730b2ff33861f1219203f4ce747f2cb57fda` |
-| Ubuntu AMD64 helper | `c68344a32daf00597791ed2da99cf30adb98be1dc37c67075d00ffdd68aeca57` |
+| Ubuntu AMD64 helper | `0679776f1ede25190b2da7299f18977d81e1025c8b83ca3e11f9d19fdc8c6c7f` |
 
 Lima initially lacked the gst-inspect executable; release preflight stopped before
 compilation. Installing only gstreamer1.0-tools inside that disposable VM resolved
@@ -232,6 +262,18 @@ uninstrumented covering results are the 47.56s pair above. Temporary diagnostic
 prints are absent from committed source. The earlier spontaneous B-survival
 failure, lost-log bootstrap attribution and original premature-renewal allegation
 retain their separate limitations above.
+
+Post-I2 AMD64 diagnostic limits: the normal combined native invocation passed
+recovery, then failed persistent-case transport isolation because one local
+helper-reader drop was counted. A single unchanged-assertion diagnostic recorded
+helper0 at setup/first actual rejection and throughout, closing/releasing at
+20.001512402s despite successful renewal/ACK/profile activity. No slow-X11-query or
+reader-full diagnostic occurred. The earlier drop's cause is not established;
+no fixture profile, zero-helperdrop assertion or product deadline was changed.
+The normal 1 pass/1 fail and instrumented persistent 1 pass are separate results, not
+a native pair 2/2. Independent original process acceptance then passed in 102.11s.
+The controlled UP-caps defect is addressed; original DOWN-adjacent termination
+and the later isolated helper drop remain explicit attribution limits for review.
 
 ## Required external acceptance — pending
 
