@@ -164,3 +164,31 @@ p95 (`sorted(samples)[ceil(0.95*n)-1]`). Report LAN and relay independently with
 measurement resolution. Target LAN p95<100ms on capable hardware. RTT, Xvfb
 queue time and software logs alone are not input-to-image p95. No performance
 claim is made until this measurement and resource observations exist.
+
+## Final controller recovery, input and operator checks
+
+Connect once, interrupt the signed control socket/backend or helper path, then
+restore it. Record a different session ID, current presence, fresh decoded video
+and a new display acknowledgement without a second Connect action. Explicit
+Disconnect while waiting must cancel recovery; sign-out and revocation must also
+remain disconnected. Remove an agent while the control socket is absent: its
+previous online label must disappear on reconnect, including when initial
+presence arrives in multiple chunks or the device returns with another role.
+
+For scrolling, positive content motion from egui means X11 button 4 (Y) and 6 (X);
+negative means 5/7. Test both axes/directions and fractional trackpad accumulation
+at the remote pointer. For text, deliver an exact 1,000-scalar nonsecret mixed
+Unicode commit while observing video progress and successful renewals. It is
+intentionally paced by existing toolkit keymap waits (about 52–57s in disposable
+fixtures), while media continues. Focus loss cancels the pending remainder and
+releases input while keeping the authorized video session; disconnect cancels it
+and closes. Verify no later reinjection and exact restoration. Do not raise
+media/authority timeouts or silently shorten the accepted commit.
+
+Read UI **observed decode FPS** separately from configured target FPS and physical
+versus decoded dimensions. Missing/recently stalled measurements show unavailable.
+Capture diagnostics contain only fixed categories and identifiers; retain those
+categories and worker exit status without enabling broad GStreamer debug logs.
+The historical DOWN termination remains unattributed. Standalone custom helper
+socket paths must be traversable by the configured UID and its system groups;
+startup reports the offending ancestor instead of changing existing permissions.

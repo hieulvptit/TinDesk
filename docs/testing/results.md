@@ -60,7 +60,85 @@ acceptable while the new caps negotiate. The same four transitions then passed.
 This is consistent with [GStreamer's documented capsfilter behavior](https://gstreamer.freedesktop.org/documentation/coreelements/capsfilter.html).
 The original AMD64 DOWN-adjacent held loss is not attributed to this cause.
 
-## Current source and covering checks
+## Final review fixes and current affected artifacts
+
+Product source `b41ba7d03e64fb87612ab645c9d2257b3a5f3341`, tree
+`c5792f98125bf51a950796ddce0cd2d7221e67cd`, fixes FR-I1–I5 and FR-M1–M3.
+The final client-only missed-close reconciliation correction is
+`2990896c20465b87e6b8f4f3157e2cc523b4c1b7`, tree
+`a4415580ad3a0fbcbcb1cfdfbf3da804e5a57600`. It refreshes enrollment immediately
+when any live scope retires, so missed close events cannot delay revocation intent
+cancellation until the periodic list cadence. The strengthened runtime suite passed
+7/7 in36.13s with scoped clippy exit0. Documentation changes do not alter binaries.
+
+- Controller connection intent survives recoverable loss and obtains a new grant,
+  Peer, display handshake and input scope after current socket reconciliation.
+  Explicit Disconnect (also available while waiting), sign-out and denial/revocation
+  cancel intent. Signed backend/native Peer tests cover fresh decoded video/ACK
+  without a second Connect, missed close events across socket loss, explicit
+  cancellation and revocation. Presence is invalidated on socket loss, merges all
+  initial chunks and replaces old roles.
+- Protocol scroll signs describe content motion: positive Y/X map to X11 buttons
+  4/6, negative to 5/7. Mapper sign/fraction tests and actual X11 four-axis events
+  cover the complete convention.
+- Accepted Unicode is an ordered bounded job: one complete existing guarded
+  scalar transaction per helper turn, at most 64 queued envelopes and 64 KiB text
+  in aggregate. Adjacent motion coalesces; clicks retain positions. Overflow
+  fails closed. Capture, lease processing and cancellation run between scalars;
+  ReleaseAll clears pending input. Delivery rechecks current session/generation
+  and deadline. The exact 1,000-scalar GTK test passed on AMD64 in 56.789977906s
+  with 567 advancing frames/three renewals, and ARM64 in 52.215909301s with 522
+  frames/three renewals. The extended ARM test additionally survived the original
+  helper/guardian 60s deadline; both cancellation paths prevented reinjection.
+- Capture flushes its encoder prefix and every complete binary access unit.
+  A newline-free LineWriter regression proved delayed visibility before the fix
+  and immediate visibility afterward. The **single corrected normal AMD pair**
+  passed 2/2 in 45.03s; persistent terminal/release was 20.001391652s with zero
+  helper drops despite renewal, ACK and profile activity. Workload, queue caps
+  and product deadlines are unchanged.
+- Capture failures carry only typed phase/domain/code/fixed element/exit categories
+  through worker, helper and agent. Injected failure retained its Stream/Encoder
+  category and exit42; arbitrary stderr is never forwarded. A running worker at
+  a malformed-reader boundary is identified as Running and then killed/reaped.
+  The historical DOWN-adjacent capture stop remains **unattributed**.
+- UI shows decoded dimensions, observed decode FPS over a bounded two-second
+  window (unavailable without sufficient/recent samples), and physical display
+  dimensions separately. Standalone socket startup tests actual agent UID,
+  primary/supplementary groups and kernel traversal/ACL checks through every
+  ancestor; inaccessible paths are diagnosed without chmod.
+
+| Final affected checks | Result |
+| --- | --- |
+| macOS client/device/protocol/helper ordinary covering run | 70 passed, 12 explicitly ignored; exit0. Later controller fixture checks and queue regression cover subsequent edits. |
+| AMD agent/helper ordinary covering run | 39 passed, 36 explicit ignores; subsequent initial clippy failed a collapsible-if lint. Mechanical correction verified by final queue test and ARM scoped clippy. |
+| macOS client/device/protocol and ARM agent/helper scoped all-target/all-feature clippy | `-D warnings`, exit0 after corrections. Fmt and host diff checks pass. |
+| Normal AMD isolation pair | 2 passed, exit0; source tree `7929bef918e52cd6cbe8701107e22ad6b42e2bda`. |
+| AMD long Unicode + standalone actual-UID traversal + injected worker failure | All passed, exit0; tree `2b2d1a71f2faeae678b3b1defd44229878bb48dc`. |
+| Extended ARM Unicode, native scroll and guardian mapping restoration | All passed, exit0; tree `58a6c350800db36e023bf4965486a52532390602` before the mechanical lint correction. |
+| Final ARM long Unicode and shared-fixture cleanup, followed by original signed-process E2E | Both passed, exit0; test-only commit `18ec0f8`, tree `607ac893956fc76ea346adc85a61d9259d660165`. Exact 1,000 scalars in 52.021847647s, 520 advancing frames/three renewals, beyond-original-lease and cancellation assertions; fresh-session GTK select/delete leaves the receiver empty and held input released. Original default 1080p60 process case then passes in the same fixture (55.39s), including exact Unicode, account B denial, scheduling pause, process faults, restart and live revoke. |
+
+The bounded instrumented diagnostic remains a separate failure (recovery helper
+queue drop1, persistent20.001387391s pass; tree
+`e13be78cbbf0cbdae4dd76c90917b8c88d703590`, exit101). It localized the drop to the
+agent's two-frame admission queue, without wall-clock data sufficient to prove
+its specific scheduling cause. The independently proven stdout buffering defect
+and corrected normal pair do not retroactively classify every historical drop
+or the DOWN termination. The first extended ARM Unicode run delivered exactly
+1,000 scalars but failed at60.04s because its raw controller fixture omitted its
+own authenticated lease renewal; the corrected fixture mirrors renewal to both
+peers only after the trusted successful renewal, preserving the original limits.
+
+Normal agent/helper artifacts use source `b41ba7d`, epoch1792549126. The final
+client uses `2990896`, epoch1792549692; only the client was rebuilt for that change. Fresh
+sidecars are `release/final-fix-{client,agent,helper}-provenance.json`; compiler
+JSON is `final-fix-client-build.jsonl` (Mac) or `final-fix-linux-build.jsonl`
+(Linux). All project feature arrays are empty, excluding native-test and
+screenshot-smoke. The normal Mac bundle passed a five-second launch outside the
+checkout with a fresh registry and terminal plugin/DYLD variables removed.
+The backend image remains its original Task10/69a627e artifact. Earlier sidecars
+and the failures below remain historical; they are not restamped as current.
+
+## Historical post-Task11 covering checks
 
 The post-review I2 helper/test source is commit
 `836669191498645ae4e448557b16c0ec31d01cd2`, tree
@@ -84,7 +162,7 @@ actual held Shift/left-button; explicit release is verified at the end. The old
 60fps cropped-RTP test and default 1080p60 process E2E are unchanged. The regression
 failed old-code staged tree 41e2e6b in 5.85s when the worker closed its command pipe.
 
-Earlier I1 coverage below used helper adf6de8 and unchanged agent748; current helper836
+Earlier I1 coverage below used helper adf6de8 and unchanged agent748; post-I2 helper836
 coverage is the post-I2 table above:
 
 | Post-I1 check | Result |
@@ -139,7 +217,7 @@ Container tests do not establish physical seat0 or a running systemd manager.
 Existing Tasks7/8 separately exercised actual sandbox/cgroup cleanup with the
 independent guardian; those unit policies are unchanged.
 
-Current component-source fault observations:
+Pre-final-fix component-source fault observations:
 
 | Fault/action | Agent748/helper adf6de8 ARM64 Lima | Agent748/helper836 AMD64 |
 | --- | --- | --- |
@@ -284,7 +362,14 @@ live testing are the gate.
 | Required evidence | Status |
 | --- | --- |
 | Physical boot/greeter/login/desktop/lock/unlock/logout/login/reboot, selected seat0 monitor, no extra desktop, suspend | Pending supported OS/admin activation/on-site observer. Xvfb is separate evidence. |
-| Real Google enrollment/consent/account denial/revoke and public proxy lifetime | Pending replacement Google secret rotation and reviewed shared/dedicated routing; private live OAuth JSON was not read/used. |
-| Real Cloudflare selected relay, credential renewal and recovery | Pending real TURN key and approved deployment. Fixture TURN/native policy is not real relay proof. |
+| Real Google enrollment/consent/account denial/revoke and public proxy lifetime | Pending replacement Google secret rotation and reviewed routing for the confirmed dedicated domain; private live OAuth JSON was not read/used. |
+| Real Cloudflare selected relay, credential renewal and recovery | TURN credentials exist; private file path and approved deployment are pending. Fixture TURN/native policy is not real relay proof. |
 | Interactive macOS Keychain/IME/LAN permission/login LaunchAgent | Pending interactive acceptance and production signing identity; no privacy/autostart changes made. |
 | Actual encoder/resolution/decodedFPS, CPU/GPU, bytes/s/RTT/queue timing, input-to-image p95 | Pending hardware measurement. LAN p95<100ms is an unmeasured target; RTT is not that metric. |
+
+Current external inputs: the owner confirmed `amio.vnoffice.io.vn` is dedicated
+to RemoteVNC. TURN credentials exist and their private file path is forthcoming.
+Additional compatibility acceptance on the existing 25.10 host is requested and
+pending; 26.04 remains the primary code target. No OS upgrade, installer bypass,
+physical display-manager/service activation or administrative deployment occurred
+in this fix wave.

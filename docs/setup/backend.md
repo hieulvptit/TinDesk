@@ -8,12 +8,13 @@ The container runs as UID/GID 10001 with private state, read-only root filesyste
 no capabilities and no exposed public backend port.
 
 `https://amio.vnoffice.io.vn/login/callback` is the registered Google callback.
-The domain is Cloudflare-proxied; its dedicated/shared routing and Cloudflare
-TURN inputs still require owner clarification. Existing host nginx already owns
-80/443. These examples do not replace ingress, DNS, tunnels or other services.
-Do not copy a new catch-all server into that host or assume ownership of `/`.
-A shared domain must reserve `/v1`, `/auth/google` and `/login/callback` exactly;
-prefix mounting is not supported by current absolute enrollment URLs/forms.
+The owner confirmed that the Cloudflare-proxied `amio.vnoffice.io.vn` domain is
+**dedicated to RemoteVNC**. Cloudflare TURN credentials exist; their private file
+path is forthcoming. Existing host nginx already owns 80/443. Add only the reviewed
+server-name-specific routing for this domain; preserve other nginx hosts, ingress,
+DNS, tunnels and services. Do not install a catch-all server. RemoteVNC uses `/v1`,
+`/auth/google` and `/login/callback` at the origin root; prefix mounting is not
+supported by current absolute enrollment URLs/forms.
 
 Create a private deployment directory **outside git**. Copy compose.yaml and
 `env.example` to `/etc/remotevnc-backend/{compose.yaml,deploy.env}` (root 0700
