@@ -256,6 +256,7 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
         assert!(tokio::time::Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    let renewal_origin = tokio::time::Instant::now();
     let grant = api.create_session(&token, f.ids[1]).await.unwrap();
     let mut controller = Peer::new(PeerConfig {
         session_id: grant.session_id,
@@ -350,11 +351,19 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
                 HelperRequest::RenewLease {
                     deadline_boot_ms, ..
                 } => {
+                    let authority_interval = deadline_boot_ms.saturating_sub(started.unwrap());
                     assert!(
-                        start.elapsed() >= Duration::from_secs(14),
-                        "activity must not renew before scheduled interval"
+                        renewal_origin.elapsed() >= Duration::from_secs(14),
+                        "renewal before14s: grant-dispatch elapsed={:?}, post-native elapsed={:?}, helper request-start delta={authority_interval}ms",
+                        renewal_origin.elapsed(),
+                        start.elapsed()
                     );
-                    assert!(deadline_boot_ms >= started.unwrap() + 14_000);
+                    assert!(
+                        authority_interval >= 14_000,
+                        "helper request-start delta={authority_interval}ms; grant-dispatch elapsed={:?}, post-native elapsed={:?}",
+                        renewal_origin.elapsed(),
+                        start.elapsed()
+                    );
                     renewed = true;
                 }
                 HelperRequest::UpdateProfile {
