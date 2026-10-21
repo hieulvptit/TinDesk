@@ -545,4 +545,27 @@ async fn long_text_keeps_video_renewals_and_cancellation_live() {
     assert_eq!(received(), after_disconnect);
     assert!(after_disconnect.len() < after_focus.len() + 1000);
     println!("PASS focus/disconnect cancel pending Unicode; bounded release; no reinjection");
+    // test-e2e.sh shares the disposable GTK receiver with the following signed
+    // process test. Clean only its nonsecret contents using a fresh session;
+    // never revive the disconnected authority or change the system clipboard.
+    let mut cleanup = Session::start().await;
+    cleanup.input(InputEvent::ReleaseAll);
+    for (keysym, pressed) in [
+        (0xffe3, true),
+        (0x61, true),
+        (0x61, false),
+        (0xffe3, false),
+        (0xff08, true),
+        (0xff08, false),
+    ] {
+        cleanup.input(InputEvent::Key { keysym, pressed });
+    }
+    let until = Instant::now() + Duration::from_secs(3);
+    while !received().is_empty() {
+        cleanup.tick().unwrap();
+        assert!(Instant::now() < until, "shared GTK receiver cleanup failed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    cleanup.closed_and_released().await;
+    println!("PASS shared GTK receiver empty and held input released for subsequent E2E case");
 }
