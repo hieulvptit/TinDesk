@@ -93,7 +93,10 @@ Kiểm tra đã đạt:
   `/srv/remotevnc/data/bootstrap-20261021.db` tạo bằng Online Backup API,
   integrity check đạt, UID 10001/mode 0600.
 
-Chưa nghiệm thu trên deployment này: người dùng hoàn tất Google consent/token
-exchange, kết nối WebSocket đã đăng nhập và phiên remote thực tế có candidate
-`relay`. HTTP 201 của provider chưa chứng minh media đã truyền qua TURN.
+Sau đó đã xác minh Google consent/token exchange và đăng ký agent thực tế trên
+`clawmachine@172.22.8.59`: người dùng xác nhận thiết bị, backend đăng ký và cấp
+access token cho agent. Xem [bản ghi triển khai agent](deployment-clawmachine.md).
+
+Chưa nghiệm thu riêng kết nối WebSocket đã đăng nhập và phiên remote thực tế có
+candidate `relay`. HTTP 201 của provider chưa chứng minh media đã truyền qua TURN.
 Nghiệm thu màn hình login/khóa trên máy Ubuntu vật lý vẫn là bước riêng.
