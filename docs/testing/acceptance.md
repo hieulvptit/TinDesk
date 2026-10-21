@@ -32,7 +32,18 @@ device/presence and cannot create or signal into A's session. A bounded 250ms ag
 scheduling pause must preserve held input/session authority and restore freshly
 decoded source timestamps at the default 1920x1080@60fps capture profile. Focused
 service coverage separately uses measured IPC drops to require adaptive quality
-updates; config-bearing IDR recovery is bounded by one absolute 20s episode.
+updates. Before the process test, two explicitly ignored private Live cases
+block actual native appsrc downstream after DisplayAck at controlled 320x180@10fps:
+native drops must increase with helper drops 0; fresh decoded PTS/held input must
+recover before the bound, and a persistent gap must close/release at 20s despite
+successful renewal, ACK/keyframe and applied profile updates. A dev-dependency-only
+RAII pad guard removes its probe on every exit and is absent from normal release
+feature sets. This is separate from authenticated HTTP renewal ingress coverage.
+Helper and transport config-bearing-IDR recovery share one absolute 20s episode;
+only successful current-generation/revision-valid config-IDR acceptance clears it.
+Repeated rejection, profile changes, ACKs, keyframes or leases cannot extend it.
+The bounded 5s native-drop onset setup precedes the 21/24s observation windows;
+none changes the production 20s budget.
 Backend fixture setup has a 120s allowance for fresh RSA preparation, phase logs,
 and prompt child-exit detection; native failure/authority bounds are separate.
 The harness kills the established controller without Signal::End, kills/restarts helper and
