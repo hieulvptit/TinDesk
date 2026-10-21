@@ -22,7 +22,10 @@ services:
       REMOTEVNC_GOOGLE_CLIENT_ID: ${REMOTEVNC_GOOGLE_CLIENT_ID:?Google client ID required}
       REMOTEVNC_GOOGLE_CLIENT_SECRET_FILE: /run/secrets/google_client_secret
       REMOTEVNC_TURN_KEYS_FILE: /run/secrets/turn_keys.json
-    secrets: [google_client_secret, turn_keys]
+    secrets:
+      - google_client_secret
+      - source: turn_keys
+        target: turn_keys.json
     logging:
       driver: local
       options: {max-size: "5m", max-file: "3"}
