@@ -63,7 +63,11 @@ The original AMD64 DOWN-adjacent held loss is not attributed to this cause.
 ## Final review fixes and current affected artifacts
 
 Product source `b41ba7d03e64fb87612ab645c9d2257b3a5f3341`, tree
-`c5792f98125bf51a950796ddce0cd2d7221e67cd`, fixes FR-I1–I5 and FR-M1–M3.
+`c5792f98125bf51a950796ddce0cd2d7221e67cd`, implemented the first combined fix wave.
+The scoped rereview through `a1bfbf7` remained negative: FR-I3 still starved pointer
+motion, FR-M3 missed inaccessible supplied symlink ancestors, and new FR-R1 broke
+managed helper startup under the shipped capability policy. The exceptional narrow
+correction below repairs these residuals; the earlier tests did not prove them.
 The final client-only missed-close reconciliation correction is
 `2990896c20465b87e6b8f4f3157e2cc523b4c1b7`, tree
 `a4415580ad3a0fbcbcb1cfdfbf3da804e5a57600`. It refreshes enrollment immediately
@@ -83,7 +87,8 @@ cancellation until the periodic list cadence. The strengthened runtime suite pas
   cover the complete convention.
 - Accepted Unicode is an ordered bounded job: one complete existing guarded
   scalar transaction per helper turn, at most 64 queued envelopes and 64 KiB text
-  in aggregate. Adjacent motion coalesces; clicks retain positions. Overflow
+  in aggregate. The initial implementation coalesced adjacent motion behind text;
+  the correction below services latest motion independently. Clicks retain positions. Overflow
   fails closed. Capture, lease processing and cancellation run between scalars;
   ReleaseAll clears pending input. Delivery rechecks current session/generation
   and deadline. The exact 1,000-scalar GTK test passed on AMD64 in 56.789977906s
@@ -135,8 +140,62 @@ JSON is `final-fix-client-build.jsonl` (Mac) or `final-fix-linux-build.jsonl`
 (Linux). All project feature arrays are empty, excluding native-test and
 screenshot-smoke. The normal Mac bundle passed a five-second launch outside the
 checkout with a fresh registry and terminal plugin/DYLD variables removed.
-The backend image remains its original Task10/69a627e artifact. Earlier sidecars
+The backend image remains its original Task10/69a627e artifact. The helper-only
+correction refresh below supersedes the b41 helper artifact. Earlier sidecars
 and the failures below remain historical; they are not restamped as current.
+
+## Exceptional narrow correction after scoped rereview
+
+Rulings 58–60 explicitly authorize this correction beyond the default final-wave
+cap. Product/test/unit source is `1bc63df14813ab1067870f3f0d005dc35ec853aa`, tree
+`a0adf62be4ac25d9f03cd3396b720ea3e2e59f66`. The original negative rereview and all
+earlier failures remain historical evidence.
+
+- FR-I3: a single latest-motion slot alternates fairly with reliable events/text
+  scalars. Both lanes share the same 64-envelope cap and cancellation clearing;
+  aggregate text remains capped at 64 KiB. Text/key/button order is preserved,
+  position-bearing controls clear older pending motion at their sequence floor,
+  and clicks retain their own coordinates. Current authority/generation/deadline
+  checks remain in the common delivery path.
+- FR-M3: actual-identity traversal checks include the original supplied path's
+  ancestors before canonical ancestors. An inaccessible directory preceding a
+  symlink now fails without chmod, including kernel ACL/group checks.
+- FR-R1: the helper unit adds only `CAP_SETUID` and `CAP_SETGID` for the preflight
+  child's actual-identity/group switch. Package-only follow-up `5c37387` also
+  declares `AmbientCapabilities=CAP_SETUID` so systemd retains effective SETUID
+  through sandbox setup. Existing service hardening is retained.
+  This is an explicit capability-budget change, not a skipped preflight.
+
+Focused pointer RED failed its two-second bound while text was unfinished.
+GREEN observed the actual X11 pointer at **301.54358ms**, then exact 1,000 scalars
+in **50.753453889s**, 505 advancing frames and three renewals. The same case crossed
+the original lease and passed focus/disconnect cancellation and empty GTK cleanup
+(62.95s, exit 0). The supplied-symlink regression failed before correction and
+passed afterward. Five IPC unit tests and 11 IPC integration tests passed (one
+explicit native ignore), with agent/helper all-target/all-feature clippy exit 0.
+No unchanged AMD isolation pair or full suite was repeated.
+
+The exact original shipped unit failed before socket bind with EPERM. A first
+attempt with only the expanded bounding set also failed: a bounded trace showed
+successful setgroups/setgid but failing setuid, and direct capsh under that policy
+showed SETUID bounded but absent from effective/permitted capabilities. Upstream
+[systemd v259 source](https://github.com/systemd/systemd/blob/v259/src/core/exec-invoke.c#L6143)
+explicitly drops SETUID during sandbox setup unless included in its ambient set.
+After the narrow ambient declaration, the **exact shipped unit** with no overrides
+passed socket bind and `Ready` as agent UID 999 in disposable Lima (exit 0).
+Runtime effective/permitted/bounding sets were `0xed` (the six approved capabilities),
+ambient/inheritable `0x80` (SETUID only), NoNewPrivs=1 and Seccomp=2. Both services
+were stopped afterward. This establishes managed startup without a physical
+display, not physical-seat lifecycle acceptance.
+
+Only the normal Linux helper was rebuilt, from `1bc63df` on both architectures;
+the later unit-only `5c37387` does not alter its Rust binary. Fresh sidecars are
+`release/final-correction-helper-provenance.json` and
+`release/final-correction-helper-build.jsonl`, with all project features empty.
+ARM helper SHA256 is `b5291e2e85e71f3d7fbc4c439e45e6b1baa8a609641cf69cd6e534ad151cc086`;
+AMD helper is `839c6e74ce8b792fb22d08ad0b4ffede34c09ce2ffb156b889da8b0ecab2c524`.
+Agent bytes remain verified b41 on both platforms; the Mac client and backend
+were not rebuilt. Earlier sidecars and first-wave assertions remain historical.
 
 ## Historical post-Task11 covering checks
 

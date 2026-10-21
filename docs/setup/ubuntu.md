@@ -100,6 +100,15 @@ runtime directory and independent cgroup. The helper uses KillMode=control-group
 so capture children die on helper restart. Kernel >=6.5 and usable SO_PEERPIDFD,
 pidfd_send_signal and signal permission are mandatory; no numeric-PID fallback.
 
+Standalone helper startup also checks the configured agent's traversal through
+the supplied socket path, including ancestors before symlinks, using its actual
+UID and primary/supplementary groups. It never chmods existing ancestors. The
+helper unit includes `CAP_SETUID` and `CAP_SETGID` so this preflight child can
+switch identity, plus `AmbientCapabilities=CAP_SETUID` to retain SETUID during
+systemd sandbox setup. Removing them prevents startup before socket bind. The remaining
+capability budget and service hardening are unchanged. Test custom policy changes
+by connecting as the agent and receiving `Ready` under that exact unit policy.
+
 For disposable Linux checks only:
 
 ```sh

@@ -179,11 +179,17 @@ For scrolling, positive content motion from egui means X11 button 4 (Y) and 6 (X
 negative means 5/7. Test both axes/directions and fractional trackpad accumulation
 at the remote pointer. For text, deliver an exact 1,000-scalar nonsecret mixed
 Unicode commit while observing video progress and successful renewals. It is
-intentionally paced by existing toolkit keymap waits (about 52–57s in disposable
+intentionally paced by existing toolkit keymap waits (about 51–57s in disposable
 fixtures), while media continues. Focus loss cancels the pending remainder and
 releases input while keeping the authorized video session; disconnect cancels it
 and closes. Verify no later reinjection and exact restoration. Do not raise
 media/authority timeouts or silently shorten the accepted commit.
+
+During the text commit, move the pointer and observe its actual X11 position
+before text completion. Latest motion must remain responsive while reliable
+text/key/button events keep their order; a click uses its own coordinates and
+older motion cannot follow that positioned control. Queue coalescing alone does
+not establish responsiveness.
 
 Read UI **observed decode FPS** separately from configured target FPS and physical
 versus decoded dimensions. Missing/recently stalled measurements show unavailable.
@@ -192,3 +198,9 @@ categories and worker exit status without enabling broad GStreamer debug logs.
 The historical DOWN termination remains unattributed. Standalone custom helper
 socket paths must be traversable by the configured UID and its system groups;
 startup reports the offending ancestor instead of changing existing permissions.
+Include a supplied path with a symlink below an inaccessible directory, not just
+a direct 0700 parent. Also verify socket bind and `Ready` as the real agent UID
+under the exact shipped helper unit policy. Its preflight requires `CAP_SETUID`
+and `CAP_SETGID` for the child identity/group switch, with ambient SETUID retained
+through systemd sandbox setup; unrestricted-root testing
+does not establish managed-service startup.
