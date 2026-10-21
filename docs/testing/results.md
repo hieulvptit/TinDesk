@@ -2,7 +2,8 @@
 
 These are native build/test results for the Rust implementation. Physical Ubuntu
 and live Google/Cloudflare acceptance remain pending. SSH works, but the physical
-host runs Ubuntu 25.10/GDM/Wayland without passwordless sudo; the installer requires
+host runs Ubuntu 25.10/GDM/Wayland without passwordless sudo. Additional isolated
+[25.10 compatibility passed](compatibility-ubuntu2510.md); the installer requires
 Ubuntu 26.04 and the reviewed LightDM/Xfce/X11 activation. No physical OS, package,
 display manager, reboot, routing, ingress, privacy or autostart change was made.
 
@@ -428,7 +429,22 @@ live testing are the gate.
 
 Current external inputs: the owner confirmed `amio.vnoffice.io.vn` is dedicated
 to RemoteVNC. TURN credentials exist and their private file path is forthcoming.
-Additional compatibility acceptance on the existing 25.10 host is requested and
-pending; 26.04 remains the primary code target. No OS upgrade, installer bypass,
+Additional disposable Ubuntu25.10 compatibility passed ordinary helper/agent,
+X11/GTK and native WebRTC/signed-process checks; see
+[the exact source, environment and limits](compatibility-ubuntu2510.md).
+26.04 remains the primary code and installer target; physical25.10 activation
+and acceptance are still pending. No OS upgrade, installer bypass,
 physical display-manager/service activation or administrative deployment occurred
 in this fix wave.
+
+
+## Final review disposition
+
+Whole-branch review at 1d1cebd required eight corrections. The first scoped
+rereview at a1bfbf7 closed six, retained pointer/traversal residuals and identified
+the managed-startup regression. The explicitly recorded exceptional correction
+through bedcc58 then closed FR-I3, FR-M3 and FR-R1; independent scoped verification
+found no new Critical/Important breakage. All review reports, earlier failures and
+60 chronological rulings are preserved in the delivery audit. This completes the
+local implementation/review gate, with external acceptance still pending above.
+Documentation-only finalization does not rebuild or restamp component artifacts.
