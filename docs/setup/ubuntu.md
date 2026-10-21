@@ -2,8 +2,15 @@
 
 Use a local administrator session with a recovery path. The supported desktop is
 LightDM + lightdm-gtk-greeter + Xfce + light-locker on physical seat0/X11. The
-installer rejects other Ubuntu releases and never upgrades the OS. GDM/Wayland
-remains unsupported. Neither preparation nor tests restart a display manager.
+installer defaults to Ubuntu 26.04 and never upgrades the OS. GDM/Wayland remains
+unsupported. Neither preparation nor tests restart a display manager.
+
+For Ubuntu 25.10, explicitly add `--allow-ubuntu-2510` to each `--prepare`,
+`--apply` and `--doctor` invocation. Without the flag, 25.10 is rejected; the flag
+allows no other releases. The same kernel, private enrollment, backup and rollback
+checks apply. This compatibility opt-in does not establish physical greeter,
+locker or public TURN acceptance, and does not restart the display manager or
+reboot the machine.
 
 Install Rust 1.95.0 separately (leave an existing default compiler unchanged),
 then install build prerequisites:

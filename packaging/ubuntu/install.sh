@@ -3,17 +3,18 @@
 set -euo pipefail
 umask 077
 here=$(cd "$(dirname "$0")" && pwd)
-mode='' bin_dir=target/release origin=https://amio.vnoffice.io.vn
+mode='' bin_dir=target/release origin=https://amio.vnoffice.io.vn allow_ubuntu_2510=false
 fail() { echo "RemoteVNC: $*" >&2; exit 1; }
 while (($#)); do
   case "$1" in
     --prepare|--apply|--dry-run|--doctor) [[ -z "$mode" ]] || fail 'choose one mode'; mode=$1; shift ;;
     --bin-dir) bin_dir=${2:?missing binary directory}; shift 2 ;;
     --backend) origin=${2:?missing HTTPS backend origin}; shift 2 ;;
+    --allow-ubuntu-2510) allow_ubuntu_2510=true; shift ;;
     *) fail "unknown argument: $1" ;;
   esac
 done
-[[ -n "$mode" ]] || fail 'usage: install.sh --dry-run|--prepare|--apply|--doctor [--bin-dir DIR] [--backend HTTPS_ORIGIN]'
+[[ -n "$mode" ]] || fail 'usage: install.sh --dry-run|--prepare|--apply|--doctor [--bin-dir DIR] [--backend HTTPS_ORIGIN] [--allow-ubuntu-2510]'
 if [[ "$mode" == --dry-run ]]; then
   echo 'Prepare: install native/Xfce/LightDM/greeter/locker dependencies with service starts blocked; preserve display-manager selection; install private agent state and reviewed units.'
   echo 'Enroll locally as remotevnc-agent. Apply: back up display selection/config/unit enablement, select LightDM/Xfce for NEXT BOOT; start guardian, helper, agent.'
@@ -24,7 +25,7 @@ fi
 [[ -f /etc/os-release ]] || fail 'missing Ubuntu release information'
 # shellcheck source=/dev/null
 source /etc/os-release
-[[ "$ID" == ubuntu && "$VERSION_ID" == 26.04 ]] || fail 'supported deployment requires Ubuntu 26.04; no OS upgrade is performed'
+[[ "$ID" == ubuntu && ( "$VERSION_ID" == 26.04 || ( "$VERSION_ID" == 25.10 && "$allow_ubuntu_2510" == true ) ) ]] || fail 'requires Ubuntu 26.04 or Ubuntu 25.10 with explicit --allow-ubuntu-2510; no OS upgrade is performed'
 for command in python3 systemctl runuser useradd groupadd getent install stat; do command -v "$command" >/dev/null || fail "missing prerequisite: $command"; done
 python3 - "$origin" <<'PY'
 import sys, urllib.parse

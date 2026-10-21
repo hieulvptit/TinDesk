@@ -28,7 +28,8 @@ class Installer(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.root.chmod(0o755)
-        for directory in ("bin", "lib", "lib64", "dev"):
+        # Coreutils stat on Ubuntu 25.10 also reads the mount table.
+        for directory in ("bin", "lib", "lib64", "dev", "proc"):
             source = Path("/") / directory
             if source.exists():
                 dest = self.root / directory
@@ -108,6 +109,54 @@ class Installer(unittest.TestCase):
         self.run_install("--dry-run")
         after = self.snapshot()
         self.assertEqual(before, after)
+
+    def test_ubuntu_2510_requires_explicit_opt_in_before_any_writes(self):
+        (self.root / "etc/os-release").write_text('ID=ubuntu\nVERSION_ID="25.10"\n')
+        before = self.snapshot()
+        for mode in ("--prepare", "--apply", "--doctor"):
+            with self.subTest(mode=mode):
+                self.run_install(mode, success=False)
+                self.assertEqual(before, self.snapshot())
+                self.assertFalse((self.root / "commands").exists())
+
+    def test_ubuntu_2510_opt_in_preserves_enrollment_doctor_and_rollback(self):
+        (self.root / "etc/os-release").write_text('ID=ubuntu\nVERSION_ID="25.10"\n')
+        flag = "--allow-ubuntu-2510"
+        self.run_install("--prepare", flag)
+        self.assertEqual((self.root / "etc/X11/default-display-manager").read_text(), "/usr/sbin/gdm3\n")
+        self.assertEqual((self.root / "var/lib/remotevnc-agent").stat().st_mode & 0o777, 0o700)
+        self.assertEqual((self.root / "etc/remotevnc/agent.json").stat().st_mode & 0o777, 0o640)
+        commands = (self.root / "commands").read_text()
+        self.assertNotRegex(commands, r"systemctl .*\b(start|restart|enable|stop)\b")
+        before = self.snapshot()
+        self.run_install("--apply", flag, success=False)
+        self.assertEqual(before, self.snapshot(), "compatibility mode must still require private enrollment before writes")
+        self.enroll_fixture()
+        applied = self.run_install("--apply", flag)
+        self.assertEqual((self.root / "etc/X11/default-display-manager").read_text(), "/usr/sbin/lightdm\n")
+        agent = self.root / "usr/bin/remotevnc-agent"
+        agent.write_text('#!/bin/bash\n[[ "$1" == doctor && "$2" == --config && "$3" == /etc/remotevnc/agent.json ]] || exit 9\nprintf "%s\\n" "$EUID" > /var/lib/remotevnc-agent/doctor-uid\n')
+        agent.chmod(0o755)
+        self.run_install("--doctor", flag)
+        self.assertEqual((self.root / "var/lib/remotevnc-agent/doctor-uid").read_text().strip(), str((self.root / "var/lib/remotevnc-agent").stat().st_uid))
+        commands = (self.root / "commands").read_text()
+        starts = [line for line in commands.splitlines() if line.startswith('systemctl start ')]
+        self.assertEqual(starts, ['systemctl start remotevnc-input-guardian.service', 'systemctl start remotevnc-seat-helper.service', 'systemctl start remotevnc-agent.service'])
+        self.assertNotRegex(commands, r"systemctl (?:restart|reboot|start (?:lightdm|gdm|display-manager))\b")
+        self.run_rollback(applied.stdout)
+        self.assertEqual((self.root / "etc/X11/default-display-manager").read_text(), "/usr/sbin/gdm3\n")
+        self.assertEqual(os.readlink(self.root / "etc/systemd/system/display-manager.service"), "/usr/lib/systemd/system/gdm3.service")
+        self.assertEqual((self.root / "etc/debconf-value").read_text().strip(), 'gdm3')
+        self.assertEqual((self.root / "etc/debconf-seen").read_text().strip(), 'false')
+
+    def test_compatibility_flag_does_not_allow_other_releases(self):
+        for distro, release in (("ubuntu", "24.04"), ("ubuntu", "25.04"), ("ubuntu", "26.10"), ("debian", "25.10")):
+            with self.subTest(distro=distro, release=release):
+                (self.root / "etc/os-release").write_text(f'ID={distro}\nVERSION_ID="{release}"\n')
+                before = self.snapshot()
+                self.run_install("--prepare", "--allow-ubuntu-2510", success=False)
+                self.assertEqual(before, self.snapshot())
+                self.assertFalse((self.root / "commands").exists())
 
     def test_invalid_prerequisites_fail_before_writes(self):
         (self.root / "artifacts/remotevnc-agent").unlink()
