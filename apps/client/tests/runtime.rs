@@ -509,6 +509,7 @@ async fn recover_then_cancel(revoke: bool) {
         signing_key: device_key(1),
     }));
     let server = server(f.db.clone(), store.clone()).await;
+    server.control.rotate.store(true, Ordering::SeqCst);
     let api = DeviceApi::new(&server.base, device_key(2)).unwrap();
     let token = AccessToken {
         token: f.tokens[1].clone(),
@@ -580,7 +581,13 @@ async fn recover_then_cancel(revoke: bool) {
         }
         if ack && decoded >= 3 {
             if sessions.len() == 1 {
+                // Remove the old session while the runtime cannot receive its
+                // close event. Reconnection must reconcile the missing grant
+                // then create fresh authority without another Connect command.
+                server.control.offline_events.store(true, Ordering::SeqCst);
+                wait_for(|| store.view.lock().unwrap().presence.is_empty()).await;
                 api.close_session(&token, sessions[0]).await.unwrap();
+                server.control.offline_events.store(false, Ordering::SeqCst);
                 peer.take();
                 decoded = 0;
                 ack = false;

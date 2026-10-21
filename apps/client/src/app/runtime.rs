@@ -363,6 +363,9 @@ async fn run(
         state.lock().unwrap().connection_requested = desired.is_some();
         if end {
             if let Some(l) = live.take() {
+                // A close event may have been lost during socket rotation.
+                // Recheck enrollment immediately when any live scope retires.
+                next_list = Instant::now();
                 let id = l.grant.session_id;
                 drop(l);
                 close_remote(&mut closing, api.clone(), &token_rx, id);
