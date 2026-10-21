@@ -5,6 +5,7 @@ cd "$(dirname "$0")/.."
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-1}
 for script in scripts/*.sh packaging/ubuntu/*.sh packaging/macos/*.sh packaging/backend/*.sh; do bash -n "$script"; done
 python3 scripts/test-backend-maintenance.py
+python3 scripts/test-backend-entrypoint.py
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked

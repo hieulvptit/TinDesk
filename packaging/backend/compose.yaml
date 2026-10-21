@@ -21,14 +21,13 @@ services:
       REMOTEVNC_GOOGLE_REDIRECT_URI: ${REMOTEVNC_GOOGLE_REDIRECT_URI:?registered callback required}
       REMOTEVNC_GOOGLE_CLIENT_ID: ${REMOTEVNC_GOOGLE_CLIENT_ID:?Google client ID required}
       REMOTEVNC_GOOGLE_CLIENT_SECRET_FILE: /run/secrets/google_client_secret
-      REMOTEVNC_TURN_KEY_ID: ${REMOTEVNC_TURN_KEY_ID:?TURN key ID required}
-      REMOTEVNC_TURN_API_TOKEN_FILE: /run/secrets/turn_api_token
-    secrets: [google_client_secret, turn_api_token]
+      REMOTEVNC_TURN_KEYS_FILE: /run/secrets/turn_keys.json
+    secrets: [google_client_secret, turn_keys]
     logging:
       driver: local
       options: {max-size: "5m", max-file: "3"}
 secrets:
   google_client_secret:
     file: ${REMOTEVNC_GOOGLE_SECRET_FILE:?private Google secret file required}
-  turn_api_token:
-    file: ${REMOTEVNC_TURN_TOKEN_FILE:?private TURN token file required}
+  turn_keys:
+    file: ${REMOTEVNC_TURN_KEYS_FILE:?private TURN keys JSON file required}

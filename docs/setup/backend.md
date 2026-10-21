@@ -9,8 +9,8 @@ no capabilities and no exposed public backend port.
 
 `https://amio.vnoffice.io.vn/login/callback` is the registered Google callback.
 The owner confirmed that the Cloudflare-proxied `amio.vnoffice.io.vn` domain is
-**dedicated to RemoteVNC**. Cloudflare TURN credentials exist; their private file
-path is forthcoming. Existing host nginx already owns 80/443. Add only the reviewed
+**dedicated to RemoteVNC**. TURN supports a private JSON key list; see
+[the Cloudflare token and multi-key guide](cloudflare-turn.md). Existing host nginx already owns 80/443. Add only the reviewed
 server-name-specific routing for this domain; preserve other nginx hosts, ingress,
 DNS, tunnels and services. Do not install a catch-all server. RemoteVNC uses `/v1`,
 `/auth/google` and `/login/callback` at the origin root; prefix mounting is not
@@ -26,12 +26,13 @@ sudo install -d -m0700 -o 10001 -g 10001 /srv/remotevnc/data
 ```
 
 Create the two secret files named by deploy.env using a private secret manager or
-editor. Each contains one raw secret only, not the Google JSON document. Their
+editor. The Google file contains only the raw client secret (not its JSON download);
+the TURN file contains the `keys` JSON described in the guide above. Their
 owner must be UID 10001 with mode 0400/0600 and root 0700 containing directory, so
 root Compose can bind-mount them while only the backend UID reads the mounted
 file. Compose local file-secret mounts preserve host ownership; declaring secret
 uid/mode is not a substitute for host permissions. The entrypoint requires both
-Google client secret and TURN API token from secret files or environment, rejects
+Google client secret and either the TURN JSON file or legacy token configuration, rejects
 conflicting sources, and never prints values. Never put live values in CLI args,
 Docker build args, shell history, compose config output, CI variables in logs or
 the repository. Rotate any previously exposed OAuth secret through the provider
@@ -50,7 +51,7 @@ Compose uses the separately built image; it has no build context or source-tree
 mount. Keep its immutable image ID alongside deployment/change records. Required Google
 configuration is validated before creating the DB or listening. Invalid/missing
 HTTPS origin/auth fails closed; there is no installed auth bypass. Missing TURN
-credentials are rejected by the packaged entrypoint (the library's unavailable
+configuration is rejected by the packaged entrypoint (the library's unavailable
 TURN mode remains useful for local tests only). Initial Google discovery needs
 outbound HTTPS. Keep time synchronized; lease/token safety assumes local clock
 and bounded scheduler operation. On restart existing sessions expire.

@@ -1,0 +1,12 @@
+{
+  "keys": [
+    {
+      "key_id": "replace-with-first-turn-key-id",
+      "api_token": "replace-with-first-turn-api-token"
+    },
+    {
+      "key_id": "replace-with-second-turn-key-id",
+      "api_token": "replace-with-second-turn-api-token"
+    }
+  ]
+}

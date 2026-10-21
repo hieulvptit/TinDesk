@@ -8,6 +8,7 @@ input use authenticated WebRTC; the privileged helper has no network access.
 - [Ubuntu installation, local enrollment and rollback](docs/setup/ubuntu.md)
 - [macOS development app and signing limits](docs/setup/macos.md)
 - [Private backend deployment, ingress and SQLite operations](docs/setup/backend.md)
+- [Cloudflare TURN tokens and multiple backend keys](docs/setup/cloudflare-turn.md)
 - [Native dependency setup](docs/setup/native-dependencies.md)
 
 Use Rust **1.95.0**, the committed `Cargo.lock`, and `--locked`. After native
@@ -24,6 +25,6 @@ upgraded or switched as a side effect of builds/tests.
 
 Local tests and unsigned macOS bundles do not establish physical greeter/locker,
 interactive Google/Keychain/IME, LAN permission or real Cloudflare relay acceptance.
-Public routing for `amio.vnoffice.io.vn` still requires dedicated/shared-domain
-clarification; deployment examples are additive and must be reviewed before use.
+The owner confirmed `amio.vnoffice.io.vn` is dedicated to this backend; deployment
+examples add only its routing and preserve other applications.
 No secrets, databases, recordings or generated app bundles belong in git.
