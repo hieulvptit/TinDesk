@@ -6,7 +6,8 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY apps ./apps
-RUN cargo build --locked --release -p remotevnc-backend -j 1
+# Avoid registry HTTP/2 stalls on constrained build-host networks.
+RUN CARGO_HTTP_MULTIPLEXING=false cargo build --locked --release -p remotevnc-backend -j 1
 
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 RUN rm -f /etc/apt/sources.list.d/debian.sources && printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20261020T000000Z bookworm main\n' > /etc/apt/sources.list \
