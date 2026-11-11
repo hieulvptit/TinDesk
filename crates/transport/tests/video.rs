@@ -1,6 +1,6 @@
+use binachicken_protocol::*;
+use binachicken_transport::*;
 use gst::prelude::*;
-use remotevnc_protocol::*;
-use remotevnc_transport::*;
 use std::time::{Duration, Instant};
 
 fn config(role: PeerRole) -> PeerConfig {
@@ -258,12 +258,19 @@ fn real_h264_rtp_decodes_scaled_pixels_and_rebuilds_generation() {
 #[test]
 fn adaptation_requires_sustained_measured_pressure_and_stays_bounded() {
     let mut adaptation =
-        remotevnc_transport::stats::AdaptiveProfile::new(VideoProfile::default()).unwrap();
+        binachicken_transport::stats::AdaptiveProfile::new(VideoProfile::default()).unwrap();
     let mut stats = PeerStats::default();
+    // Unconnected sessions drop encoded frames without any network pressure.
+    for drops in 1..=10 {
+        stats.dropped_encoded_frames = drops;
+        assert!(adaptation.observe(&stats).is_none());
+    }
+    stats.native.local_candidate = Some(binachicken_transport::stats::CandidateType::Host);
+    stats.native.remote_candidate = Some(binachicken_transport::stats::CandidateType::Host);
     for _ in 0..10 {
         assert!(adaptation.observe(&stats).is_none());
     }
-    stats.native.loss_ppm = Some(100_000);
+    stats.native.loss_ppm = Some(150_000);
     assert!(adaptation.observe(&stats).is_none());
     assert!(adaptation.observe(&stats).is_none());
     let lower = adaptation.observe(&stats).unwrap();
@@ -272,4 +279,118 @@ fn adaptation_requires_sustained_measured_pressure_and_stays_bounded() {
     for _ in 0..2 {
         assert!(adaptation.observe(&stats).is_none());
     }
+    // A momentary two-frame queue without overflow is bursty output, not congestion.
+    stats.native.queued_video_frames = Some(2);
+    for _ in 0..5 {
+        assert!(adaptation.observe(&stats).is_none());
+    }
+    stats.native.queued_video_frames = None;
+    // Loss measured before RTX repair: 6% alone is not pressure.
+    stats.native.loss_ppm = Some(60_000);
+    for _ in 0..5 {
+        assert!(adaptation.observe(&stats).is_none());
+    }
+    // A sustained clean period restores the requested profile.
+    stats.native.loss_ppm = Some(0);
+    let mut restored = None;
+    for _ in 0..30 {
+        if let Some(profile) = adaptation.observe(&stats) {
+            restored = Some(profile);
+        }
+    }
+    assert_eq!(restored, Some(VideoProfile::default()));
+    for _ in 0..30 {
+        assert!(
+            adaptation.observe(&stats).is_none(),
+            "never above the requested profile"
+        );
+    }
+}
+
+#[test]
+fn real_h264_reports_received_counters_and_fresh_monotonic_sample_times() {
+    let mut agent = Peer::new(config(PeerRole::Agent)).unwrap();
+    let mut controller_config = config(PeerRole::Controller);
+    controller_config.display = None;
+    let mut controller = Peer::new(controller_config).unwrap();
+    for event in agent.events().try_iter().collect::<Vec<_>>() {
+        if let PeerEvent::Signal(signal) = event {
+            forward(&controller, signal);
+        }
+    }
+    agent.enable_h264().unwrap();
+    controller.enable_h264().unwrap();
+    controller.start_negotiation().unwrap();
+    let _ = pump(&mut controller, &mut agent, 1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut previous = None;
+    loop {
+        let stats = controller.stats().native;
+        if stats.bytes_received.is_some_and(|n| n > 0)
+            && stats.packets_received.is_some_and(|n| n > 0)
+            && let Some(sampled) = stats.sampled_at_ms
+        {
+            if let Some((old_time, old_bytes)) = previous {
+                if sampled > old_time {
+                    assert!(stats.bytes_received.unwrap() >= old_bytes);
+                    assert!(stats.packets_lost.is_some());
+                    break;
+                }
+            } else {
+                previous = Some((sampled, stats.bytes_received.unwrap()));
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fresh native RTP byte samples unavailable"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    controller.close();
+    agent.close();
+}
+#[test]
+fn video_negotiates_packet_retransmission_for_loss_recovery() {
+    let mut agent = Peer::new(config(PeerRole::Agent)).unwrap();
+    let mut controller_config = config(PeerRole::Controller);
+    controller_config.display = None;
+    let mut controller = Peer::new(controller_config).unwrap();
+    for event in agent.events().try_iter().collect::<Vec<_>>() {
+        if let PeerEvent::Signal(signal) = event {
+            forward(&controller, signal);
+        }
+    }
+    agent.enable_h264().unwrap();
+    controller.enable_h264().unwrap();
+    controller.start_negotiation().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (mut offer, mut answer) = (None, None);
+    while offer.is_none() || answer.is_none() {
+        for event in controller.events().try_iter().collect::<Vec<_>>() {
+            if let PeerEvent::Signal(s) = event {
+                if let SignalMessage::Offer { sdp, .. } = &s {
+                    offer = Some(sdp.clone()).filter(|sdp| sdp.contains("m=video"));
+                }
+                forward(&agent, s);
+            }
+        }
+        for event in agent.events().try_iter().collect::<Vec<_>>() {
+            if let PeerEvent::Signal(s) = event {
+                if let SignalMessage::Answer { sdp, .. } = &s {
+                    answer = Some(sdp.clone()).filter(|sdp| sdp.contains("m=video"));
+                }
+                forward(&controller, s);
+            }
+        }
+        assert!(Instant::now() < deadline, "no offer/answer exchanged");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Both sides must agree on generic NACK and an RTX payload, otherwise a
+    // single lost packet corrupts the picture until the next keyframe.
+    for sdp in [offer.unwrap(), answer.unwrap()] {
+        assert!(sdp.contains("nack\r\n"), "no generic NACK feedback: {sdp}");
+        assert!(sdp.contains("rtx/90000"), "no RTX payload: {sdp}");
+    }
+    controller.close();
+    agent.close();
 }

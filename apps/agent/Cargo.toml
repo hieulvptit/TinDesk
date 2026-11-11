@@ -1,14 +1,15 @@
 [package]
-name = "remotevnc-agent"
+name = "binachicken-agent"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-remotevnc-device = { path = "../../crates/device" }
-remotevnc-protocol = { path = "../../crates/protocol" }
-remotevnc-transport = { path = "../../crates/transport" }
+binachicken-device = { path = "../../crates/device" }
+binachicken-protocol = { path = "../../crates/protocol" }
+binachicken-transport = { path = "../../crates/transport" }
+binachicken-sync = { path = "../../crates/sync" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde.workspace = true
@@ -19,11 +20,11 @@ rand = "0.8"
 base64 = "0.22"
 
 [dev-dependencies]
-remotevnc-transport = { path = "../../crates/transport", features = ["native-test"] }
+binachicken-transport = { path = "../../crates/transport", features = ["native-test"] }
 tokio = { version = "1", features = ["test-util"] }
 uuid.workspace = true
 tempfile = "3"
-remotevnc-seat-helper = { path = "../seat-helper" }
+binachicken-seat-helper = { path = "../seat-helper" }
 remotevnc-backend = { path = "../backend" }
 axum = { version = "0.8", features = ["form", "ws"] }
 openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }

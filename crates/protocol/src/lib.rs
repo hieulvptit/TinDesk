@@ -1,4 +1,4 @@
-//! Shared RemoteVNC wire contracts and local input policy, with no native dependencies.
+//! Shared BinaChicken wire contracts and local input policy, with no native dependencies.
 pub mod enrollment;
 pub mod identity;
 pub mod input;
@@ -49,3 +49,9 @@ pub enum ProtocolError {
 
 pub mod session;
 pub use session::*;
+
+pub mod sync;
+pub use sync::*;
+
+pub mod tunnel;
+pub use tunnel::*;

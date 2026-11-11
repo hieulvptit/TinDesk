@@ -8,6 +8,9 @@ The container runs as UID/GID 10001 with private state, read-only root filesyste
 no capabilities and no exposed public backend port.
 
 `https://amio.vnoffice.io.vn/login/callback` is the registered Google callback.
+An enrollment-bound Google sign-in automatically registers the pending device
+under the authenticated Google subject; no device code or extra confirmation is
+required. Existing device keys continue to authenticate with signed challenges.
 The owner confirmed that the Cloudflare-proxied `amio.vnoffice.io.vn` domain is
 **dedicated to RemoteVNC**. TURN supports a private JSON key list; see
 [the Cloudflare token and multi-key guide](cloudflare-turn.md) and the
@@ -106,7 +109,7 @@ Loopback tests do not establish long-lived proxy/real-TURN acceptance.
 Install `remotevnc-maintenance.{service,timer}` into `/etc/systemd/system`, then
 review and explicitly enable its hourly timer. It invokes the private backend
 container as its existing UID, uses BEGIN IMMEDIATE/busy timeout, and deletes
-only expired OAuth transactions, confirmations, enrollments, challenges and
+only expired OAuth transactions, legacy confirmations, enrollments, challenges and
 access tokens after one-hour grace; already closed/expired sessions are removed.
 Live records, users, devices, public-key uniqueness and revoked ownership
 **never** get pruned. The backend's per-process authorization gate is not bypassed:

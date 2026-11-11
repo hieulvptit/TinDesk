@@ -1,5 +1,5 @@
-use remotevnc_agent::helper::Helper;
-use remotevnc_protocol::*;
+use binachicken_agent::helper::Helper;
+use binachicken_protocol::*;
 use std::{io::Read, os::unix::net::UnixListener, time::Duration};
 
 #[tokio::test]

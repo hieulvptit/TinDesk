@@ -51,18 +51,29 @@ pub fn boot_time_ms() -> u64 {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-        START
-            .get_or_init(std::time::Instant::now)
-            .elapsed()
-            .as_millis() as u64
+        // The local helper is a separate process, so leases need a system-wide
+        // clock (CLOCK_MONOTONIC) rather than a per-process Instant origin.
+        let mut value = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+            return u64::MAX;
+        }
+        value.tv_sec as u64 * 1000 + value.tv_nsec as u64 / 1_000_000
     }
 }
 
-use crate::{config::Config, helper::Helper};
-use remotevnc_device::{DeviceApi, DeviceIdentity};
-use remotevnc_protocol::*;
-use remotevnc_transport::{ConnectionState, Peer, PeerConfig, PeerEvent, PeerRole, TransportError};
+use crate::{
+    config::Config,
+    helper::Helper,
+    sync_bridge::{PortError, SyncBridge, SyncPort, active_seat_user, tunnel_policy},
+};
+use binachicken_device::{DeviceApi, DeviceIdentity};
+use binachicken_protocol::*;
+use binachicken_transport::{
+    ConnectionState, Peer, PeerConfig, PeerEvent, PeerRole, TransportError,
+};
 use std::{
     collections::HashSet,
     net::Shutdown,
@@ -135,14 +146,15 @@ impl AgentService {
         ));
         let mut live: Option<Live> = None;
         let mut renewal: Option<
-            JoinHandle<(SessionId, u64, remotevnc_device::Result<SessionGrant>)>,
+            JoinHandle<(SessionId, u64, binachicken_device::Result<SessionGrant>)>,
         > = None;
         let mut pending: Option<SessionGrant> = None;
         let mut replayed = HashSet::new();
         let mut next_renew = Instant::now() + Duration::from_secs(15);
         let mut offline_until: Option<Instant> = None;
-        let mut turn_job: Option<JoinHandle<remotevnc_device::Result<()>>> = None;
-        let mut tick = tokio::time::interval(Duration::from_millis(5));
+        let mut turn_job: Option<JoinHandle<binachicken_device::Result<()>>> = None;
+        // Input and encoded video both cross this tick; keep its added latency small.
+        let mut tick = tokio::time::interval(Duration::from_millis(2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let mut end = false;
@@ -277,7 +289,8 @@ impl AgentService {
                             }
                             Ok(())
                         })();
-                        if result.is_err() {
+                        if let Err(error) = result {
+                            eprintln!("binachicken-agent: signaling session retired: {error}");
                             end = true;
                         }
                     }
@@ -307,7 +320,8 @@ impl AgentService {
                                     } else {
                                         match Live::new(&self.config, grant, started, stop.child_token()) {
                                             Ok(l) => live = Some(l),
-                                            Err(_) => {
+                                            Err(error) => {
+                                                eprintln!("binachicken-agent: session initialization failed: {error}");
                                                 close_remote(api.clone(), &token_rx, id);
                                                 end = true;
                                             }
@@ -315,7 +329,7 @@ impl AgentService {
                                     }
                                 }
                             }
-                            Ok((_, _, Err(remotevnc_device::Error::Unauthorized))) => end = true,
+                            Ok((_, _, Err(binachicken_device::Error::Unauthorized))) => end = true,
                             // A transient HTTP failure cannot create new authority. Retain the
                             // last authenticated deadline; the independent watchdog still expires.
                             Ok((_, _, Err(_))) if live.is_some() => {}
@@ -323,7 +337,11 @@ impl AgentService {
                         }
                     }
                     if let Some(l) = live.as_mut() {
-                        if l.poll(&command_tx).is_err() || l.stop.is_cancelled() {
+                        if let Err(error) = l.poll(&command_tx) {
+                            eprintln!("binachicken-agent: media session retired: {error}");
+                            end = true;
+                        }
+                        if l.stop.is_cancelled() {
                             end = true;
                         }
                         if Instant::now() >= next_renew && renewal.is_none() {
@@ -389,7 +407,7 @@ fn renew(
     api: Arc<DeviceApi>,
     token: AccessToken,
     id: SessionId,
-) -> JoinHandle<(SessionId, u64, remotevnc_device::Result<SessionGrant>)> {
+) -> JoinHandle<(SessionId, u64, binachicken_device::Result<SessionGrant>)> {
     tokio::spawn(async move {
         let started = boot_time_ms();
         (id, started, api.renew_session(&token, id).await)
@@ -415,10 +433,10 @@ async fn network(
         let connection = async {
             let token = api.authenticate(&identity).await?;
             let socket = api.events(&token, DeviceRole::Agent).await?;
-            Ok::<_, remotevnc_device::Error>((token, socket))
+            Ok::<_, binachicken_device::Error>((token, socket))
         };
         let result = tokio::select! {_=stop.cancelled()=>return,result=connection=>result};
-        if matches!(result, Err(remotevnc_device::Error::Unauthorized)) {
+        if matches!(result, Err(binachicken_device::Error::Unauthorized)) {
             let _ = events.try_send(NetworkEvent::PolicyClosed);
         }
         if let Ok((token, socket)) = result {
@@ -440,7 +458,7 @@ async fn network(
                   _=&mut rotate=>break,
                   event=receiver.next()=>match event {
                     Ok(Some(event))=>events.try_send(NetworkEvent::Event(event)).map_err(|_|()),
-                    Err(remotevnc_device::Error::PolicyClosed)=>{let _=events.try_send(NetworkEvent::PolicyClosed);Err(())},
+                    Err(binachicken_device::Error::PolicyClosed)=>{let _=events.try_send(NetworkEvent::PolicyClosed);Err(())},
                     _=>Err(()),
                   },
                   command=commands.recv()=>match command {Some(command)=>sender.send(&command).await.map_err(|_|()),None=>return},
@@ -467,7 +485,7 @@ struct Live {
     grant: SessionGrant,
     helper: Helper,
     peer: Arc<Peer>,
-    events: remotevnc_transport::Receiver<PeerEvent>,
+    events: binachicken_transport::Receiver<PeerEvent>,
     authority: Authority,
     stop: CancellationToken,
     display: Option<DisplayInfo>,
@@ -480,9 +498,30 @@ struct Live {
     negotiation_until: Option<Instant>,
     helper_transition_until: Option<Instant>,
     profile: VideoProfile,
-    adaptation: remotevnc_transport::stats::AdaptiveProfile,
+    configured_profile: VideoProfile,
+    adaptation: binachicken_transport::stats::AdaptiveProfile,
     next_media_sample: Instant,
+    next_media_log: Instant,
+    /// Ordered signals awaiting network capacity; never blocks other peer events.
+    outbox: std::collections::VecDeque<SignalMessage>,
+    /// Clipboard/file relay to the logged-in user's helper; absent when not configured.
+    sync: Option<SyncBridge>,
 }
+/// The data channel as the sync bridge sees it.
+struct PeerPort<'a>(&'a Peer);
+impl SyncPort for PeerPort<'_> {
+    fn send(&self, frame: &[u8]) -> std::result::Result<(), PortError> {
+        match self.0.send_sync(frame) {
+            Ok(()) => Ok(()),
+            Err(TransportError::QueueFull | TransportError::NotReady) => Err(PortError::Busy),
+            Err(_) => Err(PortError::Fatal),
+        }
+    }
+    fn recv(&self) -> Option<Vec<u8>> {
+        self.0.sync_events().try_recv().ok()
+    }
+}
+const SIGNAL_BACKLOG_LIMIT: usize = 256;
 impl Live {
     fn new(
         config: &Config,
@@ -549,6 +588,10 @@ impl Live {
                 return Err(e);
             }
         };
+        let profile = VideoProfile {
+            fps: 30,
+            ..VideoProfile::default()
+        };
         Ok(Self {
             turn_due: grant.turn_refresh_at_unix_secs(),
             ice: grant.ice_servers.clone(),
@@ -565,9 +608,32 @@ impl Live {
             restarted_generation: 0,
             negotiation_until: None,
             helper_transition_until: None,
-            profile: VideoProfile::default(),
-            adaptation: remotevnc_transport::stats::AdaptiveProfile::new(VideoProfile::default())?,
+            profile,
+            configured_profile: profile,
+            adaptation: binachicken_transport::stats::AdaptiveProfile::new(profile)?,
             next_media_sample: Instant::now() + Duration::from_secs(1),
+            next_media_log: Instant::now() + Duration::from_secs(5),
+            outbox: Default::default(),
+            sync: {
+                let mut bridge = match config.sync_socket.as_deref() {
+                    Some(path) => match SyncBridge::bind(path, Box::new(active_seat_user)) {
+                        Ok(bridge) => Some(bridge),
+                        Err(error) => {
+                            // Sync is optional; never end a control session over it.
+                            eprintln!("binachicken-agent: clipboard sync unavailable: {error}");
+                            None
+                        }
+                    },
+                    None => config.ssh_port.map(|_| SyncBridge::tunnel_only()),
+                };
+                if let (Some(bridge), Some(port)) = (bridge.as_mut(), config.ssh_port) {
+                    bridge.enable_tunnel(
+                        std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                        Box::new(tunnel_policy),
+                    );
+                }
+                bridge
+            },
         })
     }
     fn renewed(&mut self, started: u64) -> Result<()> {
@@ -625,11 +691,12 @@ impl Live {
             };
             match event {
                 HelperEvent::Ready => {}
-                HelperEvent::CaptureFailed(failure) => eprintln!("remotevnc-agent: {failure}"),
-                HelperEvent::Error { .. } => {
+                HelperEvent::CaptureFailed(failure) => eprintln!("binachicken-agent: {failure}"),
+                HelperEvent::Error { message } => {
                     eprintln!(
-                        "remotevnc-agent: helper input unavailable or recovery pending; session closed"
+                        "binachicken-agent: helper input unavailable or recovery pending; session closed"
                     );
+                    eprintln!("binachicken-agent: helper operation failed: {message}");
                     return Err("helper unavailable or input recovery pending".into());
                 }
                 HelperEvent::Stopped { session_id } => {
@@ -658,6 +725,9 @@ impl Live {
                         display,
                         deadline_boot_ms: deadline,
                     })?;
+                    self.profile = self.configured_profile.fit_display(display)?;
+                    self.adaptation =
+                        binachicken_transport::stats::AdaptiveProfile::new(self.profile)?;
                     self.helper.send(HelperRequest::StartCapture {
                         session_id: self.grant.session_id,
                         generation: display.generation,
@@ -675,17 +745,39 @@ impl Live {
                 }
             }
         }
+        if commands.is_closed() {
+            return Err("signaling unavailable".into());
+        }
+        // ICE callbacks can burst past the network queue. A temporary backlog
+        // waits in order; only a closed network or runaway backlog ends the session.
+        while !self.outbox.is_empty() && commands.capacity() > 0 {
+            let message = self.outbox.pop_front().unwrap();
+            commands
+                .try_send(DeviceCommand::Signal {
+                    receiver: self.grant.client_id,
+                    message,
+                })
+                .map_err(|_| "signaling unavailable")?;
+        }
         for _ in 0..64 {
             let Ok(event) = self.events.try_recv() else {
                 break;
             };
             match event {
-                PeerEvent::Signal(message) => commands
-                    .try_send(DeviceCommand::Signal {
-                        receiver: self.grant.client_id,
-                        message,
-                    })
-                    .map_err(|_| "signaling unavailable")?,
+                PeerEvent::Signal(message) => {
+                    if self.outbox.is_empty() && commands.capacity() > 0 {
+                        commands
+                            .try_send(DeviceCommand::Signal {
+                                receiver: self.grant.client_id,
+                                message,
+                            })
+                            .map_err(|_| "signaling unavailable")?;
+                    } else if self.outbox.len() < SIGNAL_BACKLOG_LIMIT {
+                        self.outbox.push_back(message);
+                    } else {
+                        return Err("signaling backlog exceeded".into());
+                    }
+                }
                 PeerEvent::Input(input) => {
                     self.guard
                         .as_mut()
@@ -700,10 +792,31 @@ impl Live {
                         _ if !self.acknowledged => return Err("display is not acknowledged".into()),
                         _ => {}
                     }
-                    self.helper.send(HelperRequest::Input(input))?;
+                    if let InputEvent::VideoProfile { profile } = input.event {
+                        let fitted = profile
+                            .fit_display(self.display.ok_or("video settings without display")?)?;
+                        self.helper.send(HelperRequest::UpdateProfile {
+                            session_id: self.grant.session_id,
+                            generation: input.generation,
+                            profile: fitted,
+                        })?;
+                        self.configured_profile = profile;
+                        self.profile = fitted;
+                        self.adaptation =
+                            binachicken_transport::stats::AdaptiveProfile::new(fitted)?;
+                        self.next_media_sample = Instant::now() + Duration::from_secs(1);
+                    } else {
+                        self.helper.send(HelperRequest::Input(input))?;
+                    }
                 }
                 PeerEvent::InputReset { .. } => {
                     self.release()?;
+                }
+                // A fresh PeerConnection epoch: nothing in flight survives it.
+                PeerEvent::ChannelsReady => {
+                    if let Some(sync) = self.sync.as_mut() {
+                        sync.reset(&PeerPort(&self.peer));
+                    }
                 }
                 PeerEvent::KeyframeNeeded => {
                     if let Some(display) = self.display {
@@ -724,6 +837,10 @@ impl Live {
                 PeerEvent::Error(_) => return Err("media failure".into()),
                 _ => {}
             }
+        }
+        if let Some(sync) = self.sync.as_mut() {
+            sync.poll(&PeerPort(&self.peer))
+                .map_err(|_| "sync channel closed")?;
         }
         if self
             .helper_transition_until
@@ -746,6 +863,21 @@ impl Live {
             if now >= self.next_media_sample {
                 self.next_media_sample = now + Duration::from_secs(1);
                 let mut stats = self.peer.stats();
+                if now >= self.next_media_log {
+                    self.next_media_log = now + Duration::from_secs(10);
+                    // Operational measurements only: no input, addresses or credentials.
+                    eprintln!(
+                        "binachicken-agent: media path={} video={}x{} fps_limit={} encoded_drops={} helper_drops={} rtt_ms={:?} loss_ppm={:?}",
+                        stats.native.connection_path().unwrap_or("checking"),
+                        self.profile.width,
+                        self.profile.height,
+                        self.profile.fps,
+                        stats.dropped_encoded_frames,
+                        helper_drops,
+                        stats.native.rtt_ms,
+                        stats.native.loss_ppm,
+                    );
+                }
                 stats.dropped_encoded_frames =
                     stats.dropped_encoded_frames.saturating_add(helper_drops);
                 if let Some(profile) = self.adaptation.observe(&stats) {
@@ -815,3 +947,6 @@ fn signal_scope(message: &SignalMessage) -> (SessionId, u64) {
 
 #[cfg(all(test, target_os = "linux"))]
 mod native_tests;
+
+#[cfg(test)]
+mod tests;

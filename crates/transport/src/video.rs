@@ -6,6 +6,7 @@ pub(super) struct SenderState {
     generation: u64,
     needs_keyframe: bool,
     last_pts: Option<u64>,
+    timestamp_origin: Option<(u64, u64)>,
 }
 fn caps() -> gst::Caps {
     gst::Caps::builder("application/x-rtp")
@@ -99,12 +100,33 @@ impl Peer {
         }
         let mut buffer = gst::Buffer::from_mut_slice(frame.data);
         let buffer_mut = buffer.get_mut().unwrap();
-        // Source time is preserved. Reject backwards time rather than relabel it.
+        // Capture and transport are separate live pipelines. Map their clock
+        // origins once, preserving capture cadence rather than timestamping each
+        // arrival (which would turn network/IPC jitter into video jitter).
         if sender.last_pts.is_some_and(|last| frame.pts_ns < last) {
             return Err(ProtocolError::InvalidPayload.into());
         }
-        buffer_mut.set_pts(gst::ClockTime::from_nseconds(frame.pts_ns));
-        buffer_mut.set_dts(gst::ClockTime::from_nseconds(frame.pts_ns));
+        let origin = match sender.timestamp_origin {
+            Some(origin) => origin,
+            None => (
+                frame.pts_ns,
+                engine
+                    .pipeline
+                    .current_running_time()
+                    // Live pipelines acquire a clock/base time asynchronously.
+                    // Retain the keyframe gate and retry within the existing
+                    // bounded video-recovery/authorization deadlines.
+                    .ok_or(TransportError::NotReady)?
+                    .nseconds(),
+            ),
+        };
+        let pts = frame
+            .pts_ns
+            .checked_sub(origin.0)
+            .and_then(|elapsed| origin.1.checked_add(elapsed))
+            .ok_or(ProtocolError::InvalidPayload)?;
+        buffer_mut.set_pts(gst::ClockTime::from_nseconds(pts));
+        buffer_mut.set_dts(gst::ClockTime::from_nseconds(pts));
         if !frame.keyframe {
             buffer_mut.set_flags(gst::BufferFlags::DELTA_UNIT);
         }
@@ -115,6 +137,7 @@ impl Peer {
             engine.keyframe_requested.store(false, Ordering::Release);
         }
         sender.last_pts = Some(frame.pts_ns);
+        sender.timestamp_origin = Some(origin);
         Ok(())
     }
 }
@@ -126,7 +149,7 @@ pub(super) fn install(shared: &Arc<Shared>, engine: &Arc<Engine>) -> Result<()> 
     let generation = display.generation;
     if config.role == PeerRole::Agent {
         let bin = native(gst::parse::bin_from_description(
-            "appsrc name=source is-live=true format=time block=false max-buffers=2 max-bytes=16777216 ! h264parse config-interval=-1 ! rtph264pay config-interval=-1 pt=96 aggregate-mode=zero-latency ! capsfilter caps=\"application/x-rtp,media=video,encoding-name=H264,payload=96\"",
+            "appsrc name=source is-live=true format=time block=false max-buffers=2 max-bytes=16777216 ! h264parse config-interval=-1 ! rtph264pay config-interval=-1 pt=96 mtu=1200 aggregate-mode=zero-latency ! capsfilter caps=\"application/x-rtp,media=video,encoding-name=H264,payload=96\"",
             true,
         ))?;
         let source = bin
@@ -160,21 +183,29 @@ pub(super) fn install(shared: &Arc<Shared>, engine: &Arc<Engine>) -> Result<()> 
             });
         native(engine.pipeline.add(&bin))?;
         native(bin.link(&engine.webrtc))?;
+        let transceiver = bin
+            .static_pad("src")
+            .and_then(|pad| pad.peer())
+            .ok_or(TransportError::NativeOperation)?
+            .property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
+        enable_nack(&transceiver);
         native(bin.sync_state_with_parent())?;
         *engine.video.lock().unwrap() = Some(SenderState {
             source,
             generation,
             needs_keyframe: true,
             last_pts: None,
+            timestamp_origin: None,
         });
     } else {
-        let _: gst_webrtc::WebRTCRTPTransceiver = engine.webrtc.emit_by_name(
+        let transceiver: gst_webrtc::WebRTCRTPTransceiver = engine.webrtc.emit_by_name(
             "add-transceiver",
             &[
                 &gst_webrtc::WebRTCRTPTransceiverDirection::Recvonly,
                 &caps(),
             ],
         );
+        enable_nack(&transceiver);
         let weak = Arc::downgrade(shared);
         let weak_engine = Arc::downgrade(engine);
         engine.webrtc.connect_pad_added(move |_, pad| {
@@ -194,6 +225,13 @@ pub(super) fn install(shared: &Arc<Shared>, engine: &Arc<Engine>) -> Result<()> 
     }
     Ok(())
 }
+/// Retransmit individual lost RTP packets (RFC 4588) instead of decoding
+/// around the hole; a PLI keyframe remains the fallback for late losses.
+fn enable_nack(transceiver: &gst_webrtc::WebRTCRTPTransceiver) {
+    if transceiver.find_property("do-nack").is_some() {
+        transceiver.set_property("do-nack", true);
+    }
+}
 fn engine_epoch(engine: &Weak<Engine>) -> u64 {
     engine.upgrade().map_or(u64::MAX, |e| e.epoch)
 }
@@ -204,7 +242,7 @@ fn receive(
     generation: u64,
 ) -> Result<()> {
     let bin = native(gst::parse::bin_from_description(
-        "rtph264depay request-keyframe=true wait-for-keyframe=true ! h264parse ! video/x-h264,width=(int)[1,3840],height=(int)[1,2160] ! avdec_h264 max-threads=2 ! videoconvert ! video/x-raw,format=RGBA ! appsink name=frames emit-signals=true max-buffers=1 drop=true sync=false",
+        "rtph264depay request-keyframe=true wait-for-keyframe=true ! h264parse ! video/x-h264,width=(int)[1,3840],height=(int)[1,2160] ! avdec_h264 max-threads=2 thread-type=slice output-corrupt=false ! videoconvert n-threads=2 ! video/x-raw,format=RGBA ! appsink name=frames emit-signals=true max-buffers=1 drop=true sync=false",
         true,
     ))?;
     let sink = bin
@@ -261,6 +299,9 @@ fn receive(
             if shared.frame.lock().unwrap().replace(frame).is_some() {
                 shared.counters.frames.fetch_add(1, Ordering::Relaxed);
             }
+            drop(_gate);
+            // Publish without waiting for the monitor tick when the consumer is idle.
+            shared.flush_frame();
             Ok(())
         })();
         Some(
@@ -310,6 +351,7 @@ pub(super) fn query_stats(shared: &Arc<Shared>, engine: &Arc<Engine>) {
             .map(|s| s.source.property("current-level-buffers"));
         let _gate = shared.event_gate.lock().unwrap();
         if shared.current(epoch) {
+            stats.sampled_at_ms = Some(shared.now_ms());
             *shared.counters.native.lock().unwrap() = stats;
         }
     });
@@ -408,6 +450,148 @@ mod tests {
                 .keyframe_requested
                 .load(Ordering::Acquire)
         );
+        peer.close();
+    }
+
+    #[test]
+    fn temporarily_unavailable_live_clock_retries_without_retiring_authorized_peer() {
+        let peer = Peer::new(super::super::tests::config(PeerRole::Agent)).unwrap();
+        peer.enable_h264().unwrap();
+        let engine = peer.shared.engine().unwrap();
+        let clock = engine.pipeline.clock().unwrap();
+        // Model the native pipeline's pre-clock state with a real GstPipeline.
+        // Missing running time is documented during state changes, not a fatal
+        // media operation. Do not commit an origin until a clock becomes usable.
+        engine.pipeline.set_clock(None::<&gst::Clock>).unwrap();
+        assert!(engine.pipeline.current_running_time().is_none());
+        let frame = EncodedFrame {
+            generation: 7,
+            pts_ns: 0,
+            keyframe: true,
+            data: vec![0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68, 0, 0, 0, 1, 0x65],
+        };
+        let waiting = peer.push_video(frame.clone());
+        engine.pipeline.set_clock(Some(&clock)).unwrap();
+        assert_eq!(waiting, Err(TransportError::NotReady));
+        assert!(!peer.is_closed());
+        assert!(
+            engine
+                .video
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .timestamp_origin
+                .is_none()
+        );
+        peer.push_video(frame).unwrap();
+        assert!(
+            engine
+                .video
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .timestamp_origin
+                .is_some()
+        );
+        peer.close();
+    }
+
+    #[test]
+    fn capture_pts_are_rebased_to_live_pipeline_time_without_losing_cadence() {
+        let peer = Peer::new(super::super::tests::config(PeerRole::Agent)).unwrap();
+        peer.enable_h264().unwrap();
+        let engine = peer.shared.engine().unwrap();
+        let source = engine
+            .video
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .source
+            .clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = source
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(gst::PadProbeData::Buffer(buffer)) = &info.data {
+                    tx.send(buffer.pts().unwrap().nseconds()).unwrap();
+                }
+                // This test inspects appsrc timestamps, without needing an SDP peer.
+                gst::PadProbeReturn::Drop
+            })
+            .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let before = engine.pipeline.current_running_time().unwrap().nseconds();
+        let frame = EncodedFrame {
+            generation: 7,
+            pts_ns: 9_000_000_000,
+            keyframe: true,
+            data: vec![0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68, 0, 0, 0, 1, 0x65],
+        };
+        peer.push_video(frame.clone()).unwrap();
+        let first = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let after = engine.pipeline.current_running_time().unwrap().nseconds();
+        assert!(
+            (before..=after).contains(&first),
+            "capture clock must map to live running time"
+        );
+        let mut second = frame.clone();
+        second.pts_ns += 33_333_333;
+        peer.push_video(second).unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap() - first,
+            33_333_333
+        );
+        let mut backwards = frame;
+        backwards.pts_ns -= 1;
+        assert_eq!(
+            peer.push_video(backwards),
+            Err(ProtocolError::InvalidPayload.into())
+        );
+        source.static_pad("src").unwrap().remove_probe(probe);
+        peer.close();
+    }
+
+    #[test]
+    fn occupied_event_slot_retains_latest_decoded_frame_until_consumer_catches_up() {
+        let mut peer = Peer::new(super::super::tests::config(PeerRole::Controller)).unwrap();
+        peer.shared
+            .events
+            .try_send(PeerEvent::Stats(PeerStats::default()))
+            .ok()
+            .unwrap();
+        peer.publish_frame(DecodedFrame {
+            generation: 7,
+            width: 1,
+            height: 1,
+            rgba: vec![0; 4],
+            pts_ns: Some(42),
+        })
+        .unwrap();
+        // Several monitor iterations must not discard the pending frame merely
+        // because an unrelated low-priority event occupies the delivery slot.
+        thread::sleep(Duration::from_millis(30));
+        assert!(peer.shared.frame.lock().unwrap().is_some());
+        assert_eq!(peer.stats().dropped_frames, 0);
+        let queued: Vec<_> = peer.events().try_iter().collect();
+        assert!(
+            queued
+                .iter()
+                .any(|event| matches!(event, PeerEvent::Stats(_)))
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Ok(PeerEvent::Frame(frame)) =
+                peer.events().recv_timeout(Duration::from_millis(10))
+            {
+                assert_eq!(frame.pts_ns, Some(42));
+                break;
+            }
+            assert!(Instant::now() < deadline, "pending frame was not delivered");
+        }
         peer.close();
     }
 

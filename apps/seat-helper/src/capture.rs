@@ -1,9 +1,9 @@
 //! Capture runs in a killable child: Xauthority is per-child and no encoder or
 //! pipe write can hold the parent's input/lease loop. The worker has no network.
 use crate::{Result, error, seat::DisplayTarget};
+use binachicken_protocol::*;
 #[cfg(any(target_os = "linux", test))]
 use gst::prelude::*;
-use remotevnc_protocol::*;
 use std::{
     io::{Read, Write},
     os::fd::AsRawFd,
@@ -95,7 +95,7 @@ impl Capture {
         let selected = encoder.clone();
         let request = commands.clone();
         let reader = thread::Builder::new()
-            .name("remotevnc-capture-reader".into())
+            .name("binachicken-capture-reader".into())
             .spawn(move || {
                 let mut header = [0];
                 if output.read_exact(&mut header).is_err() {
@@ -227,19 +227,28 @@ fn validate_target(t: &DisplayTarget) -> Result<()> {
     Ok(())
 }
 #[cfg(any(target_os = "linux", test))]
+const KEYFRAME_FALLBACK_SECS: u32 = 10;
+#[cfg(any(target_os = "linux", test))]
 fn encoder_description(encoder: VideoEncoder, p: VideoProfile) -> String {
+    // Loss recovery requests IDRs on demand (PLI/keyframe command), so periodic
+    // IDRs are only a fallback. Each one is a burst that itself risks packet loss.
+    let gop = p.fps.saturating_mul(KEYFRAME_FALLBACK_SECS);
     match encoder {
         VideoEncoder::X264 => format!(
-            "x264enc name=encoder tune=zerolatency speed-preset=ultrafast bframes=0 key-int-max={} bitrate={}",
-            p.fps, p.bitrate_kbps
+            // Constant quality keeps a static desktop sharp at almost no bitrate;
+            // the profile bitrate becomes a VBV ceiling for motion, and the short
+            // VBV bounds per-frame spikes. superfast keeps deblocking (ultrafast
+            // disables it, which smears text) at ~45 FPS 1080p on a 4-core laptop.
+            "x264enc name=encoder tune=zerolatency speed-preset=superfast bframes=0 key-int-max={gop} pass=qual quantizer=20 vbv-buf-capacity=300 bitrate={}",
+            p.bitrate_kbps
         ),
         VideoEncoder::Va => format!(
-            "vah264enc name=encoder b-frames=0 key-int-max={} bitrate={}",
-            p.fps, p.bitrate_kbps
+            "vah264enc name=encoder b-frames=0 key-int-max={gop} bitrate={}",
+            p.bitrate_kbps
         ),
         VideoEncoder::Nv => format!(
-            "nvh264enc name=encoder zerolatency=true bframes=0 gop-size={} bitrate={}",
-            p.fps, p.bitrate_kbps
+            "nvh264enc name=encoder zerolatency=true bframes=0 gop-size={gop} bitrate={}",
+            p.bitrate_kbps
         ),
         VideoEncoder::Auto => unreachable!(),
     }
@@ -248,11 +257,17 @@ fn encoder_description(encoder: VideoEncoder, p: VideoProfile) -> String {
 fn pipeline(source: &str, p: VideoProfile, encoder: VideoEncoder) -> Result<gst::Pipeline> {
     // Drop raw frames before inter-frame encoding. Never leak encoded deltas.
     let text = format!(
-        "{source} ! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream ! videoconvert ! videoscale ! videorate drop-only=true ! capsfilter name=profile caps-change-mode=delayed caps=\"video/x-raw,format=I420,width={},height={},framerate={}/1\" ! {} ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline ! appsink name=encoded max-buffers=2 drop=false sync=false",
+        "{source} ! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream ! videoconvert n-threads=2 ! videoscale n-threads=2 ! videorate drop-only=true ! capsfilter name=profile caps-change-mode=delayed caps=\"video/x-raw,format=I420,width={},height={},framerate={}/1\" ! {} ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au,profile={} ! appsink name=encoded max-buffers=2 drop=false sync=false",
         p.width,
         p.height,
         p.fps,
-        encoder_description(encoder, p)
+        encoder_description(encoder, p),
+        // CABAC and 8x8 transforms sharpen text; B-frames stay disabled.
+        if encoder == VideoEncoder::X264 {
+            "high"
+        } else {
+            "constrained-baseline"
+        }
     );
     gst::parse::launch(&text)?
         .downcast::<gst::Pipeline>()
@@ -568,6 +583,88 @@ mod tests {
             received, expected,
             "capture must flush a complete binary access unit even without a newline"
         );
+    }
+    #[test]
+    fn live_profile_change_updates_encoded_dimensions_and_limits_fps() {
+        gst::init().unwrap();
+        let initial = VideoProfile {
+            width: 320,
+            height: 240,
+            fps: 30,
+            encoder: VideoEncoder::X264,
+            ..VideoProfile::default()
+        };
+        let pipe = pipeline(
+            "videotestsrc is-live=true pattern=red",
+            initial,
+            VideoEncoder::X264,
+        )
+        .unwrap();
+        // Native streaming threads must stop even if a caps/PTS assertion fails.
+        struct StopPipeline<'a>(&'a gst::Pipeline);
+        impl Drop for StopPipeline<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.set_state(gst::State::Null);
+            }
+        }
+        let _stop = StopPipeline(&pipe);
+        let sink = pipe.by_name("encoded").unwrap();
+        pipe.set_state(gst::State::Playing).unwrap();
+        let first: Option<gst::Sample> = sink.emit_by_name("try-pull-sample", &[&3_000_000_000u64]);
+        let first = first.expect("initial encoded frame");
+        let initial_caps = first.caps().unwrap().structure(0).unwrap();
+        assert_eq!(initial_caps.get::<i32>("width").unwrap(), 320);
+        assert_eq!(initial_caps.get::<i32>("height").unwrap(), 240);
+        assert_eq!(
+            initial_caps.get::<gst::Fraction>("framerate").unwrap(),
+            gst::Fraction::new(30, 1)
+        );
+
+        apply_profile(
+            &pipe,
+            VideoProfile {
+                width: 240,
+                height: 180,
+                fps: 15,
+                ..initial
+            },
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut last_pts = None;
+        let mut stable_intervals = 0;
+        while stable_intervals < 4 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "live profile never produced stable 15 FPS encoded output"
+            );
+            let sample: Option<gst::Sample> =
+                sink.emit_by_name("try-pull-sample", &[&500_000_000u64]);
+            let Some(sample) = sample else {
+                continue;
+            };
+            let caps = sample.caps().unwrap().structure(0).unwrap();
+            let updated = caps.get::<i32>("width").unwrap() == 240
+                && caps.get::<i32>("height").unwrap() == 180
+                && caps.get::<gst::Fraction>("framerate").unwrap() == gst::Fraction::new(15, 1);
+            if !updated {
+                assert!(
+                    last_pts.is_none(),
+                    "encoded output reverted to the old profile"
+                );
+                continue;
+            }
+            let pts = sample.buffer().unwrap().pts().unwrap().nseconds();
+            if let Some(previous) = last_pts {
+                assert!(
+                    pts >= previous + 60_000_000,
+                    "encoded frame spacing {spacing}ns exceeds the 15 FPS limit",
+                    spacing = pts.saturating_sub(previous)
+                );
+                stable_intervals += 1;
+            }
+            last_pts = Some(pts);
+        }
     }
     #[test]
     fn real_pattern_encoder_has_config_keyframes_and_no_reordering() {

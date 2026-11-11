@@ -46,7 +46,7 @@ async fn enrolled_public_key_cannot_be_assigned_to_another_subject() {
     assert!(auth.confirm(&login.confirmation, &b.display_code).is_err());
     assert!(
         service
-            .begin_enrollment(remotevnc_protocol::EnrollmentRequest {
+            .begin_enrollment(binachicken_protocol::EnrollmentRequest {
                 name: "duplicate".into(),
                 public_key: {
                     use base64::Engine;
@@ -61,9 +61,9 @@ async fn enrolled_public_key_cannot_be_assigned_to_another_subject() {
 #[tokio::test]
 async fn http_sdk_enrolls_confirms_authenticates_lists_and_revokes() {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use binachicken_device::{DeviceApi, DeviceIdentity};
+    use binachicken_protocol::EnrollmentStatus;
     use remotevnc_backend::{BackendState, router};
-    use remotevnc_device::{DeviceApi, DeviceIdentity};
-    use remotevnc_protocol::EnrollmentStatus;
     let issuer = Issuer::start().await;
     let dir = private_dir();
     let db = Database::open(dir.path().join("identity.db")).unwrap();
@@ -114,27 +114,11 @@ async fn http_sdk_enrolls_confirms_authenticates_lists_and_revokes() {
     assert_eq!(callback.headers()["referrer-policy"], "no-referrer");
     assert_eq!(callback.headers()["cache-control"], "no-store");
     let html = callback.text().await.unwrap();
-    assert!(html.contains("Office &lt;agent&gt;"));
-    assert!(html.contains("http-owner"));
+    assert!(html.contains("Google sign-in complete"));
+    assert!(html.contains("registered"));
+    assert!(!html.contains("http-owner"));
     assert!(!html.contains(&enrollment.display_code));
     assert!(!html.contains(&enrollment.polling_verifier));
-    let confirmation = html
-        .split("name=\"confirmation\" value=\"")
-        .nth(1)
-        .unwrap()
-        .split('"')
-        .next()
-        .unwrap();
-    let response = http
-        .post(format!("{base}/auth/google/confirm"))
-        .form(&[
-            ("confirmation", confirmation),
-            ("display_code", &enrollment.display_code),
-        ])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
     let EnrollmentStatus::Enrolled { device_id } = api.poll_enrollment(&enrollment).await.unwrap()
     else {
         panic!("not enrolled")
@@ -238,7 +222,7 @@ async fn active_device_quota_bounds_listing_and_revocation_frees_a_slot() {
     );
     assert_eq!(service.list(&token.token).unwrap().len(), 1000);
     service
-        .revoke(&token.token, remotevnc_protocol::DeviceId(removable))
+        .revoke(&token.token, binachicken_protocol::DeviceId(removable))
         .await
         .unwrap();
     assert!(

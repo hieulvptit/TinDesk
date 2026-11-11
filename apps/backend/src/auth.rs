@@ -240,6 +240,59 @@ impl AuthService {
             Err(Error::Invalid)
         }
     }
+
+    /// Complete a device registration after the enrollment-bound Google login succeeds.
+    /// The OAuth state and PKCE verifier are consumed before this capability is issued.
+    pub fn auto_confirm(&self, confirmation: &str) -> Result<()> {
+        if confirmation.len() > 128 {
+            return Err(Error::Invalid);
+        }
+        let accepted = self.db.transaction(|tx| {
+            let row = tx
+                .query_row(
+                    "DELETE FROM confirmations WHERE token_hash=? RETURNING
+                 enrollment_id,subject,expires_at",
+                    [hash(confirmation)],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((id, subject, expiry)) = row else {
+                return Ok(false);
+            };
+            if expiry <= now() {
+                return Ok(false);
+            }
+            let valid = tx
+                .query_row(
+                    "SELECT id FROM enrollments WHERE id=? AND consumed=0 AND owner IS NULL AND
+                 expires_at>? AND NOT EXISTS(SELECT 1 FROM devices d WHERE
+                 d.public_key=enrollments.public_key)",
+                    params![id, now()],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .is_some();
+            if !valid {
+                return Ok(false);
+            }
+            tx.execute("INSERT OR IGNORE INTO users(subject) VALUES(?)", [&subject])?;
+            Ok(tx.execute(
+                "UPDATE enrollments SET owner=? WHERE id=? AND owner IS NULL AND consumed=0",
+                params![subject, id],
+            )? == 1)
+        })?;
+        if accepted {
+            Ok(())
+        } else {
+            Err(Error::Invalid)
+        }
+    }
 }
 /// The standard OIDC client uses this bounded transport for discovery, JWKS and token exchange.
 async fn bounded_http(request: HttpRequest) -> Result<HttpResponse> {

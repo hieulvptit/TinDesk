@@ -1,11 +1,11 @@
 use crate::{
     Result, TransportError,
-    channels::{CONTROL, InputDecoder, MOTION, channel_for},
+    channels::{CONTROL, InputDecoder, MOTION, SYNC, channel_for},
     stats::{Counters, PeerStats},
 };
+use binachicken_protocol::*;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use gst::prelude::*;
-use remotevnc_protocol::*;
 use std::{
     collections::HashMap,
     sync::{
@@ -22,6 +22,10 @@ const CRITICAL_LIMIT: usize = 128; // two slots reserved for terminal error/clos
 const LOW_PRIORITY_LIMIT: usize = 1;
 const MAX_EARLY_ICE: usize = 128;
 const MAX_SCTP_BUFFER: u64 = 256 * 1024;
+/// Local send backlog for sync frames; callers retry on QueueFull instead of failing.
+const MAX_SYNC_BUFFER: u64 = 512 * 1024;
+/// Peers are window-limited (SYNC_WINDOW per transfer); beyond this they violate flow control.
+const SYNC_QUEUE_CAPACITY: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerRole {
@@ -144,6 +148,7 @@ struct Shared {
     negotiation_ready: AtomicBool,
     events: Sender<PeerEvent>,
     events_drain: Receiver<PeerEvent>,
+    sync_tx: Sender<Vec<u8>>,
     event_gate: Mutex<()>,
     input: Mutex<InputDecoder>,
     send_gate: Mutex<()>,
@@ -241,6 +246,28 @@ impl Shared {
         });
         Ok(())
     }
+    fn flush_frame(&self) {
+        let _gate = self.event_gate.lock().unwrap();
+        if self.closed.load(Ordering::Acquire) || self.events.len() >= LOW_PRIORITY_LIMIT {
+            return;
+        }
+        // Keep the latest frame in its coalescing slot while the consumer is
+        // busy. Only a newer decoded frame may supersede it, not a stats event.
+        if let Some(frame) = self.frame.lock().unwrap().take() {
+            let _ = self.events.try_send(PeerEvent::Frame(frame));
+        }
+    }
+    /// Deliver the latest pointer position as soon as the queue has room. Unlike
+    /// a dropped intermediate position, the final one must never be discarded.
+    fn flush_motion(&self) {
+        let _gate = self.event_gate.lock().unwrap();
+        if self.closed.load(Ordering::Acquire) || self.events.len() >= LOW_PRIORITY_LIMIT {
+            return;
+        }
+        if let Some(input) = self.incoming_motion.lock().unwrap().take() {
+            let _ = self.events.try_send(PeerEvent::Input(input));
+        }
+    }
     fn low_priority(&self, event: PeerEvent) -> bool {
         let _gate = self.event_gate.lock().unwrap();
         !self.closed.load(Ordering::Acquire)
@@ -252,6 +279,7 @@ impl Shared {
 pub struct Peer {
     shared: Arc<Shared>,
     events: Receiver<PeerEvent>,
+    sync: Receiver<Vec<u8>>,
     monitor: Mutex<Option<JoinHandle<()>>>,
 }
 impl Peer {
@@ -269,6 +297,7 @@ impl Peer {
         }
         validate_ice(&config.ice_servers)?;
         let (tx, events) = bounded(EVENT_CAPACITY);
+        let (sync_tx, sync) = bounded(SYNC_QUEUE_CAPACITY);
         let input = InputDecoder::new(config.session_id, config.display, 0)?;
         let shared = Arc::new(Shared {
             #[cfg(test)]
@@ -284,6 +313,7 @@ impl Peer {
             negotiation_ready: AtomicBool::new(true),
             events: tx,
             events_drain: events.clone(),
+            sync_tx,
             event_gate: Mutex::new(()),
             input: Mutex::new(input),
             send_gate: Mutex::new(()),
@@ -297,7 +327,7 @@ impl Peer {
         *shared.engine.lock().unwrap() = Some(engine);
         let monitor_shared = shared.clone();
         let monitor = match thread::Builder::new()
-            .name("remotevnc-peer".into())
+            .name("binachicken-peer".into())
             .spawn(move || monitor_peer(monitor_shared))
         {
             Ok(monitor) => monitor,
@@ -322,6 +352,7 @@ impl Peer {
         Ok(Self {
             shared,
             events,
+            sync,
             monitor: Mutex::new(Some(monitor)),
         })
     }
@@ -481,6 +512,38 @@ impl Peer {
         }
         Ok(())
     }
+    /// Raw `sync` channel frames, in order. Reset any in-progress receive state
+    /// on every `ChannelsReady`, which marks a fresh PeerConnection epoch.
+    pub fn sync_events(&self) -> &Receiver<Vec<u8>> {
+        &self.sync
+    }
+    /// Either role may send. `QueueFull` is backpressure, not a failure: retry later.
+    pub fn send_sync(&self, frame: &[u8]) -> Result<()> {
+        if frame.len() > SYNC_FRAME_LIMIT {
+            return Err(TransportError::Protocol(ProtocolError::ControlTooLarge));
+        }
+        let _rebuild = self.shared.rebuild.lock().unwrap();
+        let _send = self.shared.send_gate.lock().unwrap();
+        let engine = self.shared.engine()?;
+        let channel = engine
+            .channels
+            .lock()
+            .unwrap()
+            .get(SYNC.label)
+            .cloned()
+            .ok_or(TransportError::NotReady)?;
+        if channel.ready_state() != gst_webrtc::WebRTCDataChannelState::Open {
+            return Err(TransportError::NotReady);
+        }
+        if channel.buffered_amount().saturating_add(frame.len() as u64) > MAX_SYNC_BUFFER {
+            return Err(TransportError::QueueFull);
+        }
+        channel
+            .send_data_full(Some(&gst::glib::Bytes::from(frame)))
+            .map_err(|_| TransportError::NativeOperation)?;
+        self.shared.counters.sent.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
     pub fn send_input(&self, input: InputEnvelope) -> Result<()> {
         let _rebuild = self.shared.rebuild.lock().unwrap();
         let _send = self.shared.send_gate.lock().unwrap();
@@ -506,15 +569,20 @@ impl Peer {
             .unwrap()
             .decode(label, &bytes, self.shared.now_ms())?;
         if label == MOTION.label {
-            if self
-                .shared
-                .outgoing_motion
-                .lock()
-                .unwrap()
-                .replace(bytes)
-                .is_some()
-            {
+            // The monitor also holds the lifecycle lock, so a direct send cannot
+            // race an older coalesced position. Coalesce only while SCTP is backed up.
+            let mut pending = self.shared.outgoing_motion.lock().unwrap();
+            if pending.take().is_some() {
                 self.shared.counters.motion.fetch_add(1, Ordering::Relaxed);
+            }
+            if channel.buffered_amount() == 0
+                && channel
+                    .send_data_full(Some(&gst::glib::Bytes::from(&bytes[..])))
+                    .is_ok()
+            {
+                self.shared.counters.sent.fetch_add(1, Ordering::Relaxed);
+            } else {
+                *pending = Some(bytes);
             }
             return Ok(());
         }
@@ -714,7 +782,7 @@ mod tests {
                     .values()
                     .filter(|c| c.ready_state() == gst_webrtc::WebRTCDataChannelState::Open)
                     .count()
-                    == 2
+                    == 3
             });
             if ready {
                 return (a, b);

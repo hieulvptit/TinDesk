@@ -1,4 +1,4 @@
-use remotevnc_protocol::*;
+use binachicken_protocol::*;
 
 fn display() -> DisplayInfo {
     DisplayInfo {
@@ -259,4 +259,36 @@ fn accepting_input_does_not_renew_the_lease() {
         .accept(&envelope(InputEvent::ReleaseAll, 1), 59_999)
         .unwrap();
     assert!(guard.expired(60_000));
+}
+
+#[test]
+fn controller_video_settings_validate_bounds_and_keep_encoder_selection_local() {
+    let mut guard = guard();
+    let valid = VideoProfile {
+        width: 1280,
+        height: 720,
+        fps: 20,
+        ..VideoProfile::default()
+    };
+    assert!(
+        guard
+            .accept(&envelope(InputEvent::VideoProfile { profile: valid }, 1), 0)
+            .is_ok()
+    );
+    for profile in [
+        VideoProfile { fps: 61, ..valid },
+        VideoProfile {
+            encoder: VideoEncoder::X264,
+            ..valid
+        },
+        VideoProfile {
+            width: 1279,
+            ..valid
+        },
+    ] {
+        assert_eq!(
+            guard.accept(&envelope(InputEvent::VideoProfile { profile }, 2), 0),
+            Err(ProtocolError::InvalidPayload)
+        );
+    }
 }

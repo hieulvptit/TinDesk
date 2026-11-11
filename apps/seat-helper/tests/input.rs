@@ -1,4 +1,4 @@
-use remotevnc_seat_helper::input::unicode_keysym;
+use binachicken_seat_helper::input::unicode_keysym;
 #[test]
 fn unicode_keysyms_preserve_scalar_values() {
     assert_eq!(unicode_keysym('a').unwrap(), 0x61);
@@ -7,8 +7,8 @@ fn unicode_keysyms_preserve_scalar_values() {
     assert!(unicode_keysym('\0').is_err());
 }
 
-fn target() -> remotevnc_seat_helper::seat::DisplayTarget {
-    use remotevnc_seat_helper::seat::*;
+fn target() -> binachicken_seat_helper::seat::DisplayTarget {
+    use binachicken_seat_helper::seat::*;
     DisplayTarget {
         seat: "test-only".into(),
         display: std::env::var("DISPLAY").unwrap(),
@@ -31,8 +31,8 @@ fn target() -> remotevnc_seat_helper::seat::DisplayTarget {
 #[test]
 #[ignore = "requires scripts/test-x11.sh Xvfb fixture"]
 fn x11_releases_keys_buttons_and_restores_keymap_after_error() {
-    use remotevnc_protocol::*;
-    use remotevnc_seat_helper::{input::X11Input, x11};
+    use binachicken_protocol::*;
+    use binachicken_seat_helper::{input::X11Input, x11};
     use x11rb::{
         connection::Connection,
         protocol::{
@@ -95,8 +95,8 @@ fn x11_releases_keys_buttons_and_restores_keymap_after_error() {
 #[test]
 #[ignore = "requires scripts/test-x11.sh GTK receiver"]
 fn gtk_receives_exact_unicode_without_duplicate_commit() {
-    use remotevnc_protocol::InputEvent;
-    use remotevnc_seat_helper::{input::X11Input, x11};
+    use binachicken_protocol::InputEvent;
+    use binachicken_seat_helper::{input::X11Input, x11};
     use x11rb::protocol::xkb::ConnectionExt as _;
     let t = target();
     let c = x11::connect(&t).unwrap();
@@ -148,8 +148,8 @@ fn gtk_receives_exact_unicode_without_duplicate_commit() {
 #[test]
 #[ignore = "requires scripts/test-x11.sh Xvfb fixture"]
 fn cancelled_long_text_restores_keymap_and_input_state_promptly() {
-    use remotevnc_protocol::InputEvent;
-    use remotevnc_seat_helper::{input::X11Input, x11};
+    use binachicken_protocol::InputEvent;
+    use binachicken_seat_helper::{input::X11Input, x11};
     use std::{cell::Cell, time::Instant};
     use x11rb::{connection::Connection, protocol::xproto::ConnectionExt};
     let t = target();
@@ -198,8 +198,8 @@ fn cancelled_long_text_restores_keymap_and_input_state_promptly() {
 #[test]
 #[ignore = "requires scripts/test-x11.sh Xvfb fixture"]
 fn remote_cleanup_does_not_release_unowned_local_input() {
-    use remotevnc_protocol::{InputEvent, MouseButton};
-    use remotevnc_seat_helper::{input::X11Input, x11};
+    use binachicken_protocol::{InputEvent, MouseButton};
+    use binachicken_seat_helper::{input::X11Input, x11};
     use x11rb::{
         connection::Connection,
         protocol::{
@@ -284,8 +284,8 @@ fn remote_cleanup_does_not_release_unowned_local_input() {
 #[test]
 #[ignore = "requires scripts/test-x11.sh Xvfb fixture"]
 fn remote_cleanup_preserves_local_back_and_forward_buttons() {
-    use remotevnc_protocol::{InputEvent, MouseButton};
-    use remotevnc_seat_helper::{input::X11Input, x11};
+    use binachicken_protocol::{InputEvent, MouseButton};
+    use binachicken_seat_helper::{input::X11Input, x11};
     use x11rb::{
         connection::Connection,
         protocol::{xinput::ConnectionExt as _, xproto, xtest::ConnectionExt as _},
@@ -372,8 +372,8 @@ fn remote_cleanup_preserves_local_back_and_forward_buttons() {
 #[test]
 #[ignore = "requires disposable Xvfb"]
 fn content_scroll_signs_reach_actual_x11_buttons_on_both_axes() {
-    use remotevnc_protocol::InputEvent;
-    use remotevnc_seat_helper::{input::X11Input, x11};
+    use binachicken_protocol::InputEvent;
+    use binachicken_seat_helper::{input::X11Input, x11};
     use x11rb::{
         connection::Connection,
         protocol::{Event, xproto::*},

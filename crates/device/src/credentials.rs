@@ -1,6 +1,6 @@
 use crate::{Error, Result};
+use binachicken_protocol::DeviceId;
 use ed25519_dalek::SigningKey;
-use remotevnc_protocol::DeviceId;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -199,6 +199,7 @@ impl CredentialStore for FileStore {
 pub struct KeychainStore {
     service: String,
     account: String,
+    helper: Option<std::path::PathBuf>,
 }
 #[cfg(target_os = "macos")]
 impl KeychainStore {
@@ -207,12 +208,76 @@ impl KeychainStore {
         Self {
             service: service.into(),
             account: account.into(),
+            helper: None,
+        }
+    }
+    /// A bundled stable helper avoids per-build cdhash partitions for local signing.
+    /// The helper verifies the client's pinned code signature before accessing this item.
+    pub fn with_helper(account: impl Into<String>, helper: std::path::PathBuf) -> Self {
+        Self {
+            service: "io.binachicken.client".into(),
+            account: account.into(),
+            helper: Some(helper),
+        }
+    }
+    fn helper(&self, action: &str, input: Option<&[u8]>) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        let mut child = Command::new(self.helper.as_ref().ok_or(Error::Storage)?)
+            .args([action, &self.account])
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|_| Error::Storage)?;
+        if let Some(input) = input {
+            let result = child.stdin.take().ok_or(Error::Storage)?.write_all(input);
+            if result.is_err() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Storage);
+            }
+        }
+        let output = child.wait_with_output().map_err(|_| Error::Storage)?;
+        let bytes = Zeroizing::new(output.stdout);
+        if output.status.success() && bytes.len() <= 4096 {
+            Ok(Some(bytes))
+        } else if action == "read" && output.status.code() == Some(3) {
+            Ok(None)
+        } else {
+            Err(Error::Storage)
+        }
+    }
+    pub fn delete(&self) -> Result<()> {
+        if self.helper.is_some() {
+            self.helper("delete", None).map(|_| ())
+        } else {
+            match security_framework::passwords::delete_generic_password(
+                &self.service,
+                &self.account,
+            ) {
+                Ok(()) => Ok(()),
+                Err(e) if e.code() == -25300 => Ok(()),
+                Err(_) => Err(Error::Storage),
+            }
         }
     }
 }
 #[cfg(target_os = "macos")]
 impl CredentialStore for KeychainStore {
     fn load(&self) -> Result<Option<StoredCredentials>> {
+        if self.helper.is_some() {
+            return self
+                .helper("read", None)?
+                .map(|bytes| decode(&bytes))
+                .transpose();
+        }
         match security_framework::passwords::get_generic_password(&self.service, &self.account) {
             Ok(bytes) => decode(&Zeroizing::new(bytes)).map(Some),
             Err(error) if error.code() == -25300 => Ok(None),
@@ -220,6 +285,11 @@ impl CredentialStore for KeychainStore {
         }
     }
     fn save(&self, credentials: &StoredCredentials) -> Result<()> {
+        if self.helper.is_some() {
+            return self
+                .helper("write", Some(&encode(credentials)?))
+                .map(|_| ());
+        }
         security_framework::passwords::set_generic_password(
             &self.service,
             &self.account,

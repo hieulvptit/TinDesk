@@ -1,5 +1,5 @@
-use remotevnc_client::{app::Authority, video::LatestFrame};
-use remotevnc_transport::DecodedFrame;
+use binachicken_client::{app::Authority, video::LatestFrame};
+use binachicken_transport::DecodedFrame;
 #[test]
 fn delayed_and_duplicate_grants_never_gain_authority_from_receipt_or_display() {
     let mut a = Authority::default();
@@ -27,9 +27,9 @@ fn newest_decoded_frame_replaces_old_without_queueing() {
     assert_eq!(frames.take().unwrap().generation, 99);
     assert!(frames.take().is_none());
 }
-use remotevnc_client::app::ControllerSession;
-use remotevnc_protocol::*;
-use remotevnc_transport::{Peer, PeerConfig, PeerEvent, PeerRole};
+use binachicken_client::app::ControllerSession;
+use binachicken_protocol::*;
+use binachicken_transport::{Peer, PeerConfig, PeerEvent, PeerRole};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 fn grant() -> SessionGrant {
     SessionGrant {

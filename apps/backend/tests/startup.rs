@@ -24,7 +24,7 @@ fn production_binary_rejects_missing_or_invalid_auth_before_database_writes() {
         assert!(!stderr.contains("fixture-secret"));
         assert_eq!(
             stderr.trim(),
-            "RemoteVNC backend could not start or continue"
+            "BinaChicken backend could not start or continue"
         );
     }
 }
@@ -63,6 +63,6 @@ fn invalid_turn_file_is_rejected_before_database_or_discovery() {
     assert!(!database.exists());
     assert_eq!(
         String::from_utf8(output.stderr).unwrap().trim(),
-        "RemoteVNC backend could not start or continue"
+        "BinaChicken backend could not start or continue"
     );
 }

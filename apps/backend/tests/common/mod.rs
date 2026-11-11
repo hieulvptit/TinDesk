@@ -208,27 +208,27 @@ pub fn device_key(byte: u8) -> ed25519_dalek::SigningKey {
 pub fn begin(
     service: &remotevnc_backend::devices::DeviceService,
     key: &ed25519_dalek::SigningKey,
-) -> remotevnc_protocol::Enrollment {
+) -> binachicken_protocol::Enrollment {
     service
-        .begin_enrollment(remotevnc_protocol::EnrollmentRequest {
+        .begin_enrollment(binachicken_protocol::EnrollmentRequest {
             name: "Office <agent>".into(),
             public_key: URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
         })
         .unwrap()
 }
 pub fn poll(
-    enrollment: &remotevnc_protocol::Enrollment,
+    enrollment: &binachicken_protocol::Enrollment,
     key: &ed25519_dalek::SigningKey,
-) -> remotevnc_protocol::EnrollmentPoll {
-    remotevnc_protocol::EnrollmentPoll {
+) -> binachicken_protocol::EnrollmentPoll {
+    binachicken_protocol::EnrollmentPoll {
         polling_verifier: enrollment.polling_verifier.clone(),
-        signature: remotevnc_protocol::sign_challenge(key, &enrollment.challenge).unwrap(),
+        signature: binachicken_protocol::sign_challenge(key, &enrollment.challenge).unwrap(),
     }
 }
 pub async fn confirm(
     issuer: &Issuer,
     auth: &AuthService,
-    e: &remotevnc_protocol::Enrollment,
+    e: &binachicken_protocol::Enrollment,
     sub: &str,
 ) {
     let (code, state) = issuer.issue(&auth.start_login(&e.id).unwrap(), sub, Fault::None);
@@ -237,14 +237,14 @@ pub async fn confirm(
 }
 pub fn access(
     service: &remotevnc_backend::devices::DeviceService,
-    id: remotevnc_protocol::DeviceId,
+    id: binachicken_protocol::DeviceId,
     key: &ed25519_dalek::SigningKey,
-) -> remotevnc_protocol::AccessToken {
+) -> binachicken_protocol::AccessToken {
     let c = service.challenge(id).unwrap();
     service
-        .authenticate(remotevnc_protocol::DeviceProof {
+        .authenticate(binachicken_protocol::DeviceProof {
             challenge_id: c.id,
-            signature: remotevnc_protocol::sign_challenge(key, &c.challenge).unwrap(),
+            signature: binachicken_protocol::sign_challenge(key, &c.challenge).unwrap(),
         })
         .unwrap()
 }
@@ -263,7 +263,7 @@ pub struct SessionFixture {
     pub directory: tempfile::TempDir,
     pub db: Database,
     pub devices: remotevnc_backend::devices::DeviceService,
-    pub ids: [remotevnc_protocol::DeviceId; 4],
+    pub ids: [binachicken_protocol::DeviceId; 4],
     pub tokens: [String; 4],
 }
 impl SessionFixture {
@@ -284,7 +284,7 @@ pub fn session_fixture() -> SessionFixture {
     let c = rusqlite::Connection::open(&path).unwrap();
     c.execute("INSERT INTO users(subject) VALUES('owner'),('other')", [])
         .unwrap();
-    let ids = std::array::from_fn(|_| remotevnc_protocol::DeviceId(uuid::Uuid::new_v4()));
+    let ids = std::array::from_fn(|_| binachicken_protocol::DeviceId(uuid::Uuid::new_v4()));
     let tokens = std::array::from_fn(|_| uuid::Uuid::new_v4().to_string());
     for index in 0..4 {
         c.execute(

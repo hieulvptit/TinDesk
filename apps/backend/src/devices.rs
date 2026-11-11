@@ -4,9 +4,9 @@ use crate::{
     db::{Database, hash, now, random},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use binachicken_protocol::*;
 use ed25519_dalek::VerifyingKey;
 use rand::RngCore;
-use remotevnc_protocol::*;
 use rusqlite::{OptionalExtension, Transaction, params};
 use uuid::Uuid;
 

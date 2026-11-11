@@ -1,5 +1,5 @@
 use crate::{Result, capture::Capture, error, input::X11Input, seat::DisplayTarget};
-use remotevnc_protocol::*;
+use binachicken_protocol::*;
 use std::{
     io::{ErrorKind, Read, Write},
     os::{fd::AsRawFd, unix::net::UnixStream},
@@ -358,7 +358,7 @@ pub fn serve(
         generation,
         now_ms,
         stop,
-        std::path::Path::new("/run/remotevnc-guardian/guardian.sock"),
+        std::path::Path::new("/run/binachicken-guardian/guardian.sock"),
     )
 }
 /// Trusted embedding/tests may select a local guardian endpoint. No network
@@ -384,12 +384,21 @@ pub fn serve_with_guardian(
     let mut target = None;
     let mut policy = SessionPolicy::default();
     let mut frames = FrameDecoder::default();
+    // An exited X server (LightDM retires the lock-screen greeter's server on
+    // unlock) is a display transition, not a helper failure: rescan instead of
+    // ending the authorized session. A live server keeps the fail-closed paths.
+    let mut display_lost = false;
     loop {
-        if let Some(input) = input.as_mut()
-            && input.poll_recovery().is_err()
-        {
-            capture.take();
-            return Ok(());
+        if let Some(i) = input.as_mut() {
+            let recovery_failed = i.poll_recovery().is_err();
+            if (recovery_failed || !i.guardian_healthy()) && !i.server_alive() {
+                capture.take();
+                input.take();
+                display_lost = true;
+            } else if recovery_failed {
+                capture.take();
+                return Ok(());
+            }
         }
         // Cancellation is checked before discovery and while loginctl is waiting.
         let cancelled = || {
@@ -426,6 +435,7 @@ pub fn serve_with_guardian(
             return Ok(());
         }
         if current != target {
+            display_lost = false;
             pending_input.clear();
             capture.take();
             input.take();
@@ -466,10 +476,11 @@ pub fn serve_with_guardian(
                 }
             }
         }
-        if capture_stopped {
-            if let Some(capture) = capture.as_mut() {
+        if capture_stopped || display_lost {
+            display_lost = false;
+            if capture_stopped && let Some(capture) = capture.as_mut() {
                 let failure = capture.failure();
-                eprintln!("remotevnc-seat-helper: {failure}");
+                eprintln!("binachicken-seat-helper: {failure}");
                 output.event(HelperEvent::CaptureFailed(failure))?;
             }
             pending_input.clear();
@@ -492,16 +503,32 @@ pub fn serve_with_guardian(
             }
             continue;
         }
-        // One scalar (including its full restoration) or one ordinary event per
-        // turn. No accepted input can extend authority; recheck at delivery.
-        if let Some(event) = pending_input.next() {
+        // Drain a bounded batch so a key press/release pair or a click arriving in
+        // one read is not spread across socket read timeouts. Each scalar (with
+        // its full restoration) is still atomic; no accepted input can extend
+        // authority, so policy is rechecked at every delivery.
+        let batch_started = std::time::Instant::now();
+        for _ in 0..16 {
+            let Some(event) = pending_input.next() else {
+                break;
+            };
             policy.validate(event.session_id, event.generation, now_ms())?;
-            input
-                .as_mut()
-                .ok_or("no active X11 input")?
-                .apply_with_cancel(&event.event, || {
-                    stop.load(Ordering::Relaxed) || policy.expired(now_ms()) || disconnected(peer)
-                })?;
+            let active = input.as_mut().ok_or("no active X11 input")?;
+            if let Err(error) = active.apply_with_cancel(&event.event, || {
+                stop.load(Ordering::Relaxed) || policy.expired(now_ms()) || disconnected(peer)
+            }) {
+                if active.server_alive() {
+                    return Err(error);
+                }
+                pending_input.clear();
+                capture.take();
+                input.take();
+                display_lost = true;
+                break;
+            }
+            if batch_started.elapsed() >= std::time::Duration::from_millis(4) {
+                break;
+            }
         }
         let mut bytes = [0u8; 4096];
         let count = match peer.read(&mut bytes) {
@@ -674,7 +701,7 @@ impl Output {
                         break;
                     }
                 } else {
-                    std::thread::sleep(Duration::from_millis(2));
+                    std::thread::sleep(Duration::from_millis(1));
                 }
             }
             let _ = done.send(());

@@ -1,22 +1,25 @@
 #[path = "../../backend/tests/common/mod.rs"]
 mod common;
 use axum::{
-    extract::Request,
+    extract::{
+        FromRequestParts, Request,
+        ws::{CloseFrame, Message, WebSocketUpgrade, close_code},
+    },
     http::{Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
+use binachicken_client::{
+    app::{ClientCredentialStore, ClientRuntime, Config, ViewState},
+    video::LatestFrame,
+};
+use binachicken_device::{CredentialStore, StoredCredentials};
+use binachicken_protocol::*;
 use common::*;
 use remotevnc_backend::{
     BackendState, auth::AuthService, db::Database, devices::DeviceService,
     sessions::SessionService, turn::TurnClient,
 };
-use remotevnc_client::{
-    app::{ClientCredentialStore, ClientRuntime, Config, ViewState},
-    video::LatestFrame,
-};
-use remotevnc_device::{CredentialStore, StoredCredentials};
-use remotevnc_protocol::*;
 use std::{
     sync::{
         Arc, Mutex,
@@ -40,27 +43,27 @@ fn clone_credentials(c: &StoredCredentials) -> StoredCredentials {
     }
 }
 impl CredentialStore for MemoryStore {
-    fn load(&self) -> remotevnc_device::Result<Option<StoredCredentials>> {
+    fn load(&self) -> binachicken_device::Result<Option<StoredCredentials>> {
         Ok(self.record.lock().unwrap().as_ref().map(clone_credentials))
     }
-    fn save(&self, c: &StoredCredentials) -> remotevnc_device::Result<()> {
+    fn save(&self, c: &StoredCredentials) -> binachicken_device::Result<()> {
         let n = self.saves.fetch_add(1, Ordering::SeqCst) + 1;
         if n == self.fail_save.load(Ordering::SeqCst) {
-            return Err(remotevnc_device::Error::Storage);
+            return Err(binachicken_device::Error::Storage);
         }
         *self.record.lock().unwrap() = Some(clone_credentials(c));
         Ok(())
     }
 }
 impl ClientCredentialStore for MemoryStore {
-    fn delete(&self) -> remotevnc_device::Result<()> {
+    fn delete(&self) -> binachicken_device::Result<()> {
         let view = self.view.lock().unwrap();
         assert!(
             !view.connected && !view.ready && !view.signed_in,
             "worker/Peer stop precedes persistence deletion"
         );
         if self.fail_delete.load(Ordering::SeqCst) {
-            return Err(remotevnc_device::Error::Storage);
+            return Err(binachicken_device::Error::Storage);
         }
         self.record.lock().unwrap().take();
         self.deleted.store(true, Ordering::SeqCst);
@@ -87,6 +90,7 @@ struct Control {
     revoke_unavailable: AtomicBool,
     rotate: AtomicBool,
     offline_events: AtomicBool,
+    policy_close_once: AtomicBool,
 }
 struct Server {
     base: String,
@@ -123,6 +127,22 @@ async fn server(db: Database, store: Arc<MemoryStore>) -> Server {
             let checks = checks.clone();
             async move {
                 let path = request.uri().path().to_string();
+                if path == "/v1/events" && checks.policy_close_once.swap(false, Ordering::SeqCst) {
+                    let (mut parts, _) = request.into_parts();
+                    let ws = WebSocketUpgrade::from_request_parts(&mut parts, &())
+                        .await
+                        .unwrap();
+                    return ws
+                        .on_upgrade(|mut socket| async move {
+                            let _ = socket
+                                .send(Message::Close(Some(CloseFrame {
+                                    code: close_code::POLICY,
+                                    reason: "fixture session policy failure".into(),
+                                })))
+                                .await;
+                        })
+                        .into_response();
+                }
                 if path == "/v1/events" && checks.offline_events.load(Ordering::SeqCst) {
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 }
@@ -221,6 +241,70 @@ fn run(server: &Server, store: &Arc<MemoryStore>) -> ClientRuntime {
         store.clone(),
     )
     .unwrap()
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saturated_ui_commands_close_remote_input_without_signing_out() {
+    let f = session_fixture();
+    let store = store(Some(StoredCredentials {
+        device_id: Some(f.ids[0]),
+        signing_key: device_key(1),
+    }));
+    let server = server(f.db.clone(), store.clone()).await;
+    let runtime = run(&server, &store);
+    wait_for(|| store.view.lock().unwrap().status == "Choose an online Ubuntu agent").await;
+    // A busy native/media worker must not turn bounded UI backpressure into logout.
+    let mut rejected = false;
+    for _ in 0..10_000 {
+        if !runtime.connect(f.ids[1]) {
+            rejected = true;
+            break;
+        }
+    }
+    assert!(rejected, "fixture must actually saturate the command queue");
+    wait_for(|| {
+        let view = store.view.lock().unwrap();
+        runtime.is_finished()
+            || (view.status.contains("queue overloaded")
+                && !view.connected
+                && !view.ready
+                && !view.connection_requested)
+    })
+    .await;
+    assert!(
+        !runtime.is_finished(),
+        "UI backpressure stopped authentication"
+    );
+    let view = store.view.lock().unwrap();
+    assert!(view.signed_in);
+    assert!(!view.connected && !view.ready && !view.connection_requested);
+    assert!(!store.deleted.load(Ordering::SeqCst));
+    assert_eq!(store.saves.load(Ordering::SeqCst), 0);
+    drop(view);
+    drop(runtime);
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signaling_policy_close_rechecks_identity_without_signing_out_valid_device() {
+    let f = session_fixture();
+    let store = store(Some(StoredCredentials {
+        device_id: Some(f.ids[0]),
+        signing_key: device_key(1),
+    }));
+    let server = server(f.db.clone(), store.clone()).await;
+    server
+        .control
+        .policy_close_once
+        .store(true, Ordering::SeqCst);
+    let runtime = run(&server, &store);
+    wait_for(|| runtime.is_finished() || server.control.auths.load(Ordering::SeqCst) >= 3).await;
+    assert!(
+        !runtime.is_finished(),
+        "session policy closure was treated as account revocation"
+    );
+    wait_for(|| store.view.lock().unwrap().status == "Choose an online Ubuntu agent").await;
+    assert!(store.view.lock().unwrap().signed_in);
+    assert_eq!(store.saves.load(Ordering::SeqCst), 0);
+    assert!(!store.deleted.load(Ordering::SeqCst));
+    drop(runtime);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persists_candidate_before_poll_and_recovers_interrupted_final_save_with_signed_authentication()
@@ -363,8 +447,8 @@ fn encoded() -> EncodedFrame {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rotating_signed_sockets_keep_native_video_then_lost_restart_has_bounded_fallback() {
-    use remotevnc_device::DeviceApi;
-    use remotevnc_transport::{Peer, PeerConfig, PeerEvent, PeerRole};
+    use binachicken_device::DeviceApi;
+    use binachicken_transport::{Peer, PeerConfig, PeerEvent, PeerRole};
     let f = session_fixture();
     let store = store(Some(StoredCredentials {
         device_id: Some(f.ids[0]),
@@ -501,8 +585,8 @@ async fn revocation_cancels_recovery_intent() {
     recover_then_cancel(true).await;
 }
 async fn recover_then_cancel(revoke: bool) {
-    use remotevnc_device::DeviceApi;
-    use remotevnc_transport::{Peer, PeerConfig, PeerEvent, PeerRole};
+    use binachicken_device::DeviceApi;
+    use binachicken_transport::{Peer, PeerConfig, PeerEvent, PeerRole};
     let f = session_fixture();
     let store = store(Some(StoredCredentials {
         device_id: Some(f.ids[0]),
@@ -525,10 +609,24 @@ async fn recover_then_cancel(revoke: bool) {
     )
     .unwrap();
     wait_for(|| store.view.lock().unwrap().status == "Choose an online Ubuntu agent").await;
+    let requested_profile = VideoProfile {
+        width: 1280,
+        height: 720,
+        fps: 24,
+        ..VideoProfile::default()
+    };
+    assert!(runtime.set_video_profile(requested_profile));
     runtime.connect(f.ids[1]); // The only Connect command in this recovery exercise.
     let mut peer: Option<Peer> = None;
     let mut sessions = Vec::new();
     let mut ack = false;
+    let mut profile_received = false;
+    let mut profile_count = 0;
+    let mut changed_profile = false;
+    let updated_profile = VideoProfile {
+        fps: 15,
+        ..requested_profile
+    };
     let mut decoded = 0;
     let mut video = encoded();
     let mut last_video = Instant::now();
@@ -540,7 +638,7 @@ async fn recover_then_cancel(revoke: bool) {
                     assert!(!sessions.contains(&grant.session_id),"old authority revived");
                     let p=Peer::new(PeerConfig { session_id:grant.session_id,local_peer_id:grant.agent_id,remote_peer_id:grant.client_id,role:PeerRole::Agent,display:None,ice_servers:grant.ice_servers,relay_only:false }).unwrap();
                     p.enable_h264().unwrap(); p.update_display(DisplayInfo{generation:1,width:640,height:480}).unwrap();
-                    sessions.push(grant.session_id); peer=Some(p); ack=false; decoded=0;
+                    sessions.push(grant.session_id); peer=Some(p); ack=false; decoded=0; profile_received=false; profile_count=0;
                 },
                 DeviceEvent::Signal { message,.. }=>{if let Some(p)=&peer {let _=p.handle_signal(message);}},
                 _=>{}
@@ -567,6 +665,25 @@ async fn recover_then_cancel(revoke: bool) {
                         );
                         ack = true;
                     }
+                    PeerEvent::Input(InputEnvelope {
+                        event: InputEvent::VideoProfile { profile },
+                        ..
+                    }) => {
+                        assert!(
+                            ack,
+                            "video settings must follow physical display acknowledgement"
+                        );
+                        assert_eq!(
+                            profile,
+                            if changed_profile {
+                                updated_profile
+                            } else {
+                                requested_profile
+                            }
+                        );
+                        profile_received = true;
+                        profile_count += 1;
+                    }
                     _ => {}
                 }
             }
@@ -579,8 +696,12 @@ async fn recover_then_cancel(revoke: bool) {
         if frames.take().is_some() {
             decoded += 1;
         }
-        if ack && decoded >= 3 {
+        if ack && profile_received && decoded >= 3 {
             if sessions.len() == 1 {
+                assert_eq!(
+                    profile_count, 1,
+                    "readiness must not repeatedly reset adaptation"
+                );
                 // Remove the old session while the runtime cannot receive its
                 // close event. Reconnection must reconcile the missing grant
                 // then create fresh authority without another Connect command.
@@ -591,7 +712,17 @@ async fn recover_then_cancel(revoke: bool) {
                 peer.take();
                 decoded = 0;
                 ack = false;
+            } else if !changed_profile {
+                assert_eq!(profile_count, 1);
+                assert!(runtime.set_video_profile(updated_profile));
+                changed_profile = true;
+                profile_received = false;
+                decoded = 0;
             } else {
+                assert_eq!(
+                    profile_count, 2,
+                    "one manual change must produce one update"
+                );
                 break;
             }
         }
@@ -623,7 +754,7 @@ async fn recover_then_cancel(revoke: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn socket_outage_invalidates_missed_presence_and_role_change() {
-    use remotevnc_device::DeviceApi;
+    use binachicken_device::DeviceApi;
     let f = session_fixture();
     let store = store(Some(StoredCredentials {
         device_id: Some(f.ids[0]),

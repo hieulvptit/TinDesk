@@ -1,6 +1,6 @@
 #![cfg(unix)]
+use binachicken_device::{CredentialStore, FileStore, StoredCredentials};
 use ed25519_dalek::SigningKey;
-use remotevnc_device::{CredentialStore, FileStore, StoredCredentials};
 use std::os::unix::fs::{PermissionsExt, symlink};
 
 #[test]

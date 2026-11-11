@@ -1,7 +1,7 @@
 //! Real X server/process fixtures. Never used by the production display monitor.
 #![cfg(target_os = "linux")]
-use remotevnc_protocol::{InputEvent, MouseButton};
-use remotevnc_seat_helper::{input::X11Input, recovery, seat::*};
+use binachicken_protocol::{InputEvent, MouseButton};
+use binachicken_seat_helper::{input::X11Input, recovery, seat::*};
 use std::{
     os::unix::net::UnixListener,
     process::{Child, Command},
@@ -168,7 +168,7 @@ fn deny_syscall(number: libc::c_long, errno: u32, allow_signal_zero: bool) {
 }
 fn paused_producer(role: &str, socket: &std::path::Path) {
     use x11rb::protocol::{xproto, xtest::ConnectionExt as _};
-    let c = remotevnc_seat_helper::x11::connect(&target()).unwrap();
+    let c = binachicken_seat_helper::x11::connect(&target()).unwrap();
     c.xtest_get_version(2, 2).unwrap().reply().unwrap();
     let min = c.setup().min_keycode;
     let map = c
@@ -228,10 +228,10 @@ fn paused_producer(role: &str, socket: &std::path::Path) {
 #[test]
 #[ignore = "subprocess entry point for Xvfb recovery fixtures"]
 fn recovery_child() {
-    let Ok(role) = std::env::var("REMOTEVNC_RECOVERY_TEST_ROLE") else {
+    let Ok(role) = std::env::var("BINACHICKEN_RECOVERY_TEST_ROLE") else {
         return;
     };
-    let socket = std::env::var("REMOTEVNC_RECOVERY_TEST_SOCKET").unwrap();
+    let socket = std::env::var("BINACHICKEN_RECOVERY_TEST_SOCKET").unwrap();
     if matches!(role.as_str(), "late_key" | "late_eof" | "queued_key") {
         paused_producer(&role, socket.as_ref());
         return;
@@ -322,14 +322,16 @@ impl Drop for Fixture {
 fn launch(role: &str, socket: &std::path::Path) -> Child {
     Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "recovery_child", "--ignored", "--nocapture"])
-        .env("REMOTEVNC_RECOVERY_TEST_ROLE", role)
-        .env("REMOTEVNC_RECOVERY_TEST_SOCKET", socket)
+        .env("BINACHICKEN_RECOVERY_TEST_ROLE", role)
+        .env("BINACHICKEN_RECOVERY_TEST_SOCKET", socket)
         .spawn()
         .unwrap()
 }
 fn fixture(role: &str) -> Fixture {
-    let socket =
-        std::env::temp_dir().join(format!("remotevnc-recovery-{}.sock", uuid::Uuid::new_v4()));
+    let socket = std::env::temp_dir().join(format!(
+        "binachicken-recovery-{}.sock",
+        uuid::Uuid::new_v4()
+    ));
     let guardian = launch("guardian", &socket);
     wait(|| socket.exists());
     let helper = launch(role, &socket);
@@ -352,7 +354,7 @@ fn wait(mut condition: impl FnMut() -> bool) {
 #[test]
 #[ignore = "requires isolated Xvfb"]
 fn guardian_releases_real_keys_and_buttons_after_helper_sigkill() {
-    let c = remotevnc_seat_helper::x11::connect(&target()).unwrap();
+    let c = binachicken_seat_helper::x11::connect(&target()).unwrap();
     let root = c.setup().roots[0].root;
     let mut f = fixture("held");
     wait(|| {
@@ -382,7 +384,7 @@ fn guardian_releases_real_keys_and_buttons_after_helper_sigkill() {
 #[test]
 #[ignore = "requires isolated Xvfb"]
 fn guardian_restores_unicode_mapping_after_helper_sigkill() {
-    let c = remotevnc_seat_helper::x11::connect(&target()).unwrap();
+    let c = binachicken_seat_helper::x11::connect(&target()).unwrap();
     let min = c.setup().min_keycode;
     let count = c.setup().max_keycode - min + 1;
     let before = c
@@ -428,7 +430,7 @@ fn physical_overlap(kill_guardian: bool) {
         ConnectionExt as _, Device, DeviceType, InputClass, InputStateData,
     };
     use x11rb::protocol::xtest::ConnectionExt as _;
-    let c = remotevnc_seat_helper::x11::connect(&target()).unwrap();
+    let c = binachicken_seat_helper::x11::connect(&target()).unwrap();
     c.xinput_xi_query_version(2, 0).unwrap().reply().unwrap();
     let root = c.setup().roots[0].root;
     let devices = c
@@ -560,7 +562,7 @@ fn guardian_loss_during_setup_fails_closed_and_releases() {
     guardian_loss("setup_loss");
 }
 fn guardian_loss(role: &str) {
-    let c = remotevnc_seat_helper::x11::connect(&target()).unwrap();
+    let c = binachicken_seat_helper::x11::connect(&target()).unwrap();
     let mut f = fixture(role);
     wait(|| f.socket.with_extension("ready").exists());
     f.guardian.kill().unwrap();
@@ -594,7 +596,7 @@ fn guardian_never_restores_old_ownership_into_reset_xserver() {
     use std::os::fd::AsRawFd;
     use x11rb::protocol::{xproto, xtest::ConnectionExt as _};
     let t = target();
-    let c = remotevnc_seat_helper::x11::connect(&t).unwrap();
+    let c = binachicken_seat_helper::x11::connect(&t).unwrap();
     let probe = std::os::unix::net::UnixStream::connect(t.socket_path().unwrap()).unwrap();
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut size = std::mem::size_of_val(&cred) as libc::socklen_t;
@@ -639,7 +641,7 @@ fn guardian_never_restores_old_ownership_into_reset_xserver() {
         0,
         "same Xvfb process must survive reset"
     );
-    let fresh = remotevnc_seat_helper::x11::connect(&t).unwrap();
+    let fresh = binachicken_seat_helper::x11::connect(&t).unwrap();
     let min = fresh.setup().min_keycode;
     let map = fresh
         .get_keyboard_mapping(min, fresh.setup().max_keycode - min + 1)
@@ -678,9 +680,9 @@ fn guardian_never_restores_old_ownership_into_reset_xserver() {
 #[ignore = "requires isolated Xvfb"]
 fn graceful_input_cleanup_releases_before_guardian_eof() {
     let t = target();
-    let c = remotevnc_seat_helper::x11::connect(&t).unwrap();
+    let c = binachicken_seat_helper::x11::connect(&t).unwrap();
     let socket =
-        std::env::temp_dir().join(format!("remotevnc-normal-{}.sock", uuid::Uuid::new_v4()));
+        std::env::temp_dir().join(format!("binachicken-normal-{}.sock", uuid::Uuid::new_v4()));
     let mut guardian = launch("guardian", &socket);
     wait(|| socket.exists());
     let mut input =
@@ -709,7 +711,7 @@ fn graceful_input_cleanup_releases_before_guardian_eof() {
 #[test]
 #[ignore = "requires isolated Xvfb"]
 fn guardian_enforces_absolute_deadline_without_helper_traffic_extension() {
-    let c = remotevnc_seat_helper::x11::connect(&target()).unwrap();
+    let c = binachicken_seat_helper::x11::connect(&target()).unwrap();
     let mut f = fixture("deadline");
     wait(|| f.socket.with_extension("ready").exists());
     wait(|| f.helper.try_wait().unwrap().is_some());
@@ -751,7 +753,7 @@ fn physical_modifier(kill_helper: bool) {
         xproto,
         xtest::ConnectionExt as _,
     };
-    let c = remotevnc_seat_helper::x11::connect(&target()).unwrap();
+    let c = binachicken_seat_helper::x11::connect(&target()).unwrap();
     c.xinput_xi_query_version(2, 0).unwrap().reply().unwrap();
     let devices = c
         .xinput_xi_query_device(Device::ALL)
@@ -836,7 +838,7 @@ fn physical_modifier(kill_helper: bool) {
 #[ignore = "requires isolated Xvfb"]
 fn write_ahead_mapping_accepts_before_after_and_preserves_unrelated_changes() {
     let t = target();
-    let c = remotevnc_seat_helper::x11::connect(&t).unwrap();
+    let c = binachicken_seat_helper::x11::connect(&t).unwrap();
     let min = c.setup().min_keycode;
     let count = c.setup().max_keycode - min + 1;
     let original = c.get_keyboard_mapping(min, count).unwrap().reply().unwrap();
@@ -858,7 +860,7 @@ fn write_ahead_mapping_accepts_before_after_and_preserves_unrelated_changes() {
         (rearranged, false),
     ] {
         let socket =
-            std::env::temp_dir().join(format!("remotevnc-map-{}.sock", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("binachicken-map-{}.sock", uuid::Uuid::new_v4()));
         let mut guardian = launch("guardian", &socket);
         wait(|| socket.exists());
         let (mut stream, lifetime) =
@@ -921,7 +923,7 @@ fn delayed_mutation(role: &str) {
         xproto::{self, ChangeWindowAttributesAux, EventMask},
         xtest::ConnectionExt as _,
     };
-    let c = remotevnc_seat_helper::x11::connect(&target()).unwrap();
+    let c = binachicken_seat_helper::x11::connect(&target()).unwrap();
     c.change_window_attributes(
         c.setup().roots[0].root,
         &ChangeWindowAttributesAux::new().event_mask(EventMask::KEY_PRESS),
@@ -979,7 +981,7 @@ fn queued_x11_mutation_cannot_follow_producer_lifetime_destruction() {
         xproto::{self, ChangeWindowAttributesAux, EventMask},
         xtest::ConnectionExt as _,
     };
-    let c = remotevnc_seat_helper::x11::connect(&target()).unwrap();
+    let c = binachicken_seat_helper::x11::connect(&target()).unwrap();
     let root = c.setup().roots[0].root;
     c.change_window_attributes(
         root,
@@ -1052,10 +1054,10 @@ fn queued_x11_mutation_cannot_follow_producer_lifetime_destruction() {
 #[test]
 #[ignore = "requires isolated Xvfb and Linux seccomp fixture"]
 fn unsupported_peer_pidfd_rejects_admission_before_input() {
-    let c = remotevnc_seat_helper::x11::connect(&target()).unwrap();
+    let c = binachicken_seat_helper::x11::connect(&target()).unwrap();
     let before = c.query_keymap().unwrap().reply().unwrap().keys;
     let socket =
-        std::env::temp_dir().join(format!("remotevnc-pidfd-{}.sock", uuid::Uuid::new_v4()));
+        std::env::temp_dir().join(format!("binachicken-pidfd-{}.sock", uuid::Uuid::new_v4()));
     let mut guardian = launch("guardian_no_pidfd", &socket);
     wait(|| socket.exists());
     assert!(
@@ -1075,7 +1077,7 @@ fn unsupported_peer_pidfd_rejects_admission_before_input() {
 #[ignore = "requires isolated Xvfb and Linux seccomp fixture"]
 fn denied_pidfd_termination_retains_recovery_until_producer_is_gone() {
     let socket =
-        std::env::temp_dir().join(format!("remotevnc-pidfd-{}.sock", uuid::Uuid::new_v4()));
+        std::env::temp_dir().join(format!("binachicken-pidfd-{}.sock", uuid::Uuid::new_v4()));
     let guardian = launch("guardian_no_kill", &socket);
     wait(|| socket.exists());
     let helper = launch("late_key", &socket);
@@ -1112,13 +1114,15 @@ fn denied_pidfd_termination_retains_recovery_until_producer_is_gone() {
 #[ignore = "requires isolated Xvfb"]
 fn normal_unicode_cleanup_preserves_local_same_symbol_remap() {
     let t = target();
-    let c = remotevnc_seat_helper::x11::connect(&t).unwrap();
+    let c = binachicken_seat_helper::x11::connect(&t).unwrap();
     let min = c.setup().min_keycode;
     let count = c.setup().max_keycode - min + 1;
     let original = c.get_keyboard_mapping(min, count).unwrap().reply().unwrap();
     let per = original.keysyms_per_keycode as usize;
-    let socket =
-        std::env::temp_dir().join(format!("remotevnc-local-map-{}.sock", uuid::Uuid::new_v4()));
+    let socket = std::env::temp_dir().join(format!(
+        "binachicken-local-map-{}.sock",
+        uuid::Uuid::new_v4()
+    ));
     let mut guardian = launch("guardian", &socket);
     wait(|| socket.exists());
     let mut input =
@@ -1175,4 +1179,53 @@ fn normal_unicode_cleanup_preserves_local_same_symbol_remap() {
             .expect("fixture must make completed same-symbol local change")
     );
     std::fs::remove_file(socket).unwrap();
+}
+
+#[test]
+#[ignore = "requires Xvfb; starts and stops only its own private server"]
+fn guardian_spares_producer_when_its_xserver_exits() {
+    use std::os::unix::process::ExitStatusExt;
+    // Model LightDM retiring the lock-screen greeter's X server on unlock.
+    let dir = std::env::temp_dir().join(format!("binachicken-exit-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let authority = dir.join("authority");
+    std::fs::write(&authority, []).unwrap();
+    let number = dir.join("display");
+    let mut xvfb = Command::new("sh")
+        .arg("-c")
+        .arg("exec Xvfb -displayfd 3 -nolisten tcp -screen 0 800x600x24 3>\"$1\"")
+        .arg("sh")
+        .arg(&number)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    wait(|| std::fs::read_to_string(&number).is_ok_and(|n| n.ends_with('\n')));
+    let display = format!(":{}", std::fs::read_to_string(&number).unwrap().trim());
+    let socket = dir.join("guardian.sock");
+    let child = |role: &str| {
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "recovery_child", "--ignored", "--nocapture"])
+            .env("BINACHICKEN_RECOVERY_TEST_ROLE", role)
+            .env("BINACHICKEN_RECOVERY_TEST_SOCKET", &socket)
+            .env("DISPLAY", &display)
+            .env("XAUTHORITY", &authority)
+            .spawn()
+            .unwrap()
+    };
+    let mut guardian = child("guardian");
+    wait(|| socket.exists());
+    let mut helper = child("held");
+    wait(|| socket.with_extension("ready").exists());
+    xvfb.kill().unwrap();
+    xvfb.wait().unwrap();
+    wait(|| helper.try_wait().unwrap().is_some());
+    let status = helper.wait().unwrap();
+    wait(|| guardian.try_wait().unwrap().is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_ne!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "an exited X server must not make the guardian kill the producer"
+    );
+    assert!(status.success(), "producer observes the lost server itself");
 }

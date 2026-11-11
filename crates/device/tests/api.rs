@@ -1,5 +1,5 @@
+use binachicken_device::DeviceApi;
 use ed25519_dalek::SigningKey;
-use remotevnc_device::DeviceApi;
 
 #[test]
 fn constructor_accepts_https_and_only_loopback_http_including_ipv6() {

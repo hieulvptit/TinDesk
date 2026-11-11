@@ -1,9 +1,9 @@
 use super::{Command, Config, ControllerSession, NetworkEvent, ViewState};
 use crate::{Result, video::LatestFrame};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use remotevnc_device::{CredentialStore, DeviceApi, DeviceIdentity, StoredCredentials};
-use remotevnc_protocol::*;
-use remotevnc_transport::PeerStats;
+use binachicken_device::{CredentialStore, DeviceApi, DeviceIdentity, StoredCredentials};
+use binachicken_protocol::*;
+use binachicken_transport::PeerStats;
 use std::{
     sync::{
         Arc, Mutex,
@@ -11,7 +11,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 fn unix_ms() -> u64 {
     SystemTime::now()
@@ -26,8 +26,14 @@ pub struct ClientRuntime {
     revoke: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     commands: mpsc::Sender<Command>,
+    overloaded: Arc<Notify>,
 }
 impl ClientRuntime {
+    pub fn set_video_profile(&self, profile: VideoProfile) -> bool {
+        profile.validate().is_ok()
+            && profile.encoder == VideoEncoder::Auto
+            && self.send(Command::VideoProfile(profile))
+    }
     pub fn start(
         config: Config,
         state: Arc<Mutex<ViewState>>,
@@ -49,8 +55,10 @@ impl ClientRuntime {
         let revoke = Arc::new(AtomicBool::new(false));
         let should_revoke = revoke.clone();
         let (commands, rx) = mpsc::channel(64);
+        let overloaded = Arc::new(Notify::new());
+        let run_overloaded = overloaded.clone();
         let thread = std::thread::Builder::new()
-            .name("remotevnc-client".into())
+            .name("binachicken-client".into())
             .spawn(move || {
                 let state = run_state;
                 let result = (|| -> Result<()> {
@@ -63,6 +71,7 @@ impl ClientRuntime {
                         child,
                         should_revoke,
                         run_credentials,
+                        run_overloaded,
                     ))
                 })();
                 let mut state = state.lock().unwrap();
@@ -74,6 +83,8 @@ impl ClientRuntime {
                 state.enrollment = None;
                 state.presence.clear();
                 if let Err(e) = result {
+                    // All worker errors are fixed public messages; never log credentials or signals.
+                    eprintln!("binachicken-client: worker stopped: {e}");
                     state.status = e.to_string();
                 }
             })?;
@@ -84,14 +95,18 @@ impl ClientRuntime {
             revoke,
             thread: Some(thread),
             commands,
+            overloaded,
         })
     }
     pub(super) fn send(&self, command: Command) -> bool {
-        if self.commands.try_send(command).is_err() {
-            self.stop.cancel();
-            false
-        } else {
-            true
+        match self.commands.try_send(command) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Fail closed for remote input without cancelling account authentication.
+                self.overloaded.notify_one();
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
 }
@@ -135,40 +150,46 @@ impl Drop for ClientRuntime {
 }
 /// Persistence boundary: production uses only the origin-scoped macOS Keychain.
 pub trait ClientCredentialStore: CredentialStore + Send + Sync {
-    fn delete(&self) -> remotevnc_device::Result<()>;
+    fn delete(&self) -> binachicken_device::Result<()>;
 }
 #[cfg(target_os = "macos")]
 struct NativeCredentials {
-    origin: String,
+    store: binachicken_device::KeychainStore,
 }
 #[cfg(target_os = "macos")]
 impl CredentialStore for NativeCredentials {
-    fn load(&self) -> remotevnc_device::Result<Option<StoredCredentials>> {
-        remotevnc_device::KeychainStore::new("io.remotevnc.client", &self.origin).load()
+    fn load(&self) -> binachicken_device::Result<Option<StoredCredentials>> {
+        self.store.load()
     }
-    fn save(&self, credentials: &StoredCredentials) -> remotevnc_device::Result<()> {
-        remotevnc_device::KeychainStore::new("io.remotevnc.client", &self.origin).save(credentials)
+    fn save(&self, credentials: &StoredCredentials) -> binachicken_device::Result<()> {
+        self.store.save(credentials)
     }
 }
 #[cfg(target_os = "macos")]
 impl ClientCredentialStore for NativeCredentials {
-    fn delete(&self) -> remotevnc_device::Result<()> {
-        match security_framework::passwords::delete_generic_password(
-            "io.remotevnc.client",
-            &self.origin,
-        ) {
-            Ok(()) => Ok(()),
-            Err(e) if e.code() == -25300 => Ok(()),
-            Err(_) => Err(remotevnc_device::Error::Storage),
-        }
+    fn delete(&self) -> binachicken_device::Result<()> {
+        self.store.delete()
     }
 }
 pub(super) fn native_store(config: &Config) -> Result<Arc<dyn ClientCredentialStore>> {
     #[cfg(target_os = "macos")]
     {
-        Ok(Arc::new(NativeCredentials {
-            origin: config.backend.clone(),
-        }))
+        let executable = std::env::current_exe()?;
+        let macos = executable.parent().ok_or("invalid app executable")?;
+        let bundled = macos.file_name().is_some_and(|name| name == "MacOS")
+            && macos
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|name| name == "Contents"));
+        let store = if bundled {
+            // Missing/rejected helper is an error; do not silently prompt through another identity.
+            binachicken_device::KeychainStore::with_helper(
+                config.backend.clone(),
+                macos.parent().unwrap().join("Helpers/binachicken-keychain"),
+            )
+        } else {
+            binachicken_device::KeychainStore::new("io.binachicken.client", &config.backend)
+        };
+        Ok(Arc::new(NativeCredentials { store }))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -200,7 +221,7 @@ async fn enroll(
         };
         match api.authenticate(&identity).await {
             Ok(_) => return Ok((Arc::new(api), Arc::new(identity))),
-            Err(remotevnc_device::Error::Unauthorized) => {}
+            Err(binachicken_device::Error::Unauthorized) => {}
             Err(e) => return Err(e.into()),
         }
     }
@@ -214,7 +235,7 @@ async fn enroll(
             enrollment.display_code.clone(),
             enrollment.browser_url.clone(),
         ));
-        s.status="Confirm this device in your browser using the same Google account as your Ubuntu agent.".into();
+        s.status = "Finish Google sign-in in your browser to add this Mac to your account.".into();
     }
     while unix_ms() < enrollment.expires_at_unix_ms {
         match api.poll_enrollment(&enrollment).await? {
@@ -241,6 +262,7 @@ async fn run(
     stop: CancellationToken,
     revoke: Arc<AtomicBool>,
     credentials: Arc<dyn ClientCredentialStore>,
+    overloaded: Arc<Notify>,
 ) -> Result<()> {
     let (api, identity) = tokio::select! {biased;_=stop.cancelled()=>return Ok(()),result=enroll(&config,&state,credentials.as_ref())=>result?};
     {
@@ -261,25 +283,39 @@ async fn run(
         stop.clone(),
     ));
     let mut live: Option<ControllerSession> = None;
+    let mut video_profile = VideoProfile::default();
     let mut desired: Option<DeviceId> = None;
     let mut next_connect = Instant::now();
     let mut connect_backoff = Duration::from_millis(250);
     let mut closing = tokio::task::JoinSet::new();
     let mut outage: Option<Instant> = None;
     let mut reconciled = false;
-    let mut refresh: Option<tokio::task::JoinHandle<remotevnc_device::Result<Vec<DeviceSummary>>>> =
-        None;
+    let mut refresh: Option<
+        tokio::task::JoinHandle<binachicken_device::Result<Vec<DeviceSummary>>>,
+    > = None;
     let mut next_list = Instant::now();
-    let mut tick = tokio::time::interval(Duration::from_millis(10));
+    // Decoded frames cross this tick before the UI sees them.
+    let mut tick = tokio::time::interval(Duration::from_millis(3));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let mut end = false;
         tokio::select! {biased;
             _=stop.cancelled()=>break,
+            _=overloaded.notified()=>{
+                while commands.try_recv().is_ok() {}
+                desired=None;
+                end=true;
+                state.lock().unwrap().status="Remote input queue overloaded; choose the computer to reconnect".into();
+                eprintln!("binachicken-client: UI queue overloaded; remote session stopped, account retained");
+            },
             command=commands.recv()=>match command {
                 None=>break,
                 Some(Command::Disconnect)=>{desired=None;end=true;},
                 Some(Command::Refresh)=>next_list=Instant::now(),
+                Some(Command::VideoProfile(profile))=>{
+                    video_profile=profile;
+                    if let Some(l)=live.as_mut(){end=l.set_video_profile(profile).is_err();}
+                },
                 Some(Command::Input{generation,epoch,events})=>{if let Some(l)=live.as_mut(){end=l.input(generation,epoch,events).is_err();}},
                 Some(Command::Connect(agent_id))=>{
                     if live.is_none() {
@@ -292,6 +328,11 @@ async fn run(
             event=events.recv()=>match event {
                 None=>break,
                 Some(NetworkEvent::Denied)=>return Err("Reauthorization required; sign out and sign in again".into()),
+                Some(NetworkEvent::SessionRejected)=>{
+                    desired=None;end=true;
+                    state.lock().unwrap().status="Remote session rejected; reconnecting to device service".into();
+                    eprintln!("binachicken-client: signaling policy closed the session; rechecking device identity");
+                },
                 Some(NetworkEvent::Offline)=>{state.lock().unwrap().presence.clear();reconciled=false;outage.get_or_insert(Instant::now()+Duration::from_secs(10));state.lock().unwrap().status="Reconnecting to device service…".into();},
                 Some(NetworkEvent::Event(event))=>{
                     let result=(||->Result<()> {match event {
@@ -306,7 +347,7 @@ async fn run(
                             if let Some(l)=live.as_mut().filter(|l|l.grant.session_id==grant.session_id) {l.refreshed(grant)?;}
                             else {close_remote(&mut closing,api.clone(),&token_rx,grant.session_id);}
                         },
-                        DeviceEvent::SessionClosed{session_id}=>{if live.as_ref().is_some_and(|l|l.grant.session_id==session_id){end=true;next_list=Instant::now();}},
+                        DeviceEvent::SessionClosed{session_id}=>{if live.as_ref().is_some_and(|l|l.grant.session_id==session_id){eprintln!("binachicken-client: backend reported session closed");end=true;next_list=Instant::now();}},
                         DeviceEvent::Signal{sender,message}=>{if let Some(l)=live.as_mut(){l.signal(sender,message)?;}},
                         DeviceEvent::IceConfiguration{session_id,generation,requires_ack,ice_servers}=>{
                             if let Some(l)=live.as_mut() {if session_id!=l.grant.session_id {return Err("wrong ICE scope".into())}
@@ -323,7 +364,7 @@ async fn run(
                 if outage.is_some_and(|deadline|Instant::now()>=deadline) {end=true;}
                 if let Some(l)=live.as_mut() {
                     match l.poll() {Ok(commands)=>{for command in commands {if signal_tx.try_send(command).is_err() {end=true;}}},Err(e)=>{state.lock().unwrap().status=e.to_string();end=true;}}
-                    let mut s=state.lock().unwrap();s.connected=true;s.display=l.display;s.epoch=l.peer.epoch();s.ready=l.ready;s.stats=l.peer.stats();
+                    let mut s=state.lock().unwrap();s.connected=true;s.display=l.display;s.epoch=l.peer.epoch();s.ready=l.ready;s.stats=l.peer.stats();s.session_id=Some(l.grant.session_id);s.connection=Some(l.connection);
                     if outage.is_none() && !end {s.status=if l.ready {"Connected"} else if l.display.is_some(){"Display transition — waiting for video"}else{"Waiting for a physical display"}.into();}
                 }
                 let connect_token = token_rx.borrow().clone();
@@ -338,11 +379,14 @@ async fn run(
                             let id=grant.session_id;
                             if grant.client_id!=identity.device_id || grant.agent_id!=agent_id {close_remote(&mut closing,api.clone(),&token_rx,id);return Err("invalid session participants".into())}
                             match ControllerSession::new(grant,started,config.relay_only,frames.clone()) {
-                                Ok(session)=>live=Some(session),
+                                Ok(mut session)=>{
+                                    session.set_video_profile(video_profile)?;
+                                    live=Some(session);
+                                },
                                 Err(e)=>{close_remote(&mut closing,api.clone(),&token_rx,id);state.lock().unwrap().status=e.to_string();}
                             }
                         },
-                        Err(remotevnc_device::Error::Unauthorized | remotevnc_device::Error::Denied)=>return Err("Reauthorization required; sign out and sign in again".into()),
+                        Err(binachicken_device::Error::Unauthorized | binachicken_device::Error::Denied)=>return Err("Reauthorization required; sign out and sign in again".into()),
                         Err(e)=>state.lock().unwrap().status=e.to_string(),
                     }
                     next_connect=Instant::now()+connect_backoff;
@@ -356,12 +400,16 @@ async fn run(
                     match refresh.take().unwrap().await {Ok(Ok(devices))=>{
                         if desired.is_some_and(|id| !devices.iter().any(|d|d.id==id && !d.revoked)) {desired=None;end=true;}
                         state.lock().unwrap().devices=devices.into_iter().filter(|d|d.id!=identity.device_id && !d.revoked).collect();
-                    },Ok(Err(remotevnc_device::Error::Unauthorized))=>return Err("Reauthorization required".into()),_=>{}}
+                    },Ok(Err(binachicken_device::Error::Unauthorized))=>return Err("Reauthorization required".into()),_=>{}}
                 }
             },
         }
         state.lock().unwrap().connection_requested = desired.is_some();
         if end {
+            eprintln!(
+                "binachicken-client: retiring remote session: {}",
+                state.lock().unwrap().status
+            );
             if let Some(l) = live.take() {
                 // A close event may have been lost during socket rotation.
                 // Recheck enrollment immediately when any live scope retires.
@@ -376,6 +424,8 @@ async fn run(
             s.ready = false;
             s.display = None;
             s.stats = PeerStats::default();
+            s.session_id = None;
+            s.connection = Some(binachicken_transport::ConnectionState::Closed);
             if s.status == "Connected" {
                 s.status = "Disconnected".into();
             }
@@ -445,10 +495,10 @@ async fn network(
         let connect = async {
             let token = api.authenticate(&identity).await?;
             let socket = api.events(&token, DeviceRole::Client).await?;
-            Ok::<_, remotevnc_device::Error>((token, socket))
+            Ok::<_, binachicken_device::Error>((token, socket))
         };
         let result = tokio::select! {_=stop.cancelled()=>return,result=connect=>result};
-        if matches!(result, Err(remotevnc_device::Error::Unauthorized)) {
+        if matches!(result, Err(binachicken_device::Error::Unauthorized)) {
             let _ = events.try_send(NetworkEvent::Denied);
             return;
         }
@@ -469,7 +519,17 @@ async fn network(
                 let result = tokio::select! {
                     _=stop.cancelled()=>return,
                     _=&mut rotate=>break,
-                    event=receiver.next()=>match event {Ok(Some(event))=>events.try_send(NetworkEvent::Event(event)).map_err(|_|()),Err(remotevnc_device::Error::PolicyClosed|remotevnc_device::Error::Unauthorized)=>{let _=events.try_send(NetworkEvent::Denied);return},_=>Err(())},
+                    event=receiver.next()=>match event {
+                        Ok(Some(event))=>events.try_send(NetworkEvent::Event(event)).map_err(|_|()),
+                        Err(binachicken_device::Error::Unauthorized)=>{let _=events.try_send(NetworkEvent::Denied);return},
+                        Err(binachicken_device::Error::PolicyClosed)=>{
+                            // A policy close also covers stale/invalid signaling, not only revocation.
+                            // Retire remote input and let fresh signed authentication decide account validity.
+                            if events.try_send(NetworkEvent::SessionRejected).is_err() {return;}
+                            Err(())
+                        },
+                        _=>Err(())
+                    },
                     command=commands.recv()=>match command {Some(command)=>sender.send(&command).await.map_err(|_|()),None=>return},
                 };
                 if result.is_err() {

@@ -1,7 +1,7 @@
 [Unit]
-Description=RemoteVNC local physical X11 helper
-Wants=remotevnc-input-guardian.service
-After=remotevnc-input-guardian.service systemd-logind.service
+Description=BinaChicken local physical X11 helper
+Wants=binachicken-input-guardian.service
+After=binachicken-input-guardian.service systemd-logind.service
 StartLimitIntervalSec=60
 StartLimitBurst=10
 
@@ -9,12 +9,12 @@ StartLimitBurst=10
 Type=simple
 User=root
 Group=root
-RuntimeDirectory=remotevnc
+RuntimeDirectory=binachicken
 RuntimeDirectoryMode=0711
 UMask=0077
 # The directory is root-owned. Remove only this fixed endpoint after a crashed main.
-ExecStartPre=/usr/bin/rm -f /run/remotevnc/helper.sock
-ExecStart=/bin/sh -ec 'exec /usr/bin/remotevnc-seat-helper --agent-uid "$$(id -u remotevnc-agent)"'
+ExecStartPre=/usr/bin/rm -f /run/binachicken/helper.sock
+ExecStart=/bin/sh -ec 'exec /usr/bin/binachicken-seat-helper --agent-uid "$$(id -u binachicken-agent)"'
 Restart=always
 RestartSec=2
 # Guardian survives in a different cgroup and owns pending physical cleanup.
@@ -23,7 +23,9 @@ TimeoutStopSec=5
 NoNewPrivileges=yes
 # SETUID/SETGID let the preflight child check socket traversal as the agent
 # with its actual primary/supplementary groups before the helper binds.
-CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_KILL CAP_SETUID CAP_SETGID
+# Reading /proc/<Xorg>/exe is ptrace-gated when Xorg has a larger capability set.
+# Keep executable identity verification for the physical seat, including the greeter.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_KILL CAP_SETUID CAP_SETGID CAP_SYS_PTRACE
 # systemd's sandbox setup drops effective SETUID unless explicitly retained here.
 AmbientCapabilities=CAP_SETUID
 ProtectSystem=strict

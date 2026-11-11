@@ -1,12 +1,12 @@
 [package]
-name = "remotevnc-seat-helper"
+name = "binachicken-seat-helper"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-remotevnc-protocol = { path = "../../crates/protocol" }
+binachicken-protocol = { path = "../../crates/protocol" }
 x11rb = { version = "0.13", features = ["xtest", "xkb", "xinput", "randr"] }
 libc = "0.2"
 signal-hook = "0.3"
@@ -16,4 +16,4 @@ serde_json.workspace = true
 gst = { package = "gstreamer", version = "0.24", features = ["v1_24"] }
 
 [dev-dependencies]
-remotevnc-transport = { path = "../../crates/transport" }
+binachicken-transport = { path = "../../crates/transport" }

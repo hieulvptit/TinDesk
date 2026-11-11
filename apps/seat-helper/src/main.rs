@@ -1,4 +1,4 @@
-use remotevnc_seat_helper::{
+use binachicken_seat_helper::{
     Result,
     input::X11Input,
     ipc::{authorize_uid, peer_uid, serve},
@@ -22,7 +22,7 @@ use std::{
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("remotevnc-seat-helper: {error}");
+        eprintln!("binachicken-seat-helper: {error}");
         std::process::exit(1);
     }
 }
@@ -30,20 +30,20 @@ fn run() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("--input-guardian") {
         let mut args = std::env::args().skip(2);
         let socket = match args.next().as_deref() {
-            None => PathBuf::from("/run/remotevnc-guardian/guardian.sock"),
+            None => PathBuf::from("/run/binachicken-guardian/guardian.sock"),
             Some("--socket") => args.next().ok_or("missing guardian socket")?.into(),
             _ => return Err("usage: --input-guardian [--socket PATH]".into()),
         };
         if args.next().is_some() {
             return Err("unexpected guardian argument".into());
         }
-        return remotevnc_seat_helper::recovery::run(&socket);
+        return binachicken_seat_helper::recovery::run(&socket);
     }
     if std::env::args().nth(1).as_deref() == Some("--capture-worker") {
-        return remotevnc_seat_helper::capture::worker_main();
+        return binachicken_seat_helper::capture::worker_main();
     }
     let mut args = std::env::args().skip(1);
-    let mut socket = PathBuf::from("/run/remotevnc/helper.sock");
+    let mut socket = PathBuf::from("/run/binachicken/helper.sock");
     let mut agent_uid = None;
     let mut doctor = false;
     let mut output_selector = None;
@@ -61,7 +61,7 @@ fn run() -> Result<()> {
             }
             _ => {
                 return Err(
-                    "usage: remotevnc-seat-helper [doctor] [--socket PATH] [--agent-uid UID] [--output RANDR_NAME]"
+                    "usage: binachicken-seat-helper [doctor] [--socket PATH] [--agent-uid UID] [--output RANDR_NAME]"
                         .into(),
                 );
             }
@@ -97,7 +97,7 @@ fn run() -> Result<()> {
             "socket parent must be owned by helper UID and not group/world writable".into(),
         );
     }
-    remotevnc_seat_helper::ipc::check_socket_traversal(parent, agent_uid)?;
+    binachicken_seat_helper::ipc::check_socket_traversal(parent, agent_uid)?;
     let listener = UnixListener::bind(&socket)?;
     let _cleanup = SocketCleanup(socket.clone());
     // Peer UID is checked as well. Agent can traverse the dedicated service directory.
@@ -107,7 +107,7 @@ fn run() -> Result<()> {
     }
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
-    remotevnc_seat_helper::recovery::boot_time_ms()?;
+    binachicken_seat_helper::recovery::boot_time_ms()?;
     let mut generation = 0u64;
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
@@ -122,13 +122,13 @@ fn run() -> Result<()> {
                     &mut peer,
                     &mut |cancelled| monitor.current_with_cancel(cancelled),
                     &mut generation,
-                    || remotevnc_seat_helper::recovery::boot_time_ms().unwrap_or(u64::MAX),
+                    || binachicken_seat_helper::recovery::boot_time_ms().unwrap_or(u64::MAX),
                     &stop,
                 )
                 .is_err()
                 {
                     eprintln!(
-                        "remotevnc-seat-helper: IPC session failed; capture stopped and input cleanup attempted"
+                        "binachicken-seat-helper: IPC session failed; capture stopped and input cleanup attempted"
                     );
                 }
             }

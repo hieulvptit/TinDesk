@@ -1,4 +1,4 @@
-use remotevnc_protocol::*;
+use binachicken_protocol::*;
 use std::io::Cursor;
 
 #[test]
@@ -19,7 +19,7 @@ fn binary_video_preserves_access_unit_metadata_and_bounds() {
 #[test]
 fn profile_bounds_and_pressure_downshift() {
     let p = VideoProfile::default();
-    assert_eq!((p.width, p.height, p.fps), (1920, 1080, 60));
+    assert_eq!((p.width, p.height, p.fps), (1920, 1080, 30));
     p.validate().unwrap();
     let lower = p.downshift();
     assert!(lower.bitrate_kbps < p.bitrate_kbps);
@@ -83,4 +83,40 @@ fn binary_video_rejects_unknown_magic_flags_and_length_mismatch() {
         .to_vec();
     envelope.extend(bytes);
     assert!(read_helper_output(&mut Cursor::new(envelope)).is_err());
+}
+
+#[test]
+fn video_profile_fits_physical_aspect_without_upscaling() {
+    let request = VideoProfile {
+        width: 1280,
+        height: 720,
+        fps: 20,
+        ..VideoProfile::default()
+    };
+    let display = DisplayInfo {
+        generation: 1,
+        width: 1600,
+        height: 1200,
+    };
+    let fitted = request.fit_display(display).unwrap();
+    assert_eq!((fitted.width, fitted.height, fitted.fps), (960, 720, 20));
+    let smaller = DisplayInfo {
+        width: 1024,
+        height: 768,
+        ..display
+    };
+    let fitted = VideoProfile::default().fit_display(smaller).unwrap();
+    assert_eq!((fitted.width, fitted.height), (1024, 768));
+    let odd = DisplayInfo {
+        width: 1365,
+        height: 767,
+        ..display
+    };
+    let fitted = VideoProfile::default().fit_display(odd).unwrap();
+    assert_eq!((fitted.width, fitted.height), (1364, 766));
+    assert!(
+        VideoProfile { fps: 0, ..request }
+            .fit_display(display)
+            .is_err()
+    );
 }

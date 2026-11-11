@@ -1,5 +1,5 @@
-use remotevnc_client::video::Viewport;
-use remotevnc_protocol::DisplayInfo;
+use binachicken_client::video::Viewport;
+use binachicken_protocol::DisplayInfo;
 #[test]
 fn letterbox_and_retina_use_logical_points_once_and_physical_output_not_decoded_size() {
     let v = Viewport::fit(

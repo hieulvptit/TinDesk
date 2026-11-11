@@ -1,4 +1,4 @@
-use remotevnc_agent::service::Authority;
+use binachicken_agent::service::Authority;
 use std::sync::atomic::Ordering;
 use tokio::time::{Duration, Instant, advance};
 use tokio_util::sync::CancellationToken;
@@ -36,7 +36,7 @@ fn expired_and_backwards_renewals_cannot_reauthorize() {
 
 #[tokio::test]
 async fn sdk_distinguishes_denial_from_transient_http_failure() {
-    use remotevnc_protocol::{AccessToken, SessionId};
+    use binachicken_protocol::{AccessToken, SessionId};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let app = axum::Router::new()
@@ -54,7 +54,7 @@ async fn sdk_distinguishes_denial_from_transient_http_failure() {
         );
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let api =
-        remotevnc_device::DeviceApi::new(&base, ed25519_dalek::SigningKey::from_bytes(&[1; 32]))
+        binachicken_device::DeviceApi::new(&base, ed25519_dalek::SigningKey::from_bytes(&[1; 32]))
             .unwrap();
     let token = AccessToken {
         token: "fixture".into(),
@@ -63,23 +63,23 @@ async fn sdk_distinguishes_denial_from_transient_http_failure() {
     let session = SessionId::from_uuid(uuid::Uuid::new_v4());
     assert!(matches!(
         api.renew_session(&token, session).await,
-        Err(remotevnc_device::Error::Unauthorized)
+        Err(binachicken_device::Error::Unauthorized)
     ));
     assert!(matches!(
         api.refresh_turn(&token, session).await,
-        Err(remotevnc_device::Error::Request)
+        Err(binachicken_device::Error::Request)
     ));
     assert!(matches!(
-        api.events(&token, remotevnc_protocol::DeviceRole::Agent)
+        api.events(&token, binachicken_protocol::DeviceRole::Agent)
             .await,
-        Err(remotevnc_device::Error::Unauthorized)
+        Err(binachicken_device::Error::Unauthorized)
     ));
     server.abort();
 }
 
 #[tokio::test(start_paused = true)]
 async fn watchdog_interrupts_partial_video_and_held_renewal_at_sixty_seconds() {
-    use remotevnc_agent::helper::Helper;
+    use binachicken_agent::helper::Helper;
     use std::{
         io::{Read, Write},
         os::unix::net::UnixListener,
@@ -92,7 +92,7 @@ async fn watchdog_interrupts_partial_video_and_held_renewal_at_sixty_seconds() {
         let (mut socket, _) = listener.accept().unwrap();
         socket
             .write_all(
-                &(0x80000000u32 | (remotevnc_protocol::ENCODED_FRAME_LIMIT as u32 + 25))
+                &(0x80000000u32 | (binachicken_protocol::ENCODED_FRAME_LIMIT as u32 + 25))
                     .to_be_bytes(),
             )
             .unwrap();

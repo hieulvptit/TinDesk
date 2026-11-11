@@ -1,25 +1,27 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use binachicken_agent::{Result, config::Config, service::AgentService};
+use binachicken_device::{
+    CredentialStore, DeviceApi, DeviceIdentity, FileStore, StoredCredentials,
+};
+use binachicken_protocol::EnrollmentStatus;
 use rand::RngCore;
-use remotevnc_agent::{Result, config::Config, service::AgentService};
-use remotevnc_device::{CredentialStore, DeviceApi, DeviceIdentity, FileStore, StoredCredentials};
-use remotevnc_protocol::EnrollmentStatus;
 use std::{io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
-        eprintln!("remotevnc-agent: {error}");
+        eprintln!("binachicken-agent: {error}");
         std::process::exit(1);
     }
 }
 async fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let command = args.next().ok_or(
-        "usage: remotevnc-agent enroll|run|doctor|revoke-local [--config PATH] [--name NAME]",
+        "usage: binachicken-agent enroll|run|doctor|revoke-local [--config PATH] [--name NAME]",
     )?;
-    let mut path = PathBuf::from("/etc/remotevnc/agent.json");
-    let mut name = String::from("Ubuntu remote computer");
+    let mut path = default_config_path();
+    let mut name = default_device_name();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => path = args.next().ok_or("missing config path")?.into(),
@@ -54,9 +56,9 @@ async fn run() -> Result<()> {
                 config.seat,
                 config.revoked_path().exists()
             );
-            let mut helper = remotevnc_agent::helper::Helper::connect(&config.helper_socket)?;
+            let mut helper = binachicken_agent::helper::Helper::connect(&config.helper_socket)?;
             match tokio::time::timeout(Duration::from_secs(2), helper.events.recv()).await? {
-                Some(remotevnc_protocol::HelperEvent::Ready) => println!(
+                Some(binachicken_protocol::HelperEvent::Ready) => println!(
                     "helper IPC ready; physical display and independent guardian admission are checked only when authorized control starts"
                 ),
                 _ => return Err("helper not ready".into()),
@@ -123,8 +125,8 @@ async fn enroll(config: &Config, name: &str) -> Result<()> {
     credentials.device_id = Some(enrollment.challenge.device_id);
     store.save(&credentials)?;
     println!(
-        "Open {} and confirm code {}",
-        enrollment.browser_url, enrollment.display_code
+        "Open {} and sign in with the same Google account. Registration completes automatically.",
+        enrollment.browser_url
     );
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -136,7 +138,7 @@ async fn enroll(config: &Config, name: &str) -> Result<()> {
                 if config.revoked_path().exists() {
                     std::fs::remove_file(config.revoked_path())?;
                 }
-                println!("Device enrolled. Start remotevnc-agent.service.");
+                println!("Device enrolled. Start binachicken-agent.service.");
                 return Ok(());
             }
         }
@@ -160,7 +162,7 @@ async fn revoke(config: &Config) -> Result<()> {
             break lock;
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err("local revocation marked, but running service has not stopped; stop remotevnc-agent.service before deleting identity".into());
+            return Err("local revocation marked, but running service has not stopped; stop binachicken-agent.service before deleting identity".into());
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
@@ -186,4 +188,24 @@ async fn revoke(config: &Config) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn default_config_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join("Library/Application Support/BinaChicken/agent.json")
+}
+#[cfg(not(target_os = "macos"))]
+fn default_config_path() -> PathBuf {
+    PathBuf::from("/etc/binachicken/agent.json")
+}
+#[cfg(target_os = "macos")]
+fn default_device_name() -> String {
+    String::from("Mac remote computer")
+}
+#[cfg(not(target_os = "macos"))]
+fn default_device_name() -> String {
+    String::from("Ubuntu remote computer")
 }

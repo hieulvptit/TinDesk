@@ -1,5 +1,5 @@
 [package]
-name = "remotevnc-transport"
+name = "binachicken-transport"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,7 @@ license.workspace = true
 native-test = []
 
 [dependencies]
-remotevnc-protocol = { path = "../protocol" }
+binachicken-protocol = { path = "../protocol" }
 gst = { package = "gstreamer", version = "0.24", features = ["v1_24"] }
 gst-webrtc = { package = "gstreamer-webrtc", version = "0.24", features = ["v1_24"] }
 gst-sdp = { package = "gstreamer-sdp", version = "0.24", features = ["v1_24"] }

@@ -1,4 +1,4 @@
-# RemoteVNC
+# BinaChicken
 
 Rust remote control of an enrolled Ubuntu **physical X11** desktop from a native
 macOS client. A single HTTPS backend brokers Google-owned device enrollment,
@@ -7,6 +7,7 @@ input use authenticated WebRTC; the privileged helper has no network access.
 
 - [Ubuntu installation, local enrollment and rollback](docs/setup/ubuntu.md)
 - [macOS development app and signing limits](docs/setup/macos.md)
+- [macOS host: control this Mac remotely](docs/setup/macos-host.md)
 - [Private backend deployment, ingress and SQLite operations](docs/setup/backend.md)
 - [Cloudflare TURN tokens and multiple backend keys](docs/setup/cloudflare-turn.md)
 - [Native dependency setup](docs/setup/native-dependencies.md)

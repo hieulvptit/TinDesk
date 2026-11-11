@@ -3,15 +3,16 @@ use crate::{
     input::InputMapper,
     video::{LatestFrame, Viewport},
 };
+use binachicken_device::DeviceApi;
+use binachicken_protocol::*;
+use binachicken_transport::PeerStats;
 use eframe::egui;
-use remotevnc_device::DeviceApi;
-use remotevnc_protocol::*;
-use remotevnc_transport::PeerStats;
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
 mod runtime;
+mod screens;
 mod session;
 pub use runtime::{ClientCredentialStore, ClientRuntime};
 pub use session::{Authority, ControllerSession};
@@ -28,7 +29,7 @@ impl Config {
         let origin = url::Url::parse(backend)?.origin().ascii_serialization();
         Ok(Self {
             backend: origin,
-            name: "RemoteVNC Mac".into(),
+            name: "BinaChicken Mac".into(),
             relay_only: false,
         })
     }
@@ -46,11 +47,14 @@ pub struct ViewState {
     pub connected: bool,
     pub connection_requested: bool,
     pub stats: PeerStats,
+    pub session_id: Option<SessionId>,
+    pub connection: Option<binachicken_transport::ConnectionState>,
 }
 enum Command {
     Connect(DeviceId),
     Disconnect,
     Refresh,
+    VideoProfile(VideoProfile),
     Input {
         generation: u64,
         epoch: u64,
@@ -61,7 +65,13 @@ enum NetworkEvent {
     Event(DeviceEvent),
     Offline,
     Denied,
+    SessionRejected,
 }
+/// Mipmaps keep text legible when a large desktop is shown in a smaller window.
+const VIDEO_TEXTURE: egui::TextureOptions = egui::TextureOptions {
+    mipmap_mode: Some(egui::TextureFilter::Linear),
+    ..egui::TextureOptions::LINEAR
+};
 /// One native own-window application. No desktop capture or global input hooks.
 pub struct ClientApp {
     config: Config,
@@ -75,6 +85,12 @@ pub struct ClientApp {
     remote_focus: bool,
     autostart: bool,
     selected: Option<DeviceId>,
+    theme_ready: bool,
+    open_browser_when_ready: bool,
+    video_profile: VideoProfile,
+    toolbar_rect: Option<egui::Rect>,
+    toolbar_until: f64,
+    telemetry: crate::connection::Telemetry,
 }
 impl ClientApp {
     pub fn new(config: Config) -> Self {
@@ -100,13 +116,23 @@ impl ClientApp {
             remote_focus: false,
             autostart,
             selected: None,
+            theme_ready: false,
+            open_browser_when_ready: false,
+            video_profile: VideoProfile::default(),
+            toolbar_rect: None,
+            toolbar_until: 0.,
+            telemetry: Default::default(),
         }
     }
     fn sign_in(&mut self) {
+        self.open_browser_when_ready = true;
         self.worker.take();
         self.state.lock().unwrap().status = "Opening secure device sign-in…".into();
         match ClientRuntime::start(self.config.clone(), self.state.clone(), self.frames.clone()) {
-            Ok(worker) => self.worker = Some(worker),
+            Ok(worker) => {
+                worker.set_video_profile(self.video_profile);
+                self.worker = Some(worker);
+            }
             Err(e) => self.state.lock().unwrap().status = e.to_string(),
         }
     }
@@ -148,11 +174,28 @@ impl ClientApp {
 }
 impl ClientApp {
     fn render(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::central_panel(ui.style()).show(ui, |ui| self.content(ui));
+        if !self.theme_ready {
+            screens::apply_theme(ui.ctx());
+            self.theme_ready = true;
+        }
+        ui.set_style(ui.ctx().global_style());
+        let remote = {
+            let s = self.state.lock().unwrap();
+            s.signed_in && (s.connected || s.connection_requested)
+        };
+        let margin = if remote { 0. } else { 8. };
+        let size = ui.available_size() - egui::vec2(margin * 2., margin * 2.);
+        egui::Frame::central_panel(ui.style())
+            .inner_margin(margin)
+            .show(ui, |ui| {
+                ui.set_min_size(size);
+                self.content(ui);
+            });
     }
     fn content(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ctx.request_repaint_after(Duration::from_millis(16));
+        self.frames.set_repaint(&ctx);
         if self.worker.as_ref().is_some_and(ClientRuntime::is_finished) {
             self.worker.take();
         }
@@ -168,6 +211,8 @@ impl ClientApp {
             connected,
             connection_requested,
             stats,
+            session_id,
+            connection,
         ) = {
             let s = self.state.lock().unwrap();
             (
@@ -182,6 +227,8 @@ impl ClientApp {
                 s.connected,
                 s.connection_requested,
                 s.stats,
+                s.session_id,
+                s.connection,
             )
         };
         let scope = display.map(|d| (d.generation, epoch));
@@ -194,135 +241,44 @@ impl ClientApp {
             }
             self.scope = scope;
         }
-        ui.add_space(12.);
-        ui.heading("RemoteVNC");
-        ui.label(&self.config.backend);
-        ui.horizontal(|ui| {
-            if signed_in {
-                if ui.button("Sign out").clicked() {
-                    self.sign_out();
-                }
-            } else if self.worker.is_none() {
-                if ui.button("Sign in with Google").clicked() {
-                    self.sign_in();
-                }
-                if ui.button("Clear local sign-in").clicked() {
-                    self.sign_out();
-                }
-            } else if ui.button("Cancel sign-in").clicked() {
-                self.worker.take();
-                self.state.lock().unwrap().status = "Sign-in cancelled".into();
-            }
-            if ui.checkbox(&mut self.autostart, "Open at login").changed()
-                && let Err(e) = crate::autostart::set_autostart(self.autostart)
-            {
-                self.autostart = crate::autostart::enabled().unwrap_or(false);
-                self.state.lock().unwrap().status = e.to_string();
-            }
-        });
-        ui.label(status);
-        if let Some((code, url)) = enrollment {
-            ui.label(format!("Confirmation code: {code}"));
-            if ui.button("Open browser to confirm").clicked() {
-                if url::Url::parse(&url)
-                    .is_ok_and(|u| u.origin().ascii_serialization() == self.config.backend)
-                {
-                    if let Err(e) = std::process::Command::new("/usr/bin/open")
-                        .arg(&url)
-                        .spawn()
-                    {
-                        self.state.lock().unwrap().status = e.to_string();
-                    }
-                } else {
-                    self.state.lock().unwrap().status = "Invalid sign-in URL".into();
-                }
-            }
+        if !signed_in {
+            self.toolbar_rect = None;
+            self.auth_screen(
+                ui,
+                &status,
+                enrollment.as_ref().map(|(_, url)| url.as_str()),
+            );
+            return;
         }
-        if signed_in {
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.strong("Devices");
-                if ui.button("Refresh").clicked() {
-                    self.send(Command::Refresh);
-                }
-            });
-            if devices.is_empty() {
-                ui.label(
-                    "No other devices yet. Enroll your Ubuntu agent using this Google account.",
-                );
-            }
-            for device in devices {
-                let online = presence
-                    .iter()
-                    .any(|p| p.device_id == device.id && p.role == DeviceRole::Agent && p.online);
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(
-                            self.selected == Some(device.id),
-                            format!(
-                                "{} · {}",
-                                device.name,
-                                if online { "online" } else { "offline" }
-                            ),
-                        )
-                        .clicked()
-                    {
-                        self.selected = Some(device.id);
-                    }
-                    if ui
-                        .add_enabled(online && !connected, egui::Button::new("Connect"))
-                        .clicked()
-                    {
-                        self.release();
-                        self.selected = Some(device.id);
-                        self.send(Command::Connect(device.id));
-                    }
-                });
-            }
-            if connected || connection_requested {
-                let (decoded, fps) = self.frames.metrics();
-                ui.label(format!(
-                    "Video: {} · observed decode FPS: {} · physical display: {}",
-                    decoded.map_or_else(|| "unavailable".into(), |(w, h)| format!("{w}×{h}")),
-                    fps.map_or_else(|| "unavailable".into(), |fps| format!("{fps:.1}")),
-                    display.map_or_else(
-                        || "unavailable".into(),
-                        |d| format!("{}×{}", d.width, d.height)
-                    )
-                ));
-                ui.horizontal(|ui| {
-                    if ui.button("Disconnect").clicked() {
-                        self.release();
-                        self.send(Command::Disconnect);
-                    }
-                    ui.label(format!(
-                        "ICE: {} to {} · RTT: {} · dropped frames: {}",
-                        candidate_name(stats.native.local_candidate),
-                        candidate_name(stats.native.remote_candidate),
-                        stats
-                            .native
-                            .rtt_ms
-                            .map_or_else(|| "unavailable".into(), |v| format!("{v} ms")),
-                        stats.dropped_frames
-                    ));
-                });
-            }
+        if !connected && !connection_requested {
+            self.toolbar_rect = None;
+            self.devices_screen(ui, &devices, &presence, &status);
+            return;
         }
-        ui.separator();
+        self.telemetry.observe(
+            session_id.map(|id| (id, epoch)),
+            stats.native,
+            ctx.input(|i| i.time),
+        );
+        let status_blocks_input =
+            self.connection_overlay(&ctx, &devices, &status, &stats, connection);
+        let toolbar_blocks_input =
+            self.remote_toolbar(ui.ctx(), &devices, ready, &status, &stats) || status_blocks_input;
         if let Some(frame) = self
             .frames
             .take()
             .filter(|f| display.is_some_and(|d| d.generation == f.generation))
         {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
+            // Decoded video is opaque (alpha 255), so this is an exact bulk copy
+            // instead of a per-pixel unmultiply.
+            let image = egui::ColorImage::from_rgba_premultiplied(
                 [frame.width as usize, frame.height as usize],
                 &frame.rgba,
             );
             if let Some(texture) = self.texture.as_mut() {
-                texture.set(image, egui::TextureOptions::LINEAR);
+                texture.set(image, VIDEO_TEXTURE);
             } else {
-                self.texture =
-                    Some(ctx.load_texture("remote-desktop", image, egui::TextureOptions::LINEAR));
+                self.texture = Some(ctx.load_texture("remote-desktop", image, VIDEO_TEXTURE));
             }
             self.frame_size = Some((frame.width, frame.height, frame.generation));
         }
@@ -340,6 +296,7 @@ impl ClientApp {
                 width,
                 height,
             );
+            let viewport = viewport.snap(width, height, ctx.pixels_per_point());
             let rect = egui::Rect::from_min_size(
                 egui::pos2(viewport.left, viewport.top),
                 egui::vec2(viewport.width, viewport.height),
@@ -363,12 +320,13 @@ impl ClientApp {
                     i.focused,
                 )
             });
-            if self.remote_focus && (!focused || events.iter().any(|e|matches!(e,egui::Event::PointerButton{pos,pressed:true,..} if !rect.contains(*pos)))) {self.release();}
-            if response.is_pointer_button_down_on() || response.clicked() {
+            if self.remote_focus && (toolbar_blocks_input || !focused || events.iter().any(|e|matches!(e,egui::Event::PointerButton{pos,pressed:true,..} if !rect.contains(*pos)))) {self.release();}
+            if !toolbar_blocks_input && (response.is_pointer_button_down_on() || response.clicked())
+            {
                 self.remote_focus = true;
                 response.request_focus();
             }
-            if ready && self.remote_focus && focused {
+            if ready && self.remote_focus && focused && !toolbar_blocks_input {
                 ctx.memory_mut(|m| {
                     m.set_focus_lock_filter(
                         response.id,
@@ -403,7 +361,14 @@ impl ClientApp {
                 }
             }
         } else {
-            ui.label("Remote desktop appears here after connection.");
+            ui.vertical_centered(|ui| {
+                ui.add_space((ui.available_height() * 0.38).max(24.));
+                ui.spinner();
+                ui.add_space(16.);
+                ui.heading("Connecting to your desktop");
+                ui.add_space(8.);
+                ui.label(&status);
+            });
         }
     }
 }
@@ -416,12 +381,29 @@ impl eframe::App for ClientApp {
 
 #[cfg(feature = "native-smoke")]
 impl ClientApp {
+    /// Fixture-only: keep controls visible without moving the system pointer.
+    pub fn preview_show_toolbar(&mut self) {
+        self.toolbar_until = f64::INFINITY;
+    }
+    /// Explicit fixture data only; never compiled into the normal client.
+    pub fn preview_connection_measurements(&mut self, slow: bool) {
+        let mut state = self.state.lock().unwrap();
+        let scope = state.session_id.map(|id| (id, state.epoch));
+        for sample in 1..=4 {
+            state.stats.native.sampled_at_ms = Some(sample * 1000);
+            state.stats.native.bytes_received = Some(sample * 625000);
+            state.stats.native.packets_received = Some(sample * 1000);
+            state.stats.native.packets_lost = Some(0);
+            state.stats.native.rtt_ms = Some(if slow { 300 } else { 25 });
+            self.telemetry.observe(scope, state.stats.native, 0.);
+        }
+    }
     /// Explicit fixture renderer for the opt-in development example. It has no
     /// authenticated worker, credentials, or means to send remote input.
     pub fn preview(
         config: Config,
         state: ViewState,
-        frame: remotevnc_transport::DecodedFrame,
+        frame: binachicken_transport::DecodedFrame,
     ) -> Self {
         let mut app = Self::new(config);
         app.scope = state.display.map(|d| (d.generation, state.epoch));
@@ -431,8 +413,8 @@ impl ClientApp {
         app
     }
 }
-fn candidate_name(candidate: Option<remotevnc_transport::stats::CandidateType>) -> &'static str {
-    use remotevnc_transport::stats::CandidateType::*;
+fn candidate_name(candidate: Option<binachicken_transport::stats::CandidateType>) -> &'static str {
+    use binachicken_transport::stats::CandidateType::*;
     match candidate {
         Some(Host) => "host",
         Some(ServerReflexive) => "server reflexive",
@@ -445,6 +427,66 @@ fn candidate_name(candidate: Option<remotevnc_transport::stats::CandidateType>) 
 #[cfg(test)]
 mod ui_tests {
     use super::*;
+    fn rendered_text(app: &mut ClientApp) -> String {
+        fn append(shape: &egui::epaint::Shape, out: &mut String) {
+            match shape {
+                egui::epaint::Shape::Text(text) => {
+                    out.push_str(text.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        append(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100., 760.),
+                )),
+                ..Default::default()
+            },
+            |ui| app.render(ui),
+        );
+        let mut text = String::new();
+        for shape in &output.shapes {
+            append(&shape.shape, &mut text);
+        }
+        output.drop_without_applying_deltas();
+        text
+    }
+    #[test]
+    fn auth_devices_and_remote_render_separate_screens() {
+        let mut app = ClientApp::new(Config::new("http://127.0.0.1:1").unwrap());
+        let auth = rendered_text(&mut app);
+        assert!(auth.contains("Continue with Google"), "{auth}");
+        assert!(!auth.contains("\nYour computers\n"));
+        assert!(!auth.contains("Connection details"));
+        app.state.lock().unwrap().signed_in = true;
+        let devices = rendered_text(&mut app);
+        assert!(devices.contains("Your computers"), "{devices}");
+        assert!(!devices.contains("Continue with Google"));
+        assert!(!devices.contains("Connection details"));
+        app.state.lock().unwrap().connection_requested = true;
+        let remote = rendered_text(&mut app);
+        assert!(
+            !remote.contains("Connection details"),
+            "remote actions use icons"
+        );
+        assert!(
+            app.toolbar_rect.is_some(),
+            "connecting still exposes disconnect"
+        );
+        assert!(remote.contains("Connecting to your desktop"));
+        assert!(!remote.contains("Your computers"));
+        assert!(!remote.contains("Continue with Google"));
+        assert!(!remote.contains("unavailable"));
+    }
     #[test]
     fn focused_remote_image_requests_native_ime_area_and_focus_loss_removes_it() {
         let mut app = ClientApp::new(Config::new("http://127.0.0.1:1").unwrap());
@@ -462,7 +504,7 @@ mod ui_tests {
         }
         app.scope = Some((1, 0));
         app.remote_focus = true;
-        app.frames.replace(remotevnc_transport::DecodedFrame {
+        app.frames.replace(binachicken_transport::DecodedFrame {
             generation: 1,
             width: 2,
             height: 2,
@@ -484,6 +526,12 @@ mod ui_tests {
             .ime
             .expect("image control enables IME without a TextEdit");
         assert!(ime.rect.width() > 100. && ime.rect.height() > 100.);
+        assert_eq!(
+            ime.rect.top(),
+            0.,
+            "toolbar must not reserve vertical space"
+        );
+        assert_eq!(ime.rect.height(), 800.);
         assert!(ime.cursor_rect.width() > 0.);
         out.drop_without_applying_deltas();
         let out = ctx.run_ui(
@@ -497,5 +545,137 @@ mod ui_tests {
         assert!(out.platform_output.ime.is_none());
         assert!(!app.remote_focus);
         out.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn hover_toolbar_and_open_menus_never_forward_input_to_the_desktop() {
+        let mut app = ClientApp::new(Config::new("http://127.0.0.1:1").unwrap());
+        {
+            let mut state = app.state.lock().unwrap();
+            state.signed_in = true;
+            state.connected = true;
+            state.ready = true;
+            state.display = Some(DisplayInfo {
+                generation: 1,
+                width: 1000,
+                height: 800,
+            });
+        }
+        app.scope = Some((1, 0));
+        app.remote_focus = true;
+        app.frames.replace(binachicken_transport::DecodedFrame {
+            generation: 1,
+            width: 2,
+            height: 2,
+            rgba: vec![255; 16],
+            pts_ns: None,
+        });
+        let ctx = egui::Context::default();
+        let raw = |time, events| egui::RawInput {
+            time: Some(time),
+            focused: true,
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000., 800.),
+            )),
+            ..Default::default()
+        };
+        let render = |time, events: Vec<egui::Event>, app: &mut ClientApp| {
+            let output = ctx.run_ui(raw(time, events), |ui| app.render(ui));
+            let ime = output.platform_output.ime;
+            output.drop_without_applying_deltas();
+            ime
+        };
+        assert!(render(1., vec![], &mut app).is_some());
+        assert!(
+            app.toolbar_rect.is_none(),
+            "hidden toolbar uses no layout space"
+        );
+        render(
+            1.1,
+            vec![egui::Event::PointerMoved(egui::pos2(500., 4.))],
+            &mut app,
+        );
+        render(1.2, vec![], &mut app); // Finish the overlay sizing pass.
+        render(1.25, vec![], &mut app); // read_response reads the preceding pass.
+        assert!(app.toolbar_rect.is_some());
+        let settings = ctx
+            .read_response(egui::Id::unique("remote-video-settings"))
+            .unwrap()
+            .rect
+            .center();
+        assert!(
+            render(1.3, vec![egui::Event::PointerMoved(settings)], &mut app).is_none(),
+            "settings={settings:?} toolbar={:?} focus={}",
+            app.toolbar_rect,
+            app.remote_focus
+        );
+        assert!(
+            !app.remote_focus,
+            "hovering controls releases held remote input"
+        );
+        let button = |position, pressed| egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        render(1.4, vec![button(settings, true)], &mut app);
+        render(1.5, vec![button(settings, false)], &mut app);
+        assert!(
+            egui::Popup::is_any_open(&ctx),
+            "icon opens the video settings menu"
+        );
+        assert!(
+            render(
+                3.,
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(100., 700.)),
+                    egui::Event::Text("local settings input".into())
+                ],
+                &mut app
+            )
+            .is_none()
+        );
+        assert!(
+            app.toolbar_rect.is_some(),
+            "an open popup keeps the toolbar visible"
+        );
+        render(3.1, vec![button(egui::pos2(100., 700.), true)], &mut app);
+        render(3.2, vec![button(egui::pos2(100., 700.), false)], &mut app);
+        assert!(
+            !app.remote_focus,
+            "outside close-click cannot click Ubuntu underneath"
+        );
+        render(5., vec![], &mut app);
+        assert!(app.toolbar_rect.is_none(), "toolbar hides after leaving it");
+        let corner = ctx
+            .read_response(egui::Id::unique("remote-connection-info"))
+            .unwrap()
+            .rect;
+        assert!(
+            corner.right() > 970. && corner.top() < 30.,
+            "status stays in the top-right corner"
+        );
+        app.remote_focus = true;
+        assert!(
+            render(
+                5.1,
+                vec![egui::Event::PointerMoved(corner.center())],
+                &mut app
+            )
+            .is_none()
+        );
+        assert!(
+            !app.remote_focus,
+            "corner overlay must also release remote input"
+        );
+        render(5.2, vec![button(corner.center(), true)], &mut app);
+        render(5.3, vec![button(corner.center(), false)], &mut app);
+        assert!(
+            egui::Popup::is_any_open(&ctx),
+            "corner indicator opens connection information"
+        );
     }
 }

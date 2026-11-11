@@ -1,12 +1,12 @@
 [package]
-name = "remotevnc-device"
+name = "binachicken-device"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-remotevnc-protocol = { path = "../protocol" }
+binachicken-protocol = { path = "../protocol" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -1,5 +1,5 @@
 [package]
-name = "remotevnc-protocol"
+name = "binachicken-protocol"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -11,3 +11,4 @@ serde_json.workspace = true
 uuid.workspace = true
 ed25519-dalek.workspace = true
 thiserror.workspace = true
+sha2 = "0.10"

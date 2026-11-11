@@ -1,6 +1,6 @@
 //! XTest input. Text uses a spare keycode, never clipboard or an IME commit channel.
 use crate::{Result, error, seat::DisplayTarget, x11};
-use remotevnc_protocol::{InputEvent, MouseButton};
+use binachicken_protocol::{InputEvent, MouseButton};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Mutex,
@@ -105,6 +105,10 @@ impl X11Input {
             deadline,
         )?);
         Ok(input)
+    }
+    /// False once this exact X server has exited or reset; never reconnects.
+    pub fn server_alive(&self) -> bool {
+        crate::recovery::server_alive(&self.connection)
     }
     pub fn guardian_healthy(&self) -> bool {
         self.guardian.as_ref().is_none_or(|g| g.healthy())
@@ -282,6 +286,9 @@ impl X11Input {
                 }
             }
             InputEvent::ReleaseAll => self.release_all()?,
+            InputEvent::VideoProfile { .. } => {
+                return Err(error("video settings must be handled by the agent"));
+            }
             InputEvent::DisplayAck => {}
         }
         self.connection.flush()?;
@@ -338,7 +345,7 @@ impl X11Input {
         Ok(())
     }
     fn text(&mut self, text: &str, cancelled: &impl Fn() -> bool) -> Result<()> {
-        if text.len() > remotevnc_protocol::TEXT_LIMIT {
+        if text.len() > binachicken_protocol::TEXT_LIMIT {
             return Err(error("text too large"));
         }
         let _serial = TEXT_TRANSACTION

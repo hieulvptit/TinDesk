@@ -324,11 +324,11 @@ pub(super) fn configure_ice(webrtc: &gst::Element, servers: &[IceServer]) -> Res
     let mut stun = false;
     for (is_stun, url) in ice_urls(servers)? {
         if is_stun {
-            if stun {
-                return Err(TransportError::InvalidIce);
+            // webrtcbin has one STUN slot; providers may list alternative ports.
+            if !stun {
+                webrtc.set_property("stun-server", url);
+                stun = true;
             }
-            webrtc.set_property("stun-server", url);
-            stun = true;
         } else if !webrtc.emit_by_name::<bool>("add-turn-server", &[&url]) {
             return Err(TransportError::InvalidIce);
         }

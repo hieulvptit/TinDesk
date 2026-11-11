@@ -215,8 +215,10 @@ impl Default for VideoProfile {
         Self {
             width: 1920,
             height: 1080,
-            fps: 60,
-            bitrate_kbps: 6000,
+            // A software encoder sustains sharp 1080p at 30 FPS; 60 FPS stays
+            // an explicit choice. The bitrate is a ceiling for motion.
+            fps: 30,
+            bitrate_kbps: 12000,
             encoder: VideoEncoder::Auto,
         }
     }
@@ -233,6 +235,34 @@ impl VideoProfile {
             return Err(ProtocolError::InvalidPayload);
         }
         Ok(())
+    }
+    /// Fit stream limits to the physical display without upscaling or stretching.
+    /// Even dimensions may round the physical aspect ratio by up to two pixels.
+    pub fn fit_display(self, display: crate::DisplayInfo) -> Result<Self, ProtocolError> {
+        self.validate()?;
+        display.validate()?;
+        let source_width = u64::from(display.width);
+        let source_height = u64::from(display.height);
+        let (width, height) = if self.width >= display.width && self.height >= display.height {
+            (display.width, display.height)
+        } else if u64::from(self.width) * source_height <= u64::from(self.height) * source_width {
+            (
+                self.width,
+                (u64::from(self.width) * source_height / source_width) as u32,
+            )
+        } else {
+            (
+                (u64::from(self.height) * source_width / source_height) as u32,
+                self.height,
+            )
+        };
+        let fitted = Self {
+            width: width / 2 * 2,
+            height: height / 2 * 2,
+            ..self
+        };
+        fitted.validate()?;
+        Ok(fitted)
     }
     /// Caller applies a sustained-pressure policy; this operation cannot exceed bounds.
     pub fn downshift(self) -> Self {

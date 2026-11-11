@@ -5,7 +5,7 @@ use remotevnc_backend::{
 #[tokio::main]
 async fn main() {
     if run().await.is_err() {
-        eprintln!("RemoteVNC backend could not start or continue");
+        eprintln!("BinaChicken backend could not start or continue");
         std::process::exit(1);
     }
 }

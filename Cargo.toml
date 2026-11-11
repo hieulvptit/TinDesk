@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/protocol", "apps/seat-helper", "crates/transport", "apps/backend", "crates/device", "apps/agent", "apps/client"]
+members = ["crates/protocol", "crates/sync", "apps/seat-helper", "apps/sync-helper", "crates/transport", "apps/backend", "crates/device", "apps/agent", "apps/client", "apps/mac-helper"]
 resolver = "3"
 
 [workspace.package]

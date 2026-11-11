@@ -1,6 +1,6 @@
 //! Cloudflare's generate-ice-servers contract. Provider secrets stay in this client.
 use crate::{Error, Result};
-use remotevnc_protocol::IceServer;
+use binachicken_protocol::IceServer;
 use serde::Deserialize;
 use std::{
     collections::HashSet,
@@ -262,7 +262,8 @@ impl TurnClient {
             if server.urls.is_empty() || server.urls.len() > 16 {
                 return Err(Error::TurnUnavailable);
             }
-            for uri in &server.urls {
+            let mut urls = Vec::new();
+            for uri in server.urls {
                 if uri.len() > 2048
                     || uri.chars().any(char::is_whitespace)
                     || uri.chars().any(char::is_control)
@@ -287,6 +288,11 @@ impl TurnClient {
                     return Err(Error::TurnUnavailable);
                 }
                 if scheme == "stun" {
+                    // Cloudflare lists alternative STUN ports (3478 and 443), but a
+                    // native peer has a single STUN slot. Keep only the first.
+                    if stun_count > 0 {
+                        continue;
+                    }
                     stun_count += 1;
                 } else {
                     turn_count += 1;
@@ -298,15 +304,19 @@ impl TurnClient {
                         }
                     }
                 }
+                urls.push(uri);
+            }
+            if urls.is_empty() {
+                continue;
             }
             servers.push(IceServer {
-                urls: server.urls,
+                urls,
                 username: server.username,
                 credential: server.credential,
                 expires_at_unix_secs: Some(issued + ttl.as_secs()),
             });
         }
-        if stun_count > 1 || turn_count == 0 {
+        if turn_count == 0 {
             return Err(Error::TurnUnavailable);
         }
         Ok(servers)
@@ -397,6 +407,23 @@ mod tests {
             assert_eq!(servers[1].urls, [format!("turn:key{index}.test:3478")]);
         }
         assert_requests(&requests, &[0, 1, 2, 0]);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn current_cloudflare_shape_keeps_one_stun_url_and_all_relays() {
+        // Live provider response (2026-10): two STUN ports plus six relay URLs.
+        let (client, _requests, task) = fixture(vec![Reply {
+            body: json!({"iceServers":[
+                {"urls":["stun:stun.cloudflare.com:3478","stun:stun.cloudflare.com:443"]},
+                {"urls":["turn:turn.cloudflare.com:3478?transport=udp","turn:turn.cloudflare.com:3478?transport=tcp","turns:turn.cloudflare.com:5349?transport=tcp","turn:turn.cloudflare.com:443?transport=udp","turn:turn.cloudflare.com:80?transport=tcp","turns:turn.cloudflare.com:443?transport=tcp"],
+                 "username":"user","credential":"credential"}]}).to_string(),
+            ..good(0)
+        }])
+        .await;
+        let servers = client.issue(TURN_TTL).await.unwrap();
+        assert_eq!(servers[0].urls, ["stun:stun.cloudflare.com:3478"]);
+        assert_eq!(servers[1].urls.len(), 6);
+        assert_eq!(servers[1].username.as_deref(), Some("user"));
         task.abort();
     }
     #[tokio::test]

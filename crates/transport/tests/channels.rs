@@ -1,5 +1,5 @@
-use remotevnc_protocol::*;
-use remotevnc_transport::channels::*;
+use binachicken_protocol::*;
+use binachicken_transport::channels::*;
 
 fn envelope(event: InputEvent) -> InputEnvelope {
     InputEnvelope {

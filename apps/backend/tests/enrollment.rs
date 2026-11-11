@@ -1,7 +1,7 @@
 mod common;
+use binachicken_protocol::*;
 use common::*;
 use remotevnc_backend::{db::Database, devices::DeviceService};
-use remotevnc_protocol::*;
 
 #[tokio::test]
 async fn enrollment_restart_requires_private_verifier_and_bound_key_proof() {

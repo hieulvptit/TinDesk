@@ -13,8 +13,8 @@ use axum::{
     http::HeaderMap,
     response::Response,
 };
+use binachicken_protocol::*;
 use futures_util::{Sink, SinkExt, StreamExt};
-use remotevnc_protocol::*;
 use serde::Deserialize;
 use std::{
     collections::HashMap,

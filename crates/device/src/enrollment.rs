@@ -1,6 +1,6 @@
 use crate::{DeviceApi, Error, Result, api::decode};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use remotevnc_protocol::*;
+use binachicken_protocol::*;
 impl DeviceApi {
     pub async fn begin_enrollment(&self, name: &str, public_key: &str) -> Result<Enrollment> {
         if public_key != URL_SAFE_NO_PAD.encode(self.key.verifying_key().to_bytes()) {

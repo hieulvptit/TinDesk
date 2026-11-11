@@ -1,10 +1,10 @@
 use crate::Result;
 use std::path::{Path, PathBuf};
-const LABEL: &str = "io.remotevnc.client";
+const LABEL: &str = "io.binachicken.client";
 fn path() -> Result<PathBuf> {
     Ok(
         PathBuf::from(std::env::var_os("HOME").ok_or("HOME is unavailable")?)
-            .join("Library/LaunchAgents/io.remotevnc.client.plist"),
+            .join("Library/LaunchAgents/io.binachicken.client.plist"),
     )
 }
 fn read_enabled(path: &Path) -> Result<bool> {
@@ -34,7 +34,7 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
         &path()?,
         enabled,
         &args,
-        std::env::var("REMOTEVNC_BACKEND").ok().as_deref(),
+        std::env::var("BINACHICKEN_BACKEND").ok().as_deref(),
     )
 }
 fn xml(value: &str) -> String {
@@ -55,7 +55,7 @@ fn write_agent(path: &Path, enabled: bool, args: &[String], backend: Option<&str
             .iter()
             .map(|a| format!("<string>{}</string>", xml(a)))
             .collect::<String>();
-        let environment=backend.map(|b|format!("<key>EnvironmentVariables</key><dict><key>REMOTEVNC_BACKEND</key><string>{}</string></dict>",xml(b))).unwrap_or_default();
+        let environment=backend.map(|b|format!("<key>EnvironmentVariables</key><dict><key>BINACHICKEN_BACKEND</key><string>{}</string></dict>",xml(b))).unwrap_or_default();
         let contents = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>{LABEL}</string><key>ProgramArguments</key><array>{args}</array>{environment}<key>RunAtLoad</key><true/></dict></plist>\n"
         );
@@ -97,7 +97,7 @@ mod tests {
             &path,
             true,
             &[
-                "/Applications/A&B/RemoteVNC".into(),
+                "/Applications/A&B/BinaChicken".into(),
                 "--backend".into(),
                 "https://example.test".into(),
             ],
@@ -114,7 +114,7 @@ mod tests {
             assert!(result.status.success());
             assert_eq!(
                 String::from_utf8(result.stdout).unwrap().trim(),
-                "/Applications/A&B/RemoteVNC"
+                "/Applications/A&B/BinaChicken"
             );
         }
         write_agent(&path, false, &[], None).unwrap();

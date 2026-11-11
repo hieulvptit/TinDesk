@@ -1,6 +1,6 @@
 use crate::video::Viewport;
+use binachicken_protocol::{DisplayInfo, InputEvent, MouseButton, TEXT_LIMIT};
 use eframe::egui;
-use remotevnc_protocol::{DisplayInfo, InputEvent, MouseButton, TEXT_LIMIT};
 use std::collections::BTreeSet;
 
 #[derive(Default)]
@@ -161,9 +161,10 @@ impl InputMapper {
         let mut out = vec![];
         for (keysym, pressed) in [
             (0xffe1, m.shift),
-            (0xffe3, m.ctrl),
+            // Command is the Mac shortcut key: it acts as Control on the remote, so
+            // Cmd+C/V/X/A/Z work there. A held physical Control shares the same key.
+            (0xffe3, m.ctrl || m.mac_cmd),
             (0xffe9, m.alt),
-            (0xffeb, m.mac_cmd),
         ] {
             if self.keys.contains(&keysym) != pressed {
                 out.extend(self.map(

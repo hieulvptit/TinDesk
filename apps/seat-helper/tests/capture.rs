@@ -1,5 +1,5 @@
-use remotevnc_protocol::*;
-use remotevnc_seat_helper::{
+use binachicken_protocol::*;
+use binachicken_seat_helper::{
     capture::Capture,
     seat::{DisplayTarget, ServerIdentity},
 };
@@ -35,7 +35,7 @@ fn physical_capture_worker_is_bounded_and_restarts_with_config() {
     };
     for generation in [10, 11] {
         let mut capture = Capture::start_with_worker(
-            Path::new(env!("CARGO_BIN_EXE_remotevnc-seat-helper")),
+            Path::new(env!("CARGO_BIN_EXE_binachicken-seat-helper")),
             &target,
             profile,
             generation,
@@ -74,8 +74,8 @@ fn physical_capture_worker_is_bounded_and_restarts_with_config() {
 #[test]
 #[ignore = "requires Xvfb fixture and Linux capture worker"]
 fn cropped_capture_hot_profile_decodes_over_rtp_without_input_reset() {
-    use remotevnc_seat_helper::{input::X11Input, x11};
-    use remotevnc_transport::*;
+    use binachicken_seat_helper::{input::X11Input, x11};
+    use binachicken_transport::*;
     use x11rb::{
         connection::Connection,
         protocol::xproto::{ConnectionExt, CreateGCAux, Rectangle},
@@ -144,7 +144,7 @@ fn cropped_capture_hot_profile_decodes_over_rtp_without_input_reset() {
         ..VideoProfile::default()
     };
     let mut capture = Capture::start_with_worker(
-        Path::new(env!("CARGO_BIN_EXE_remotevnc-seat-helper")),
+        Path::new(env!("CARGO_BIN_EXE_binachicken-seat-helper")),
         &target,
         profile,
         7,
@@ -282,7 +282,7 @@ fn cropped_capture_hot_profile_decodes_over_rtp_without_input_reset() {
                         );
                         assert_eq!(
                             agent.stats().native.local_candidate,
-                            Some(remotevnc_transport::stats::CandidateType::Host)
+                            Some(binachicken_transport::stats::CandidateType::Host)
                         );
                         assert!(agent.stats().native.packets_sent.is_some_and(|n| n > 0));
                         controller
@@ -328,8 +328,8 @@ fn cropped_capture_hot_profile_decodes_over_rtp_without_input_reset() {
 #[test]
 #[ignore = "requires Xvfb fixture and Linux capture worker"]
 fn hot_profile_renegotiation_preserves_capture_and_held_input() {
+    use binachicken_seat_helper::{input::X11Input, x11};
     use gst::prelude::*;
-    use remotevnc_seat_helper::{input::X11Input, x11};
     use x11rb::{
         connection::Connection,
         protocol::xproto::{ConnectionExt, KeyButMask},
@@ -422,7 +422,7 @@ fn hot_profile_renegotiation_preserves_capture_and_held_input() {
     let sink = decoder.0.by_name("decoded").unwrap();
     decoder.0.set_state(gst::State::Playing).unwrap();
     let mut capture = Capture::start_with_worker(
-        Path::new(env!("CARGO_BIN_EXE_remotevnc-seat-helper")),
+        Path::new(env!("CARGO_BIN_EXE_binachicken-seat-helper")),
         &target,
         high,
         7,
@@ -519,7 +519,7 @@ fn hot_profile_renegotiation_preserves_capture_and_held_input() {
 #[test]
 #[ignore = "requires 1920x1080 Xvfb fixture and Linux capture worker"]
 fn repeated_1080p_rtp_stream_stays_bounded_and_stops_cleanly() {
-    use remotevnc_transport::*;
+    use binachicken_transport::*;
     for generation in 20..23 {
         let target = DisplayTarget {
             seat: "test-only".into(),
@@ -544,7 +544,7 @@ fn repeated_1080p_rtp_stream_stays_bounded_and_stops_cleanly() {
             (1920, 1080, 60)
         );
         let mut capture = Capture::start_with_worker(
-            Path::new(env!("CARGO_BIN_EXE_remotevnc-seat-helper")),
+            Path::new(env!("CARGO_BIN_EXE_binachicken-seat-helper")),
             &target,
             profile,
             generation,
@@ -637,10 +637,10 @@ fn repeated_1080p_rtp_stream_stays_bounded_and_stops_cleanly() {
 
 #[test]
 fn injected_worker_failure_retains_only_allowlisted_category_and_exit() {
-    use remotevnc_protocol::*;
-    use remotevnc_seat_helper::{capture::Capture, seat::*};
+    use binachicken_protocol::*;
+    use binachicken_seat_helper::{capture::Capture, seat::*};
     use std::os::unix::fs::PermissionsExt;
-    let dir = std::env::temp_dir().join(format!("remotevnc-failure-{}", uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!("binachicken-failure-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
     let worker = dir.join("worker");
     let failure = CaptureFailure {

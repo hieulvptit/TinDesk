@@ -24,7 +24,7 @@ sys.argv.remove("--inside")
 
 class Installer(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="remotevnc-install-")
+        self.temp = tempfile.TemporaryDirectory(prefix="binachicken-install-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.root.chmod(0o755)
@@ -53,9 +53,9 @@ class Installer(unittest.TestCase):
         shutil.copytree("/etc/pam.d", self.root / "etc/pam.d")
         (self.root / "etc/X11").mkdir()
         (self.root / "etc/X11/default-display-manager").write_text("/usr/sbin/gdm3\n")
-        (self.root / "etc/lightdm/lightdm.conf.d/50-remotevnc.conf").write_text("previous settings\n")
+        (self.root / "etc/lightdm/lightdm.conf.d/50-binachicken.conf").write_text("previous settings\n")
         (self.root / "etc/systemd/system/display-manager.service").symlink_to("/usr/lib/systemd/system/gdm3.service")
-        for name in ("remotevnc-agent", "remotevnc-seat-helper"):
+        for name in ("binachicken-agent", "binachicken-seat-helper"):
             path = self.root / "artifacts" / name
             path.write_text("#!/bin/bash\nexit 0\n")
             path.chmod(0o755)
@@ -87,10 +87,10 @@ class Installer(unittest.TestCase):
         return result
 
     def enroll_fixture(self):
-        identity = self.root / "var/lib/remotevnc-agent/identity.json"
+        identity = self.root / "var/lib/binachicken-agent/identity.json"
         identity.write_text(json.dumps(dict(version=1,device_id="00000000-0000-4000-8000-000000000001",secret=[1]*32)))
         identity.chmod(0o600)
-        os.chown(identity, (self.root / "var/lib/remotevnc-agent").stat().st_uid, (self.root / "var/lib/remotevnc-agent").stat().st_gid)
+        os.chown(identity, (self.root / "var/lib/binachicken-agent").stat().st_uid, (self.root / "var/lib/binachicken-agent").stat().st_gid)
 
     def run_rollback(self, output):
         backup = next(line.removeprefix('Rollback: sudo ').split()[-1]
@@ -124,8 +124,8 @@ class Installer(unittest.TestCase):
         flag = "--allow-ubuntu-2510"
         self.run_install("--prepare", flag)
         self.assertEqual((self.root / "etc/X11/default-display-manager").read_text(), "/usr/sbin/gdm3\n")
-        self.assertEqual((self.root / "var/lib/remotevnc-agent").stat().st_mode & 0o777, 0o700)
-        self.assertEqual((self.root / "etc/remotevnc/agent.json").stat().st_mode & 0o777, 0o640)
+        self.assertEqual((self.root / "var/lib/binachicken-agent").stat().st_mode & 0o777, 0o700)
+        self.assertEqual((self.root / "etc/binachicken/agent.json").stat().st_mode & 0o777, 0o640)
         commands = (self.root / "commands").read_text()
         self.assertNotRegex(commands, r"systemctl .*\b(start|restart|enable|stop)\b")
         before = self.snapshot()
@@ -134,14 +134,14 @@ class Installer(unittest.TestCase):
         self.enroll_fixture()
         applied = self.run_install("--apply", flag)
         self.assertEqual((self.root / "etc/X11/default-display-manager").read_text(), "/usr/sbin/lightdm\n")
-        agent = self.root / "usr/bin/remotevnc-agent"
-        agent.write_text('#!/bin/bash\n[[ "$1" == doctor && "$2" == --config && "$3" == /etc/remotevnc/agent.json ]] || exit 9\nprintf "%s\\n" "$EUID" > /var/lib/remotevnc-agent/doctor-uid\n')
+        agent = self.root / "usr/bin/binachicken-agent"
+        agent.write_text('#!/bin/bash\n[[ "$1" == doctor && "$2" == --config && "$3" == /etc/binachicken/agent.json ]] || exit 9\nprintf "%s\\n" "$EUID" > /var/lib/binachicken-agent/doctor-uid\n')
         agent.chmod(0o755)
         self.run_install("--doctor", flag)
-        self.assertEqual((self.root / "var/lib/remotevnc-agent/doctor-uid").read_text().strip(), str((self.root / "var/lib/remotevnc-agent").stat().st_uid))
+        self.assertEqual((self.root / "var/lib/binachicken-agent/doctor-uid").read_text().strip(), str((self.root / "var/lib/binachicken-agent").stat().st_uid))
         commands = (self.root / "commands").read_text()
         starts = [line for line in commands.splitlines() if line.startswith('systemctl start ')]
-        self.assertEqual(starts, ['systemctl start remotevnc-input-guardian.service', 'systemctl start remotevnc-seat-helper.service', 'systemctl start remotevnc-agent.service'])
+        self.assertEqual(starts, ['systemctl start binachicken-input-guardian.service', 'systemctl start binachicken-seat-helper.service', 'systemctl start binachicken-agent.service'])
         self.assertNotRegex(commands, r"systemctl (?:restart|reboot|start (?:lightdm|gdm|display-manager))\b")
         self.run_rollback(applied.stdout)
         self.assertEqual((self.root / "etc/X11/default-display-manager").read_text(), "/usr/sbin/gdm3\n")
@@ -159,9 +159,9 @@ class Installer(unittest.TestCase):
                 self.assertFalse((self.root / "commands").exists())
 
     def test_invalid_prerequisites_fail_before_writes(self):
-        (self.root / "artifacts/remotevnc-agent").unlink()
+        (self.root / "artifacts/binachicken-agent").unlink()
         self.run_install("--prepare", success=False)
-        self.assertFalse((self.root / "var/lib/remotevnc-installer").exists())
+        self.assertFalse((self.root / "var/lib/binachicken-installer").exists())
         self.assertFalse((self.root / "commands").exists())
 
     def test_prepare_private_state_no_service_start_and_apt_failure_cleanup(self):
@@ -175,9 +175,9 @@ class Installer(unittest.TestCase):
         commands = (self.root / "commands").read_text()
         self.assertNotRegex(commands, r"systemctl .*\b(start|restart|enable|stop)\b")
         self.assertEqual((self.root / "etc/X11/default-display-manager").read_text(), "/usr/sbin/gdm3\n")
-        self.assertEqual((self.root / "etc/remotevnc/agent.json").stat().st_mode & 0o777, 0o640)
-        self.assertEqual((self.root / "var/lib/remotevnc-agent").stat().st_mode & 0o777, 0o700)
-        self.assertEqual((self.root / "run/remotevnc").stat().st_mode & 0o777, 0o711)
+        self.assertEqual((self.root / "etc/binachicken/agent.json").stat().st_mode & 0o777, 0o640)
+        self.assertEqual((self.root / "var/lib/binachicken-agent").stat().st_mode & 0o777, 0o700)
+        self.assertEqual((self.root / "run/binachicken").stat().st_mode & 0o777, 0o711)
         self.run_install("--prepare", success=False, extra=("APT_STATUS=42",))
         self.assertEqual((self.root / "etc/debconf-value").read_text().strip(), 'gdm3')
         self.assertEqual((self.root / "etc/debconf-seen").read_text().strip(), 'false')
@@ -192,9 +192,9 @@ class Installer(unittest.TestCase):
         self.assertEqual((self.root / "etc/debconf-seen").read_text().strip(), 'false')
 
     def test_untraversable_existing_socket_parent_fails_without_chmod(self):
-        (self.root / "run/remotevnc").mkdir(mode=0o700)
+        (self.root / "run/binachicken").mkdir(mode=0o700)
         self.run_install("--prepare", success=False)
-        self.assertEqual((self.root / "run/remotevnc").stat().st_mode & 0o777, 0o700)
+        self.assertEqual((self.root / "run/binachicken").stat().st_mode & 0o777, 0o700)
         self.assertFalse((self.root / "commands").exists())
 
     def test_apply_requires_enrollment_then_rollback_restores_dm(self):
@@ -210,9 +210,9 @@ class Installer(unittest.TestCase):
         self.assertEqual(os.readlink(self.root / "etc/systemd/system/display-manager.service"), "/usr/lib/systemd/system/lightdm.service")
         commands = (self.root / "commands").read_text()
         starts = [line for line in commands.splitlines() if line.startswith('systemctl start ')]
-        self.assertEqual(starts, ['systemctl start remotevnc-input-guardian.service','systemctl start remotevnc-seat-helper.service','systemctl start remotevnc-agent.service'])
+        self.assertEqual(starts, ['systemctl start binachicken-input-guardian.service','systemctl start binachicken-seat-helper.service','systemctl start binachicken-agent.service'])
         self.run_rollback(applied.stdout)
-        self.assertEqual((self.root / "etc/lightdm/lightdm.conf.d/50-remotevnc.conf").read_text(), "previous settings\n")
+        self.assertEqual((self.root / "etc/lightdm/lightdm.conf.d/50-binachicken.conf").read_text(), "previous settings\n")
         self.assertEqual((self.root / "etc/X11/default-display-manager").read_text(), "/usr/sbin/gdm3\n")
         self.assertEqual(os.readlink(self.root / "etc/systemd/system/display-manager.service"), "/usr/lib/systemd/system/gdm3.service")
         self.assertEqual((self.root / "etc/debconf-value").read_text().strip(), 'gdm3')
@@ -222,20 +222,20 @@ class Installer(unittest.TestCase):
         self.run_install("--prepare")
         self.enroll_fixture()
         # This is actual systemctl file enablement in the private root, never the live manager.
-        subprocess.run(["chroot", str(self.root), "/usr/bin/systemctl", "--root=/", "enable", "--runtime", "remotevnc-agent.service"], check=True, capture_output=True, text=True)
-        runtime = self.root / "run/systemd/system/multi-user.target.wants/remotevnc-agent.service"
-        persistent = self.root / "etc/systemd/system/multi-user.target.wants/remotevnc-agent.service"
+        subprocess.run(["chroot", str(self.root), "/usr/bin/systemctl", "--root=/", "enable", "--runtime", "binachicken-agent.service"], check=True, capture_output=True, text=True)
+        runtime = self.root / "run/systemd/system/multi-user.target.wants/binachicken-agent.service"
+        persistent = self.root / "etc/systemd/system/multi-user.target.wants/binachicken-agent.service"
         self.assertTrue(runtime.is_symlink())
         self.assertFalse(persistent.is_symlink())
         applied = self.run_install("--apply")
         self.assertTrue(persistent.is_symlink())
         backup = self.run_rollback(applied.stdout)
-        self.assertIn('remotevnc-agent enabled-runtime', (backup / 'enablement').read_text().splitlines())
+        self.assertIn('binachicken-agent enabled-runtime', (backup / 'enablement').read_text().splitlines())
         stops = [line for line in (self.root / 'commands').read_text().splitlines() if line.startswith('systemctl stop ')]
-        self.assertEqual(stops, ['systemctl stop remotevnc-agent.service remotevnc-seat-helper.service', 'systemctl stop remotevnc-input-guardian.service'])
+        self.assertEqual(stops, ['systemctl stop binachicken-agent.service binachicken-seat-helper.service', 'systemctl stop binachicken-input-guardian.service'])
         self.assertFalse(persistent.is_symlink(), 'rollback must remove apply-created permanent enablement')
         self.assertTrue(runtime.is_symlink(), 'runtime-only enablement must survive rollback')
-        result = subprocess.run(["chroot", str(self.root), "/usr/bin/systemctl", "--root=/", "is-enabled", "remotevnc-agent.service"], check=True, capture_output=True, text=True)
+        result = subprocess.run(["chroot", str(self.root), "/usr/bin/systemctl", "--root=/", "is-enabled", "binachicken-agent.service"], check=True, capture_output=True, text=True)
         self.assertEqual(result.stdout.strip(), 'enabled-runtime')
 
 

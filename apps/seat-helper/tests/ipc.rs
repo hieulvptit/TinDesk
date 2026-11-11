@@ -1,5 +1,5 @@
-use remotevnc_protocol::*;
-use remotevnc_seat_helper::ipc::{FrameDecoder, SessionPolicy, authorize_uid};
+use binachicken_protocol::*;
+use binachicken_seat_helper::ipc::{FrameDecoder, SessionPolicy, authorize_uid};
 use uuid::Uuid;
 
 #[test]
@@ -78,7 +78,7 @@ fn new_helper_wire_messages_round_trip() {
 #[test]
 #[cfg(target_os = "linux")]
 fn peer_credentials_come_from_kernel_and_wrong_uid_is_rejected() {
-    use remotevnc_seat_helper::ipc::peer_uid;
+    use binachicken_seat_helper::ipc::peer_uid;
     use std::os::unix::net::UnixStream;
     let (a, _b) = UnixStream::pair().unwrap();
     let actual = peer_uid(&a).unwrap();
@@ -97,11 +97,11 @@ fn helper_rejects_oversize_frame_and_removes_socket_on_sigterm() {
         thread,
         time::Duration,
     };
-    let dir = std::env::temp_dir().join(format!("remotevnc-ipc-{}", Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!("binachicken-ipc-{}", Uuid::new_v4()));
     fs::create_dir(&dir).unwrap();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
     let socket = dir.join("helper.sock");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_remotevnc-seat-helper"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_binachicken-seat-helper"))
         .arg("--socket")
         .arg(&socket)
         .arg("--agent-uid")
@@ -143,7 +143,7 @@ fn helper_rejects_oversize_frame_and_removes_socket_on_sigterm() {
 #[test]
 #[ignore = "requires scripts/test-x11.sh Xvfb fixture"]
 fn stalled_discovery_cannot_delay_responsive_input_cleanup() {
-    use remotevnc_seat_helper::{
+    use binachicken_seat_helper::{
         ipc::serve_with_guardian as serve,
         seat::{DisplayTarget, ServerIdentity, command_output},
         x11,
@@ -196,16 +196,16 @@ fn stalled_discovery_cannot_delay_responsive_input_cleanup() {
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let boot_now = remotevnc_seat_helper::recovery::boot_time_ms().unwrap();
+        let boot_now = binachicken_seat_helper::recovery::boot_time_ms().unwrap();
         let now = Arc::new(AtomicU64::new(boot_now));
         let guardian_path = std::env::temp_dir().join(format!(
-            "remotevnc-stalled-guardian-{}.sock",
+            "binachicken-stalled-guardian-{}.sock",
             Uuid::new_v4()
         ));
         let guardian_listener = std::os::unix::net::UnixListener::bind(&guardian_path).unwrap();
         let guardian_worker = thread::spawn(move || {
             let (mut peer, _) = guardian_listener.accept().unwrap();
-            remotevnc_seat_helper::recovery::serve(&mut peer)
+            binachicken_seat_helper::recovery::serve(&mut peer)
         });
         let helper_guardian_path = guardian_path.clone();
         let stop = Arc::new(AtomicBool::new(false));
@@ -415,22 +415,22 @@ fn custom_socket_checks_actual_agent_traversal_without_chmod() {
     if unsafe { libc::geteuid() } != 0 {
         return;
     }
-    let dir = std::env::temp_dir().join(format!("remotevnc-traverse-{}", Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!("binachicken-traverse-{}", Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let error = remotevnc_seat_helper::ipc::check_socket_traversal(&dir, 65534)
+    let error = binachicken_seat_helper::ipc::check_socket_traversal(&dir, 65534)
         .unwrap_err()
         .to_string();
     assert!(error.contains(dir.to_str().unwrap()) && error.contains("cannot traverse"));
     assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711)).unwrap();
-    remotevnc_seat_helper::ipc::check_socket_traversal(&dir, 65534).unwrap();
+    binachicken_seat_helper::ipc::check_socket_traversal(&dir, 65534).unwrap();
     let hidden = dir.join("hidden");
     std::fs::create_dir(&hidden).unwrap();
     std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700)).unwrap();
     let forwarded = hidden.join("forward");
     std::os::unix::fs::symlink(&dir, &forwarded).unwrap();
-    let error = remotevnc_seat_helper::ipc::check_socket_traversal(&forwarded, 65534)
+    let error = binachicken_seat_helper::ipc::check_socket_traversal(&forwarded, 65534)
         .unwrap_err()
         .to_string();
     assert!(error.contains(hidden.to_str().unwrap()) && error.contains("cannot traverse"));

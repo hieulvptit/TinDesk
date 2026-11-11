@@ -1,10 +1,10 @@
 #[path = "../../backend/tests/common/mod.rs"]
 mod common;
+use binachicken_agent::{config::Config, service::AgentService};
+use binachicken_device::{CredentialStore, FileStore, StoredCredentials};
+use binachicken_protocol::*;
 use common::*;
-use remotevnc_agent::{config::Config, service::AgentService};
 use remotevnc_backend::{BackendState, sessions::SessionService, turn::TurnClient};
-use remotevnc_device::{CredentialStore, FileStore, StoredCredentials};
-use remotevnc_protocol::*;
 use std::{os::unix::net::UnixListener, time::Duration};
 use tokio_util::sync::CancellationToken;
 
@@ -58,10 +58,12 @@ async fn boot_without_user_session_reconciles_grant_and_revocation() {
         helper_socket: socket,
         seat: "seat0".into(),
         relay_only: false,
+        sync_socket: None,
+        ssh_port: None,
     })
     .unwrap();
     let run = tokio::spawn(service.run(stop.clone()));
-    let client = remotevnc_device::DeviceApi::new(&base, device_key(1)).unwrap();
+    let client = binachicken_device::DeviceApi::new(&base, device_key(1)).unwrap();
     let token = AccessToken {
         token: f.tokens[0].clone(),
         expires_at_unix_ms: unix_ms() + 300_000,
@@ -107,7 +109,7 @@ async fn boot_without_user_session_reconciles_grant_and_revocation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
-    use remotevnc_transport::*;
+    use binachicken_transport::*;
     let f = session_fixture();
     let issuer = Issuer::start().await;
     let provider = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -181,7 +183,7 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
             })),
         )
         .unwrap();
-        let mut decoder = remotevnc_seat_helper::ipc::FrameDecoder::default();
+        let mut decoder = binachicken_seat_helper::ipc::FrameDecoder::default();
         let mut capture = false;
         let mut burst = 16;
         let encoded = encoded_fixture();
@@ -235,10 +237,12 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
         helper_socket: socket,
         seat: "seat0".into(),
         relay_only: false,
+        sync_socket: None,
+        ssh_port: None,
     };
     let stop = CancellationToken::new();
     let run = tokio::spawn(AgentService::new(config).unwrap().run(stop.clone()));
-    let api = remotevnc_device::DeviceApi::new(&base, device_key(1)).unwrap();
+    let api = binachicken_device::DeviceApi::new(&base, device_key(1)).unwrap();
     let token = AccessToken {
         token: f.tokens[0].clone(),
         expires_at_unix_ms: unix_ms() + 300_000,
@@ -280,6 +284,7 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
     let mut renewed = false;
     let mut keyframe_requested = false;
     let mut adapted = false;
+    let mut manual_profile_applied = false;
     loop {
         tokio::select! {
           event=incoming.next()=>match event.unwrap().unwrap(){
@@ -339,7 +344,11 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
                 } => {
                     assert!(started.replace(deadline_boot_ms).is_none());
                 }
+                HelperRequest::StartCapture { profile, .. } => {
+                    assert_eq!((profile.width, profile.height, profile.fps), (640, 480, 30));
+                }
                 HelperRequest::Input(input) => match input.event {
+                    InputEvent::VideoProfile { .. } => panic!("video settings reached XTest input"),
                     InputEvent::Key { pressed: true, .. } => held = true,
                     InputEvent::ReleaseAll => {
                         assert!(held);
@@ -373,6 +382,22 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
                 } => {
                     assert_eq!(session_id, grant.session_id);
                     assert_eq!(generation, 1);
+                    if profile
+                        == (VideoProfile {
+                            width: 640,
+                            height: 480,
+                            fps: 15,
+                            bitrate_kbps: 1000,
+                            encoder: VideoEncoder::Auto,
+                        })
+                    {
+                        assert!(
+                            adapted && released,
+                            "manual settings must follow focus release"
+                        );
+                        manual_profile_applied = true;
+                        continue;
+                    }
                     assert!(profile.width < VideoProfile::default().width);
                     assert!(profile.fps < VideoProfile::default().fps);
                     assert!(profile.bitrate_kbps < VideoProfile::default().bitrate_kbps);
@@ -390,6 +415,23 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
                                 event: InputEvent::ReleaseAll,
                             })
                             .unwrap();
+                        controller
+                            .send_input(InputEnvelope {
+                                version: WIRE_VERSION,
+                                session_id: grant.session_id,
+                                generation: 1,
+                                sequence: 3,
+                                event: InputEvent::VideoProfile {
+                                    profile: VideoProfile {
+                                        width: 1280,
+                                        height: 720,
+                                        fps: 15,
+                                        bitrate_kbps: 1000,
+                                        encoder: VideoEncoder::Auto,
+                                    },
+                                },
+                            })
+                            .unwrap();
                     }
                     adapted = true;
                 }
@@ -398,7 +440,13 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
                 _ => {}
             }
         }
-        if released && decoded_after_release && renewed && keyframe_requested && adapted {
+        if released
+            && decoded_after_release
+            && renewed
+            && keyframe_requested
+            && adapted
+            && manual_profile_applied
+        {
             break;
         }
         assert!(
@@ -476,7 +524,7 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
     drop(sender);
     drop(incoming);
     let rotated = api
-        .authenticate(&remotevnc_device::DeviceIdentity {
+        .authenticate(&binachicken_device::DeviceIdentity {
             device_id: f.ids[0],
             signing_key: device_key(1),
         })
@@ -485,7 +533,7 @@ async fn focus_release_preserves_video_and_renewal_is_at_fifteen_seconds() {
     let connection = loop {
         match api.events(&rotated, DeviceRole::Client).await {
             Ok(s) => break s,
-            Err(remotevnc_device::Error::Limit) => {
+            Err(binachicken_device::Error::Limit) => {
                 tokio::time::sleep(Duration::from_millis(20)).await
             }
             Err(e) => panic!("{e}"),
@@ -579,10 +627,12 @@ async fn cli_oidc_candidate_recovery_and_running_local_revoke() {
         helper_socket: dir.path().join("absent-helper.sock"),
         seat: "seat0".into(),
         relay_only: false,
+        sync_socket: None,
+        ssh_port: None,
     };
     let config_path = dir.path().join("config.json");
     std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
-    let binary = env!("CARGO_BIN_EXE_remotevnc-agent");
+    let binary = env!("CARGO_BIN_EXE_binachicken-agent");
     let mut enroll = Command::new(binary)
         .args(["enroll", "--config"])
         .arg(&config_path)
@@ -643,7 +693,7 @@ async fn cli_oidc_candidate_recovery_and_running_local_revoke() {
         .arg(&config_path)
         .spawn()
         .unwrap();
-    let api = remotevnc_device::DeviceApi::new(&base, device_key(1)).unwrap();
+    let api = binachicken_device::DeviceApi::new(&base, device_key(1)).unwrap();
     let token = AccessToken {
         token: f.tokens[0].clone(),
         expires_at_unix_ms: unix_ms() + 300_000,
@@ -702,7 +752,7 @@ async fn cli_oidc_candidate_recovery_and_running_local_revoke() {
 #[ignore = "requires explicit root disposable Ubuntu systemd fixture; never run on developer host"]
 async fn installed_agent_unit_runs_as_state_owner_and_revoke_stops_ram_identity() {
     assert_eq!(
-        std::env::var("REMOTEVNC_SYSTEMD_FIXTURE").as_deref(),
+        std::env::var("BINACHICKEN_SYSTEMD_FIXTURE").as_deref(),
         Ok("disposable-lima")
     );
     assert_eq!(unsafe { libc::geteuid() }, 0);
@@ -722,11 +772,11 @@ async fn installed_agent_unit_runs_as_state_owner_and_revoke_stops_ram_identity(
             .await
             .unwrap()
     });
-    let state_path = std::path::Path::new("/var/lib/remotevnc-agent");
+    let state_path = std::path::Path::new("/var/lib/binachicken-agent");
     std::fs::create_dir_all(state_path).unwrap();
     let uid = String::from_utf8(
         Command::new("id")
-            .args(["-u", "remotevnc-agent"])
+            .args(["-u", "binachicken-agent"])
             .output()
             .unwrap()
             .stdout,
@@ -737,7 +787,7 @@ async fn installed_agent_unit_runs_as_state_owner_and_revoke_stops_ram_identity(
     .unwrap();
     // Seed a fixture identity under root, then transfer to the actual service owner before use.
     Command::new("chown")
-        .args(["root:root", "/var/lib/remotevnc-agent"])
+        .args(["root:root", "/var/lib/binachicken-agent"])
         .status()
         .unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -755,8 +805,8 @@ async fn installed_agent_unit_runs_as_state_owner_and_revoke_stops_ram_identity(
         Command::new("chown")
             .args([
                 "-R",
-                "remotevnc-agent:remotevnc-agent",
-                "/var/lib/remotevnc-agent"
+                "binachicken-agent:binachicken-agent",
+                "/var/lib/binachicken-agent"
             ])
             .status()
             .unwrap()
@@ -765,24 +815,26 @@ async fn installed_agent_unit_runs_as_state_owner_and_revoke_stops_ram_identity(
     let config = Config {
         backend_origin: base.clone(),
         identity_path: state_path.into(),
-        helper_socket: "/run/remotevnc/helper.sock".into(),
+        helper_socket: "/run/binachicken/helper.sock".into(),
         seat: "seat0".into(),
         relay_only: false,
+        sync_socket: None,
+        ssh_port: None,
     };
-    std::fs::create_dir_all("/etc/remotevnc").unwrap();
+    std::fs::create_dir_all("/etc/binachicken").unwrap();
     std::fs::write(
-        "/etc/remotevnc/agent.json",
+        "/etc/binachicken/agent.json",
         serde_json::to_vec(&config).unwrap(),
     )
     .unwrap();
     assert!(
         Command::new("systemctl")
-            .args(["start", "remotevnc-agent.service"])
+            .args(["start", "binachicken-agent.service"])
             .status()
             .unwrap()
             .success()
     );
-    let api = remotevnc_device::DeviceApi::new(&base, device_key(1)).unwrap();
+    let api = binachicken_device::DeviceApi::new(&base, device_key(1)).unwrap();
     let token = AccessToken {
         token: f.tokens[0].clone(),
         expires_at_unix_ms: unix_ms() + 300_000,
@@ -802,7 +854,7 @@ async fn installed_agent_unit_runs_as_state_owner_and_revoke_stops_ram_identity(
         Command::new("systemctl")
             .args([
                 "show",
-                "remotevnc-agent.service",
+                "binachicken-agent.service",
                 "--property=MainPID",
                 "--value",
             ])
@@ -819,9 +871,9 @@ async fn installed_agent_unit_runs_as_state_owner_and_revoke_stops_ram_identity(
         Command::new("runuser")
             .args([
                 "-u",
-                "remotevnc-agent",
+                "binachicken-agent",
                 "--",
-                "/usr/bin/remotevnc-agent",
+                "/usr/bin/binachicken-agent",
                 "revoke-local",
             ])
             .output()
@@ -932,7 +984,7 @@ async fn renewal_denial_closes_locally_without_any_backend_close_event() {
             } = decode_control(&bytes).unwrap()
             {
                 let remaining =
-                    deadline_boot_ms.saturating_sub(remotevnc_agent::service::boot_time_ms());
+                    deadline_boot_ms.saturating_sub(binachicken_agent::service::boot_time_ms());
                 assert!(
                     (55_000..58_000).contains(&remaining),
                     "3-second delayed successful response must retain request-start authority: {remaining}ms"
@@ -952,10 +1004,12 @@ async fn renewal_denial_closes_locally_without_any_backend_close_event() {
         helper_socket: socket,
         seat: "seat0".into(),
         relay_only: false,
+        sync_socket: None,
+        ssh_port: None,
     };
     let stop = CancellationToken::new();
     let run = tokio::spawn(AgentService::new(config).unwrap().run(stop.clone()));
-    let api = remotevnc_device::DeviceApi::new(&base, device_key(1)).unwrap();
+    let api = binachicken_device::DeviceApi::new(&base, device_key(1)).unwrap();
     let token = AccessToken {
         token: f.tokens[0].clone(),
         expires_at_unix_ms: unix_ms() + 300_000,

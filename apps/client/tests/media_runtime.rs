@@ -3,12 +3,12 @@ use std::{path::Path, process::Command};
 
 #[test]
 fn bundled_media_child() {
-    if std::env::var_os("REMOTEVNC_BUNDLE_TEST_CHILD").is_none() {
+    if std::env::var_os("BINACHICKEN_BUNDLE_TEST_CHILD").is_none() {
         return;
     }
     gst::init().unwrap();
     // The normal executable path, also used by LaunchAgent current_exe, initializes it.
-    remotevnc_client::media_runtime::initialize_bundled().unwrap();
+    binachicken_client::media_runtime::initialize_bundled().unwrap();
     for factory in [
         "webrtcbin",
         "nicesrc",
@@ -36,15 +36,34 @@ fn bundled_media_child() {
                 .join("Resources")
         )
     );
+    // Discovery alone is insufficient: cached factories may fail to instantiate.
+    use binachicken_protocol::{DeviceId, DisplayInfo, SessionId};
+    use binachicken_transport::{Peer, PeerConfig, PeerRole};
+    let peer = Peer::new(PeerConfig {
+        session_id: SessionId::from_uuid(uuid::Uuid::nil()),
+        local_peer_id: DeviceId::from_uuid(uuid::Uuid::from_u128(1)),
+        remote_peer_id: DeviceId::from_uuid(uuid::Uuid::from_u128(2)),
+        role: PeerRole::Controller,
+        display: Some(DisplayInfo {
+            generation: 1,
+            width: 640,
+            height: 480,
+        }),
+        ice_servers: vec![],
+        relay_only: false,
+    })
+    .expect("packaged WebRTC engine must instantiate without shell environment");
+    peer.enable_h264().unwrap();
+    peer.close();
 }
 
 #[test]
 fn app_bundle_finds_media_without_terminal_environment_or_registry_cache() {
     let root = tempfile::tempdir().unwrap();
-    let contents = root.path().join("RemoteVNC.app/Contents");
+    let contents = root.path().join("BinaChicken.app/Contents");
     std::fs::create_dir_all(contents.join("MacOS")).unwrap();
     std::fs::create_dir_all(contents.join("Resources/gst-plugins")).unwrap();
-    let executable = contents.join("MacOS/remotevnc-client");
+    let executable = contents.join("MacOS/binachicken-client");
     std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../.deps/media/gst-plugins/libgstnice.dylib");
@@ -56,7 +75,7 @@ fn app_bundle_finds_media_without_terminal_environment_or_registry_cache() {
     let mut command = Command::new(executable);
     command
         .args(["--exact", "bundled_media_child", "--nocapture"])
-        .env("REMOTEVNC_BUNDLE_TEST_CHILD", "1")
+        .env("BINACHICKEN_BUNDLE_TEST_CHILD", "1")
         .env("GST_REGISTRY_1_0", root.path().join("fresh-registry.bin"));
     for variable in [
         "GST_PLUGIN_PATH",

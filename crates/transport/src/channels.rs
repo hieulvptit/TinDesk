@@ -1,5 +1,5 @@
 //! Data-channel contracts and validation, shared by native callbacks and tests.
-use remotevnc_protocol::*;
+use binachicken_protocol::*;
 
 pub struct ChannelSpec {
     pub label: &'static str,
@@ -13,6 +13,13 @@ pub const MOTION: ChannelSpec = ChannelSpec {
 };
 pub const CONTROL: ChannelSpec = ChannelSpec {
     label: "control",
+    ordered: true,
+    max_retransmits: None,
+};
+
+/// Clipboard and file transfer; reliable, ordered, and independent of input.
+pub const SYNC: ChannelSpec = ChannelSpec {
+    label: SYNC_CHANNEL_LABEL,
     ordered: true,
     max_retransmits: None,
 };

@@ -12,7 +12,7 @@ Install Apple's command-line developer tools (`xcode-select --install`) and
 ```sh
 scripts/setup-macos-media.sh
 source .deps/media/env.sh
-cargo test -p remotevnc-transport --locked
+cargo test -p binachicken-transport --locked
 ```
 
 The helper installs only missing `gstreamer`, `libnice`, and `pkgconf` formulae.
@@ -37,7 +37,7 @@ gst-launch-1.0 -q videotestsrc num-buffers=5 ! videoconvert ! x264enc tune=zerol
 ```
 
 GStreamer registry discovery can print warnings from unrelated Homebrew Python
-or GTK plugins on its first scan. RemoteVNC transport does not use those plugins.
+or GTK plugins on its first scan. BinaChicken transport does not use those plugins.
 Do not enable verbose GStreamer debugging with live sessions: upstream native
 logs may contain SDP, addresses, and TURN credentials. Application errors and
 Debug implementations deliberately exclude these secrets and input contents.
@@ -52,7 +52,7 @@ sudo apt-get install -y build-essential pkg-config libgstreamer1.0-dev \
   gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
   gstreamer1.0-nice
 for plugin in webrtcbin nice h264parse avdec_h264; do gst-inspect-1.0 "$plugin"; done
-cargo test -p remotevnc-transport --locked
+cargo test -p binachicken-transport --locked
 ```
 
 Loopback tests use actual ICE/DTLS/SCTP on local interfaces and fail if native

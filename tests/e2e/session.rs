@@ -1,8 +1,10 @@
 //! Process/native acceptance; opt in with scripts/test-e2e.sh on disposable Xvfb.
 #![cfg(target_os = "linux")]
-use remotevnc_agent::config::Config;
-use remotevnc_device::{CredentialStore, DeviceApi, DeviceIdentity, FileStore, StoredCredentials};
-use remotevnc_protocol::*;
+use binachicken_agent::config::Config;
+use binachicken_device::{
+    CredentialStore, DeviceApi, DeviceIdentity, FileStore, StoredCredentials,
+};
+use binachicken_protocol::*;
 use std::{
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
@@ -47,10 +49,10 @@ fn spawn(dir: &Path, role: &str) -> Process {
         .unwrap();
     Process(
         Command::new(
-            std::env::var_os("REMOTEVNC_E2E_FIXTURE").expect("explicit fixture executable"),
+            std::env::var_os("BINACHICKEN_E2E_FIXTURE").expect("explicit fixture executable"),
         )
-        .env("REMOTEVNC_E2E_ROLE", role)
-        .env("REMOTEVNC_E2E_DIR", dir)
+        .env("BINACHICKEN_E2E_ROLE", role)
+        .env("BINACHICKEN_E2E_DIR", dir)
         .process_group(0)
         .stdout(Stdio::from(log.try_clone().unwrap()))
         .stderr(Stdio::from(log))
@@ -158,7 +160,7 @@ async fn closed(api: &DeviceApi, token: &AccessToken, session: SessionId) {
     loop {
         if matches!(
             api.renew_session(token, session).await,
-            Err(remotevnc_device::Error::Unauthorized)
+            Err(binachicken_device::Error::Unauthorized)
         ) {
             return;
         }
@@ -169,13 +171,13 @@ async fn closed(api: &DeviceApi, token: &AccessToken, session: SessionId) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "explicit process/native Xvfb/GTK acceptance: scripts/test-e2e.sh"]
 async fn signed_accounts_unicode_revocation_and_process_restarts_release_input() {
-    assert_eq!(std::env::var("REMOTEVNC_E2E").as_deref(), Ok("1"));
+    assert_eq!(std::env::var("BINACHICKEN_E2E").as_deref(), Ok("1"));
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let dir = directory.path();
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     // Log paths are retained on failure in the explicitly supplied private results directory.
-    let result_dir = PathBuf::from(std::env::var_os("REMOTEVNC_E2E_RESULTS").unwrap());
+    let result_dir = PathBuf::from(std::env::var_os("BINACHICKEN_E2E_RESULTS").unwrap());
     struct Logs<'a>(&'a Path, &'a Path);
     impl Drop for Logs<'_> {
         fn drop(&mut self) {
@@ -233,7 +235,7 @@ async fn signed_accounts_unicode_revocation_and_process_restarts_release_input()
     );
     assert!(matches!(
         other.create_session(&other_token, ids[1]).await,
-        Err(remotevnc_device::Error::Unauthorized)
+        Err(binachicken_device::Error::Unauthorized)
     ));
     let _guardian = spawn(dir, "guardian");
     wait(
@@ -269,7 +271,7 @@ async fn signed_accounts_unicode_revocation_and_process_restarts_release_input()
     std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     let log = std::fs::File::create(dir.join("agent.log")).unwrap();
     let _agent = Process(
-        Command::new(env!("CARGO_BIN_EXE_remotevnc-agent"))
+        Command::new(env!("CARGO_BIN_EXE_binachicken-agent"))
             .args(["run", "--config"])
             .arg(config_path)
             .process_group(0)
@@ -283,7 +285,7 @@ async fn signed_accounts_unicode_revocation_and_process_restarts_release_input()
     let (connection, _) = x11rb::connect(None).unwrap();
     assert_eq!(held(&connection), (false, false));
     let (mut client, grant) = controller(dir, true, &connection).await;
-    let receiver = PathBuf::from(std::env::var_os("REMOTEVNC_GTK_RESULT").unwrap());
+    let receiver = PathBuf::from(std::env::var_os("BINACHICKEN_GTK_RESULT").unwrap());
     wait(
         || std::fs::read_to_string(&receiver).is_ok_and(|s| s == "Tiếng Việt|é|e\u{301}|中文|😀"),
         Duration::from_secs(5),

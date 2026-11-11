@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-remotevnc-protocol = { path = "../../crates/protocol" }
+binachicken-protocol = { path = "../../crates/protocol" }
 axum = { version = "0.8", features = ["form", "ws"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
@@ -26,7 +26,7 @@ futures-util = { version = "0.3", features = ["sink"] }
 
 [dev-dependencies]
 tokio-tungstenite = "0.29"
-remotevnc-device = { path = "../../crates/device" }
+binachicken-device = { path = "../../crates/device" }
 tempfile = "3"
 jsonwebtoken = { version = "9", default-features = false }
 rsa = { version = "0.9", features = ["pem"] }

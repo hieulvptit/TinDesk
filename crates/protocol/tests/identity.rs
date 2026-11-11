@@ -1,5 +1,5 @@
+use binachicken_protocol::*;
 use ed25519_dalek::SigningKey;
-use remotevnc_protocol::*;
 
 fn challenge() -> DeviceChallenge {
     DeviceChallenge {

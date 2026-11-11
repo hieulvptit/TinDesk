@@ -1,8 +1,8 @@
 mod common;
+use binachicken_protocol::*;
 use common::session_fixture;
 use remotevnc_backend::sessions::SessionService;
 use remotevnc_backend::turn::TurnClient;
-use remotevnc_protocol::*;
 
 #[tokio::test]
 async fn ownership_single_controller_lease_close_and_restart() {

@@ -1,5 +1,6 @@
-use remotevnc_protocol::DisplayInfo;
-use remotevnc_transport::DecodedFrame;
+use binachicken_protocol::DisplayInfo;
+use binachicken_transport::DecodedFrame;
+use eframe::egui;
 use std::sync::{Arc, Mutex};
 
 /// All geometry here is in egui logical points, already divided by native Retina scale.
@@ -19,6 +20,30 @@ impl Viewport {
             top: bounds.top + (bounds.height - height) / 2.,
             width,
             height,
+        }
+    }
+    /// Align to physical pixels so sampling never straddles two screen pixels,
+    /// and show a near-native fit at exactly one image pixel per screen pixel.
+    pub fn snap(self, width: u32, height: u32, pixels_per_point: f32) -> Self {
+        if !pixels_per_point.is_finite() || pixels_per_point <= 0. {
+            return self;
+        }
+        let (mut w, mut h) = (
+            self.width * pixels_per_point,
+            self.height * pixels_per_point,
+        );
+        if (w - width as f32).abs() <= 2. && (h - height as f32).abs() <= 2. {
+            (w, h) = (width as f32, height as f32);
+        }
+        let center = (
+            (self.left + self.width / 2.) * pixels_per_point,
+            (self.top + self.height / 2.) * pixels_per_point,
+        );
+        Self {
+            left: (center.0 - w.round() / 2.).round() / pixels_per_point,
+            top: (center.1 - h.round() / 2.).round() / pixels_per_point,
+            width: w.round() / pixels_per_point,
+            height: h.round() / pixels_per_point,
         }
     }
     pub fn position(self, x: f32, y: f32, display: DisplayInfo, clamp: bool) -> Option<(u32, u32)> {
@@ -47,6 +72,7 @@ struct FrameState {
     frame: Option<DecodedFrame>,
     dimensions: Option<(u32, u32)>,
     arrivals: std::collections::VecDeque<std::time::Instant>,
+    repaint: Option<egui::Context>,
 }
 #[derive(Clone, Default)]
 pub struct LatestFrame(Arc<Mutex<FrameState>>);
@@ -65,6 +91,18 @@ impl LatestFrame {
             state.arrivals.pop_front();
         }
         state.frame = Some(frame);
+        let repaint = state.repaint.clone();
+        drop(state);
+        // Show a decoded frame immediately rather than at the next idle repaint.
+        if let Some(ctx) = repaint {
+            ctx.request_repaint();
+        }
+    }
+    pub fn set_repaint(&self, ctx: &egui::Context) {
+        let mut state = self.0.lock().unwrap();
+        if state.repaint.is_none() {
+            state.repaint = Some(ctx.clone());
+        }
     }
     /// Observed decoded arrivals over at most two seconds, never target FPS.
     pub fn metrics(&self) -> (Option<(u32, u32)>, Option<f64>) {
@@ -89,13 +127,38 @@ impl LatestFrame {
         self.0.lock().unwrap().frame.take()
     }
     pub fn clear(&self) {
-        *self.0.lock().unwrap() = FrameState::default();
+        let mut state = self.0.lock().unwrap();
+        *state = FrameState {
+            repaint: state.repaint.take(),
+            ..FrameState::default()
+        };
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn near_native_fit_snaps_to_whole_physical_pixels() {
+        let fitted = Viewport {
+            left: 0.3,
+            top: 10.7,
+            width: 960.6,
+            height: 540.4,
+        }
+        .snap(1920, 1080, 2.);
+        assert_eq!((fitted.width, fitted.height), (960., 540.));
+        assert_eq!((fitted.left * 2.).fract(), 0.);
+        assert_eq!((fitted.top * 2.).fract(), 0.);
+        let scaled = Viewport {
+            left: 0.,
+            top: 0.,
+            width: 1512.,
+            height: 850.5,
+        }
+        .snap(1920, 1080, 2.);
+        assert_eq!((scaled.width, scaled.height), (1512., 850.5));
+    }
     use std::time::{Duration, Instant};
     #[test]
     fn observed_rate_is_unavailable_without_samples_and_after_stall() {

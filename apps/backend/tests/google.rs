@@ -85,7 +85,7 @@ async fn confirmation_requires_matching_code_and_cannot_replay_or_swap_enrollmen
         devices
             .poll_enrollment(&a.id, poll(&a, &device_key(1)))
             .unwrap(),
-        remotevnc_protocol::EnrollmentStatus::Pending
+        binachicken_protocol::EnrollmentStatus::Pending
     ));
     // A failed code attempt burns the confirmation capability.
     assert!(auth.confirm(&login.confirmation, &a.display_code).is_err());
@@ -97,7 +97,7 @@ async fn confirmation_requires_matching_code_and_cannot_replay_or_swap_enrollmen
         devices
             .poll_enrollment(&b.id, poll(&b, &device_key(2)))
             .unwrap(),
-        remotevnc_protocol::EnrollmentStatus::Pending
+        binachicken_protocol::EnrollmentStatus::Pending
     ));
 }
 

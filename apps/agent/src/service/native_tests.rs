@@ -16,7 +16,7 @@ struct Fixtures {
 }
 impl Fixtures {
     async fn start() -> Self {
-        assert_eq!(std::env::var("REMOTEVNC_E2E").as_deref(), Ok("1"));
+        assert_eq!(std::env::var("BINACHICKEN_E2E").as_deref(), Ok("1"));
         let dir = tempfile::tempdir().unwrap();
         let mut fixture = Self {
             dir,
@@ -26,9 +26,9 @@ impl Fixtures {
             let log =
                 std::fs::File::create(fixture.dir.path().join(format!("{role}.log"))).unwrap();
             fixture.children.push(
-                Command::new(std::env::var_os("REMOTEVNC_E2E_FIXTURE").unwrap())
-                    .env("REMOTEVNC_E2E_ROLE", role)
-                    .env("REMOTEVNC_E2E_DIR", fixture.dir.path())
+                Command::new(std::env::var_os("BINACHICKEN_E2E_FIXTURE").unwrap())
+                    .env("BINACHICKEN_E2E_ROLE", role)
+                    .env("BINACHICKEN_E2E_DIR", fixture.dir.path())
                     .process_group(0)
                     .stdout(Stdio::from(log.try_clone().unwrap()))
                     .stderr(Stdio::from(log))
@@ -53,7 +53,7 @@ impl Drop for Fixtures {
             }
             let _ = child.wait();
         }
-        if let Some(results) = std::env::var_os("REMOTEVNC_E2E_RESULTS") {
+        if let Some(results) = std::env::var_os("BINACHICKEN_E2E_RESULTS") {
             for role in ["guardian", "helper"] {
                 let _ = std::fs::copy(
                     self.dir.path().join(format!("{role}.log")),
@@ -108,6 +108,8 @@ impl Session {
                 helper_socket: fixtures.dir.path().join("helper.sock"),
                 seat: "seat0".into(),
                 relay_only: false,
+                sync_socket: None,
+                ssh_port: None,
             },
             grant,
             boot_time_ms(),
@@ -124,7 +126,7 @@ impl Session {
         };
         profile.validate().unwrap();
         live.profile = profile;
-        live.adaptation = remotevnc_transport::stats::AdaptiveProfile::new(profile).unwrap();
+        live.adaptation = binachicken_transport::stats::AdaptiveProfile::new(profile).unwrap();
         let (tx, rx) = mpsc::channel(32);
         let mut session = Self {
             live: Some(live),
@@ -424,7 +426,7 @@ async fn transport_stall_closes_despite_healthy_renewals() {
 async fn long_text_keeps_video_renewals_and_cancellation_live() {
     let mut session = Session::start().await;
     session.input(InputEvent::ReleaseAll);
-    let path = std::env::var_os("REMOTEVNC_GTK_RESULT").unwrap();
+    let path = std::env::var_os("BINACHICKEN_GTK_RESULT").unwrap();
     let received = || std::fs::read_to_string(&path).unwrap_or_default();
     assert!(received().is_empty(), "requires fresh GTK entry");
     let original_deadline = session

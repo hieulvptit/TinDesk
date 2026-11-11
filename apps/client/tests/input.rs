@@ -1,8 +1,8 @@
-use remotevnc_client::{
+use binachicken_client::{
     input::{ClientInput as C, InputMapper},
     video::Viewport,
 };
-use remotevnc_protocol::{DisplayInfo, InputEvent as I, MouseButton};
+use binachicken_protocol::{DisplayInfo, InputEvent as I, MouseButton};
 fn d(generation: u64) -> DisplayInfo {
     DisplayInfo {
         generation,
@@ -222,27 +222,20 @@ fn native_commits_key_text_pairs_modifiers_and_paste_are_separate() {
         E::ModifiersChanged(plain),
     ];
     let out = m.native_batch(&events, plain, None, v(), d(1));
+    // Command maps to Control; swapping Cmd for a physical Ctrl never releases it.
     assert!(matches!(
         &out[..],
         [
-            I::Key {
-                keysym: 0xffeb,
-                pressed: true
-            },
-            I::Key {
-                keysym: 118,
-                pressed: true
-            },
-            I::Key {
-                keysym: 118,
-                pressed: false
-            },
             I::Key {
                 keysym: 0xffe3,
                 pressed: true
             },
             I::Key {
-                keysym: 0xffeb,
+                keysym: 118,
+                pressed: true
+            },
+            I::Key {
+                keysym: 118,
                 pressed: false
             },
             I::Key {

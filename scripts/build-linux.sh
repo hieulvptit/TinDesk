@@ -15,8 +15,8 @@ if [[ -z ${SOURCE_DATE_EPOCH:-} ]]; then
   SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) || { echo 'Source archive: set SOURCE_DATE_EPOCH from the reviewed commit before building.' >&2; exit 1; }
 fi
 export SOURCE_DATE_EPOCH
-cargo build --locked --release -p remotevnc-agent -p remotevnc-seat-helper --no-default-features
+cargo build --locked --release -p binachicken-agent -p binachicken-seat-helper -p binachicken-sync-helper --no-default-features
 artifact_dir="${CARGO_TARGET_DIR:-target}/release"
 { rustc --version; cargo --version; sha256sum Cargo.lock; dpkg-query -W 'gstreamer1.0-*' 'libgstreamer*'; } > "$artifact_dir/native-build-manifest.txt"
-sha256sum "$artifact_dir/remotevnc-agent" "$artifact_dir/remotevnc-seat-helper" > "$artifact_dir/SHA256SUMS"
+sha256sum "$artifact_dir/binachicken-agent" "$artifact_dir/binachicken-seat-helper" "$artifact_dir/binachicken-sync-helper" > "$artifact_dir/SHA256SUMS"
 echo "Native artifacts: $artifact_dir (no installation/service/desktop changes)"

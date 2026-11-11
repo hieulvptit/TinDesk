@@ -1,6 +1,6 @@
 //! Bounded local IPC. A separate shutdown descriptor interrupts even a partial 8 MiB frame.
 use crate::Result;
-use remotevnc_protocol::*;
+use binachicken_protocol::*;
 use std::{
     io::Write,
     net::Shutdown,

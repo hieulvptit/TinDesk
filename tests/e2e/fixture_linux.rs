@@ -1,16 +1,16 @@
 #[path = "../../apps/backend/tests/common/mod.rs"]
 mod common;
+use binachicken_device::{DeviceApi, DeviceIdentity};
+use binachicken_protocol::*;
+use binachicken_seat_helper::{
+    ipc, recovery,
+    seat::{DisplayTarget, ServerIdentity},
+};
+use binachicken_transport::{Peer, PeerConfig, PeerEvent, PeerRole};
 use common::*;
 use remotevnc_backend::{
     BackendState, db::Database, devices::DeviceService, sessions::SessionService, turn::TurnClient,
 };
-use remotevnc_device::{DeviceApi, DeviceIdentity};
-use remotevnc_protocol::*;
-use remotevnc_seat_helper::{
-    ipc, recovery,
-    seat::{DisplayTarget, ServerIdentity},
-};
-use remotevnc_transport::{Peer, PeerConfig, PeerEvent, PeerRole};
 use std::{
     os::unix::net::UnixListener,
     path::PathBuf,
@@ -18,16 +18,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub fn run() -> remotevnc_agent::Result<()> {
+pub fn run() -> binachicken_agent::Result<()> {
     // Capture::start self-execs its helper; this is exclusively a test executable.
     if std::env::args().nth(1).as_deref() == Some("--capture-worker") {
-        return remotevnc_seat_helper::capture::worker_main();
+        return binachicken_seat_helper::capture::worker_main();
     }
-    let Ok(role) = std::env::var("REMOTEVNC_E2E_ROLE") else {
+    let Ok(role) = std::env::var("BINACHICKEN_E2E_ROLE") else {
         return Ok(());
     };
     let dir =
-        PathBuf::from(std::env::var_os("REMOTEVNC_E2E_DIR").ok_or("fixture directory required")?);
+        PathBuf::from(std::env::var_os("BINACHICKEN_E2E_DIR").ok_or("fixture directory required")?);
     match role.as_str() {
         "helper" => helper(&dir),
         "guardian" => {
@@ -74,7 +74,7 @@ fn target() -> DisplayTarget {
         height: 1080,
     }
 }
-fn helper(dir: &std::path::Path) -> remotevnc_agent::Result<()> {
+fn helper(dir: &std::path::Path) -> binachicken_agent::Result<()> {
     let listener = UnixListener::bind(dir.join("helper.sock"))?;
     let mut generation = 0;
     for stream in listener.incoming() {
@@ -96,7 +96,7 @@ fn helper(dir: &std::path::Path) -> remotevnc_agent::Result<()> {
     }
     Ok(())
 }
-async fn backend(dir: &std::path::Path) -> remotevnc_agent::Result<()> {
+async fn backend(dir: &std::path::Path) -> binachicken_agent::Result<()> {
     let started = Instant::now();
     eprintln!(
         "backend fixture bootstrap started; restart={}",
@@ -152,7 +152,7 @@ async fn backend(dir: &std::path::Path) -> remotevnc_agent::Result<()> {
     drop(issuer);
     Ok(())
 }
-async fn controller(dir: &std::path::Path, unicode: bool) -> remotevnc_agent::Result<()> {
+async fn controller(dir: &std::path::Path, unicode: bool) -> binachicken_agent::Result<()> {
     let ids: Vec<DeviceId> = serde_json::from_slice(&std::fs::read(dir.join("devices.json"))?)?;
     let base = format!(
         "http://{}",

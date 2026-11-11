@@ -1,4 +1,4 @@
-use remotevnc_seat_helper::seat::{ServerIdentity, SessionProperties, physical_session};
+use binachicken_seat_helper::seat::{ServerIdentity, SessionProperties, physical_session};
 
 #[test]
 fn only_local_active_seat0_x11_is_eligible() {
@@ -37,7 +37,7 @@ fn same_display_number_does_not_hide_server_reset() {
 #[test]
 #[ignore = "requires scripts/test-x11.sh Xvfb fixture"]
 fn live_probe_changes_epoch_on_same_pid_server_reset() {
-    use remotevnc_seat_helper::{seat::DisplayTarget, x11::ServerProbe};
+    use binachicken_seat_helper::{seat::DisplayTarget, x11::ServerProbe};
     use std::{thread, time::Duration};
     let t = DisplayTarget {
         seat: "test-only".into(),
@@ -59,7 +59,7 @@ fn live_probe_changes_epoch_on_same_pid_server_reset() {
     let mut probe = ServerProbe::default();
     let (first, _, _) = probe.refresh(&t).unwrap();
     assert_eq!(first, probe.refresh(&t).unwrap().0);
-    let pid = std::env::var("REMOTEVNC_XVFB_PID")
+    let pid = std::env::var("BINACHICKEN_XVFB_PID")
         .unwrap()
         .parse::<i32>()
         .unwrap();
@@ -76,7 +76,7 @@ fn live_probe_changes_epoch_on_same_pid_server_reset() {
 
 #[test]
 fn stalled_discovery_subprocess_is_bounded_and_cancellable() {
-    use remotevnc_seat_helper::seat::command_output;
+    use binachicken_seat_helper::seat::command_output;
     use std::{
         process::Command,
         time::{Duration, Instant},
@@ -114,7 +114,7 @@ fn stalled_discovery_subprocess_is_bounded_and_cancellable() {
 
 #[test]
 fn selects_one_active_randr_output_and_offsets_pointer() {
-    use remotevnc_seat_helper::seat::{OutputGeometry, select_output};
+    use binachicken_seat_helper::seat::{OutputGeometry, select_output};
     let left = OutputGeometry {
         name: "HDMI-1".into(),
         x: 0,

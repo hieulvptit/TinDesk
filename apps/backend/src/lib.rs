@@ -4,14 +4,14 @@ pub mod config;
 pub mod db;
 pub mod devices;
 use axum::{
-    Form, Json, Router,
+    Json, Router,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{delete, get, post},
 };
-use remotevnc_protocol::*;
+use binachicken_protocol::*;
 use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
@@ -72,7 +72,6 @@ pub fn router(state: BackendState) -> Router {
         .route("/v1/enrollments/{id}/poll", post(poll))
         .route("/auth/google/start", get(start))
         .route(&callback, get(finish))
-        .route("/auth/google/confirm", post(confirm))
         .route("/v1/devices/{id}/challenge", post(challenge))
         .route("/v1/devices/authenticate", post(authenticate))
         .route("/v1/devices", get(list))
@@ -136,28 +135,14 @@ struct Callback {
     code: String,
     state: String,
 }
-async fn finish(State(s): State<BackendState>, Query(q): Query<Callback>) -> Result<Html<String>> {
-    let completion = s.auth.finish_login(&q.code, &q.state).await?;
-    Ok(Html(format!(
-        "<!doctype html><html><head><title>Confirm RemoteVNC device</title></head><body><h1>Confirm device registration</h1><p>Google account ID: {}</p><p>Device: {}</p><p>Public key: {}</p><p>Enter the display code shown on this device. Confirm only a device you control.</p><form method=\"post\" action=\"/auth/google/confirm\"><input type=\"hidden\" name=\"confirmation\" value=\"{}\"><label>Device code <input name=\"display_code\" maxlength=\"16\" required autocomplete=\"off\"></label><button type=\"submit\">Register this device</button></form></body></html>",
-        escape(&completion.owner_subject),
-        escape(&completion.device_name),
-        escape(&completion.public_key),
-        escape(&completion.confirmation)
-    )))
-}
-#[derive(Deserialize)]
-struct Confirmation {
-    confirmation: String,
-    display_code: String,
-}
-async fn confirm(
+async fn finish(
     State(s): State<BackendState>,
-    Form(q): Form<Confirmation>,
+    Query(q): Query<Callback>,
 ) -> Result<Html<&'static str>> {
-    s.auth.confirm(&q.confirmation, &q.display_code)?;
+    let completion = s.auth.finish_login(&q.code, &q.state).await?;
+    s.auth.auto_confirm(&completion.confirmation)?;
     Ok(Html(
-        "<!doctype html><title>Device confirmed</title><p>Device confirmed. Return to the application to finish registration.</p>",
+        "<!doctype html><title>BinaChicken device registered</title><p>Google sign-in complete. This device is registered. Return to BinaChicken.</p>",
     ))
 }
 async fn challenge(
@@ -192,13 +177,6 @@ async fn revoke(
 ) -> Result<StatusCode> {
     s.devices.revoke(bearer(&headers)?, DeviceId(id)).await?;
     Ok(StatusCode::NO_CONTENT)
-}
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 pub mod turn;
 

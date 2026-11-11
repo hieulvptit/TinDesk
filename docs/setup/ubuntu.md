@@ -54,20 +54,21 @@ competing saved-session locker; do not run two lockers. Existing per-user deskto
 preferences are not overwritten. See [Xfce autostart documentation](https://docs.xfce.org/xfce/xfce4-session/preferences).
 The physical lock/unlock check is required before relying on remote control.
 
-Private state is `/var/lib/remotevnc-agent` (0700, actual remotevnc-agent UID).
-`/etc/remotevnc/agent.json` is root-owned 0640 with the agent group and fixes
-`identity_path`, `helper_socket=/run/remotevnc/helper.sock`, seat0 and HTTPS origin.
+Private state is `/var/lib/binachicken-agent` (0700, actual binachicken-agent UID).
+`/etc/binachicken/agent.json` is root-owned 0640 with the agent group and fixes
+`identity_path`, `helper_socket=/run/binachicken/helper.sock`, seat0 and HTTPS origin.
 Do not run enrollment/doctor/revoke as root: state ownership is checked, and root
 is not an identity-ownership bypass. Stop the agent before credential operations:
 
 ```sh
-sudo systemctl stop remotevnc-agent.service
-sudo -u remotevnc-agent /usr/bin/remotevnc-agent enroll \
-  --config /etc/remotevnc/agent.json --name Ubuntu
+sudo systemctl stop binachicken-agent.service
+sudo -u binachicken-agent /usr/bin/binachicken-agent enroll \
+  --config /etc/binachicken/agent.json --name Ubuntu
 ```
 
-Complete Google consent and the explicit displayed device-code confirmation
-locally **before reboot**. Secrets stay in identity.json 0600; do not print/copy it.
+Complete Google sign-in with the account that should own this device locally
+**before reboot**. Google sign-in automatically registers the pending agent.
+Secrets stay in identity.json 0600; do not print/copy it.
 Only successful explicit enrollment clears a local revoke marker. `--apply`
 requires an unrevoked, private enrolled identity; actual backend authorization
 is still checked by the agent and backend on every session lifecycle.
@@ -85,7 +86,7 @@ An existing Wayland session can report unsupported until the administrator
 explicitly reboots from a local session. Keep the printed rollback command:
 
 ```sh
-sudo packaging/ubuntu/rollback.sh /var/lib/remotevnc-installer/backup-XXXXXXXX
+sudo packaging/ubuntu/rollback.sh /var/lib/binachicken-installer/backup-XXXXXXXX
 ```
 
 Replace the directory with the exact printed value. Rollback stops the agent
@@ -93,12 +94,12 @@ and helper before requesting guardian stop, restores the previous selection,
 config, Debconf selection/seen flag and enablement, and does not restart the
 current desktop. It retains
 installed packages, binaries and enrollment state. It does not restart previous
-RemoteVNC sessions. Guardian stop may wait indefinitely for physical overlap to
+BinaChicken sessions. Guardian stop may wait indefinitely for physical overlap to
 clear; release the local keys/buttons and keep the X server responsive. Never
 replace this with a forced timeout or kill both recovery owners while X remains
 alive. Review selection, then reboot explicitly when safe.
 
-`/run/remotevnc` is a dedicated root-owned 0711 directory; helper.sock is0600
+`/run/binachicken` is a dedicated root-owned 0711 directory; helper.sock is0600
 owned by the resolved agent UID. All ancestors must be traversable by that UID.
 The installer refuses a stale/untraversable existing directory instead of
 chmodding arbitrary paths; inspect and remove the stale dedicated directory
@@ -112,18 +113,48 @@ the supplied socket path, including ancestors before symlinks, using its actual
 UID and primary/supplementary groups. It never chmods existing ancestors. The
 helper unit includes `CAP_SETUID` and `CAP_SETGID` so this preflight child can
 switch identity, plus `AmbientCapabilities=CAP_SETUID` to retain SETUID during
-systemd sandbox setup. Removing them prevents startup before socket bind. The remaining
-capability budget and service hardening are unchanged. Test custom policy changes
+systemd sandbox setup. Removing them prevents startup before socket bind.
+`CAP_SYS_PTRACE` permits the verified `/proc/<Xorg>/exe` lookup when Xorg has a
+larger capability set; `CAP_DAC_READ_SEARCH` alone does not satisfy this kernel
+check. Without it the helper can miss an active physical X11 greeter entirely.
+Existing installations can use `sudo bash packaging/ubuntu/fix-xorg-probe.sh`:
+it first reproduces the actual Xorg lookup failure and runs the patched doctor,
+then installs a service override and restarts helper/agent with rollback on error.
+The input guardian stays running. Test custom policy changes
 by connecting as the agent and receiving `Ready` under that exact unit policy.
+
+The agent requires `AF_NETLINK` in `RestrictAddressFamilies` so glibc/libnice can
+enumerate interfaces through NETLINK_ROUTE during ICE gathering. Without it,
+`getifaddrs` fails with errno 97 and ICE cannot discover the available interfaces.
+Existing installations can use `sudo bash packaging/ubuntu/fix-agent-ice.sh`.
+It checks the original and corrected socket policies with the agent account,
+backs up any previous override, then installs the override and restarts only
+the agent. The helper and input guardian stay running; errors trigger rollback.
+
+For an agent-only binary update, place `packaging/ubuntu/update-agent.sh` as
+`apply.sh` beside the reviewed Linux `binachicken-agent` and a `SHA256SUMS` file
+containing its checksum. Run `sudo bash /path/to/kit/apply.sh`. The script
+requires the ICE network correction, backs up the old binary privately,
+atomically replaces it, runs `doctor` as the agent account, then starts and
+checks the service. Errors restore the previous binary and restart it. The
+helper, guardian, Google identity and display manager remain in place.
+Updated agents log a sanitized media summary every ten seconds during a session:
+selected P2P/TURN path, effective dimensions/FPS ceiling, encoder/helper drops,
+RTT and packet loss when available. No addresses, credentials or input are logged.
 
 For disposable Linux checks only:
 
 ```sh
 sudo apt-get install -y xvfb xauth x11-utils python3-gi gir1.2-gtk-3.0
 sudo python3 scripts/test-ubuntu-installer.py
+sudo python3 scripts/test-helper-proc-permissions.py
 scripts/check.sh
 scripts/test-x11.sh
 ```
+
+The sandbox regression script runs an owned child process and short-lived
+systemd transient units to reproduce both failures and verify the corrected
+policies. It does not change installed service configurations.
 
 Installer tests use private mount namespaces/chroots and actual account/file
 ownership. Package operations and live service start/stop/reload are controlled

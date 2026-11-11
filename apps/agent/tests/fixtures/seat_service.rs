@@ -1,6 +1,6 @@
 //! Explicit disposable-VM fixture. Default cargo test invocation is inert.
-use remotevnc_protocol::*;
-use remotevnc_seat_helper::{
+use binachicken_protocol::*;
+use binachicken_seat_helper::{
     ipc, recovery,
     seat::{DisplayTarget, ServerIdentity},
 };
@@ -19,7 +19,7 @@ use x11rb::{
 };
 fn main() {
     let result = match std::env::args().nth(1).as_deref() {
-        Some("--capture-worker") => remotevnc_seat_helper::capture::worker_main(),
+        Some("--capture-worker") => binachicken_seat_helper::capture::worker_main(),
         Some("service") => service(),
         Some("probe") => probe(),
         _ => Ok(()),
@@ -48,24 +48,24 @@ fn target() -> DisplayTarget {
         height: 600,
     }
 }
-fn service() -> remotevnc_seat_helper::Result<()> {
+fn service() -> binachicken_seat_helper::Result<()> {
     assert_eq!(unsafe { libc::geteuid() }, 0);
     // Verify the shipped AF restriction inside the actual helper unit namespace.
     assert_eq!(
         unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) },
         -1
     );
-    let listener = UnixListener::bind("/run/remotevnc/helper.sock")?;
+    let listener = UnixListener::bind("/run/binachicken/helper.sock")?;
     let uid = std::process::Command::new("id")
-        .args(["-u", "remotevnc-agent"])
+        .args(["-u", "binachicken-agent"])
         .output()?;
     let uid = std::str::from_utf8(&uid.stdout)?.trim().parse::<u32>()?;
-    let path = c"/run/remotevnc/helper.sock";
+    let path = c"/run/binachicken/helper.sock";
     if unsafe { libc::chown(path.as_ptr(), uid, u32::MAX) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     std::fs::set_permissions(
-        "/run/remotevnc/helper.sock",
+        "/run/binachicken/helper.sock",
         std::fs::Permissions::from_mode(0o600),
     )?;
     let mut generation = 0;
@@ -81,7 +81,7 @@ fn service() -> remotevnc_seat_helper::Result<()> {
         );
     }
 }
-fn send(stream: &mut UnixStream, request: HelperRequest) -> remotevnc_seat_helper::Result<()> {
+fn send(stream: &mut UnixStream, request: HelperRequest) -> binachicken_seat_helper::Result<()> {
     let bytes = encode_control(&request)?;
     stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
     stream.write_all(&bytes)?;
@@ -105,15 +105,15 @@ fn main_pid(unit: &str) -> u32 {
         .parse()
         .unwrap()
 }
-fn probe() -> remotevnc_seat_helper::Result<()> {
+fn probe() -> binachicken_seat_helper::Result<()> {
     // Root orchestrates Xvfb and systemctl; forked connection gets the dedicated agent UID.
-    let helper_pid = main_pid("remotevnc-seat-helper.service");
-    let guardian_pid = main_pid("remotevnc-input-guardian.service");
+    let helper_pid = main_pid("binachicken-seat-helper.service");
+    let guardian_pid = main_pid("binachicken-input-guardian.service");
     let uid = std::process::Command::new("id")
-        .args(["-u", "remotevnc-agent"])
+        .args(["-u", "binachicken-agent"])
         .output()?;
     let uid = std::str::from_utf8(&uid.stdout)?.trim().parse::<u32>()?;
-    let c = remotevnc_seat_helper::x11::connect(&target())?;
+    let c = binachicken_seat_helper::x11::connect(&target())?;
     c.xinput_xi_query_version(2, 0)?.reply()?;
     let root = c.setup().roots[0].root;
     let devices = c
@@ -149,7 +149,7 @@ fn probe() -> remotevnc_seat_helper::Result<()> {
     };
     // Drop effective uid only around connect; kernel peer credentials prove the real agent owner.
     assert_eq!(unsafe { libc::seteuid(uid) }, 0);
-    let connection = UnixStream::connect("/run/remotevnc/helper.sock");
+    let connection = UnixStream::connect("/run/binachicken/helper.sock");
     assert_eq!(unsafe { libc::seteuid(0) }, 0);
     let mut stream = connection?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -237,12 +237,12 @@ fn probe() -> remotevnc_seat_helper::Result<()> {
     // Drain capture until guardian expiry interrupts its main; do not cause output backpressure first.
     let reader = std::thread::spawn(move || while read_helper_output(&mut stream).is_ok() {});
     wait(|| {
-        main_pid("remotevnc-seat-helper.service") != helper_pid
-            && main_pid("remotevnc-seat-helper.service") != 0
+        main_pid("binachicken-seat-helper.service") != helper_pid
+            && main_pid("binachicken-seat-helper.service") != 0
     });
-    let restarted = main_pid("remotevnc-seat-helper.service");
+    let restarted = main_pid("binachicken-seat-helper.service");
     wait(|| !std::path::Path::new(&format!("/proc/{capture_pid}")).exists());
-    assert_eq!(main_pid("remotevnc-input-guardian.service"), guardian_pid);
+    assert_eq!(main_pid("binachicken-input-guardian.service"), guardian_pid);
     assert!(
         held(),
         "pending physical source must survive helper cgroup cleanup"
@@ -251,7 +251,7 @@ fn probe() -> remotevnc_seat_helper::Result<()> {
         "deadline killed helper; restarted={restarted}; capture child gone; independent guardian preserved physical overlap"
     );
     // Guardian must remain busy while old physical ownership is pending.
-    let mut probe = UnixStream::connect("/run/remotevnc-guardian/guardian.sock")?;
+    let mut probe = UnixStream::connect("/run/binachicken-guardian/guardian.sock")?;
     let mut size = [0; 4];
     probe.read_exact(&mut size)?;
     let mut bytes = vec![0; u32::from_be_bytes(size) as usize];

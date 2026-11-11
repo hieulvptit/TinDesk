@@ -134,7 +134,7 @@ pub(super) fn build_engine(shared: &Arc<Shared>, epoch: u64) -> Result<Arc<Engin
         return Err(TransportError::NativeOperation);
     }
     if config.role == PeerRole::Controller {
-        for spec in [&MOTION, &CONTROL] {
+        for spec in [&MOTION, &CONTROL, &SYNC] {
             let mut options = gst::Structure::builder("application/data-channel")
                 .field("ordered", spec.ordered)
                 .field(
@@ -174,6 +174,8 @@ fn install_channel(
         &MOTION
     } else if label == CONTROL.label {
         &CONTROL
+    } else if label == SYNC.label {
+        &SYNC
     } else {
         channel.close();
         shared.fail_at(epoch, TransportError::NativeOperation);
@@ -206,7 +208,7 @@ fn attach_channel(
         if let (Some(shared), Some(engine)) = (active(&weak, epoch), weak_engine.upgrade()) {
             install_channel(&shared, &engine, channel);
             let channels = engine.channels.lock().unwrap();
-            if channels.len() == 2
+            if channels.len() == 3
                 && channels
                     .values()
                     .all(|c| c.ready_state() == gst_webrtc::WebRTCDataChannelState::Open)
@@ -218,12 +220,13 @@ fn attach_channel(
     let weak = Arc::downgrade(shared);
     channel.connect_on_message_data(move |channel, bytes| {
         if let Some(shared) = active(&weak, epoch) {
-            receive_input(
-                &shared,
-                epoch,
-                channel.label().as_deref().unwrap_or(""),
-                bytes.map(|b| b.as_ref()).unwrap_or(&[]),
-            );
+            let label = channel.label().map(|s| s.to_string()).unwrap_or_default();
+            let bytes = bytes.map(|b| b.as_ref()).unwrap_or(&[]);
+            if label == SYNC.label {
+                receive_sync(&shared, epoch, bytes);
+                return;
+            }
+            receive_input(&shared, epoch, &label, bytes);
         }
     });
     let weak = Arc::downgrade(shared);
@@ -251,6 +254,22 @@ fn attach_channel(
     });
 }
 
+/// Never blocks the SCTP callback. The sender's window bounds the backlog, so an
+/// overflowing queue means the peer ignores flow control and the session is dropped.
+fn receive_sync(shared: &Arc<Shared>, epoch: u64, bytes: &[u8]) {
+    if bytes.len() > SYNC_FRAME_LIMIT {
+        shared.fail_at(epoch, ProtocolError::ControlTooLarge.into());
+        return;
+    }
+    if !shared.current(epoch) {
+        return;
+    }
+    shared.counters.received.fetch_add(1, Ordering::Relaxed);
+    if shared.sync_tx.try_send(bytes.to_vec()).is_err() {
+        shared.fail_at(epoch, TransportError::QueueFull);
+    }
+}
+
 fn receive_input(shared: &Arc<Shared>, epoch: u64, label: &str, bytes: &[u8]) {
     if shared.config.lock().unwrap().role != PeerRole::Agent {
         shared.fail_at(epoch, TransportError::WrongRole);
@@ -274,6 +293,7 @@ fn receive_input(shared: &Arc<Shared>, epoch: u64, label: &str, bytes: &[u8]) {
                 {
                     shared.counters.motion.fetch_add(1, Ordering::Relaxed);
                 }
+                shared.flush_motion();
             } else {
                 if matches!(
                     input.event,
@@ -340,17 +360,8 @@ pub(super) fn monitor_peer(shared: Arc<Shared>) {
                 }
             }
         }
-        if let Some(input) = shared.incoming_motion.lock().unwrap().take()
-            && !shared.low_priority(PeerEvent::Input(input))
-        {
-            shared.counters.motion.fetch_add(1, Ordering::Relaxed);
-        }
-        let frame = shared.frame.lock().unwrap().take();
-        if let Some(frame) = frame
-            && !shared.low_priority(PeerEvent::Frame(frame))
-        {
-            shared.counters.frames.fetch_add(1, Ordering::Relaxed);
-        }
+        shared.flush_motion();
+        shared.flush_frame();
         if stats_at.elapsed() >= Duration::from_secs(1) {
             if let Ok(engine) = shared.engine() {
                 video::query_stats(&shared, &engine);
@@ -359,7 +370,8 @@ pub(super) fn monitor_peer(shared: Arc<Shared>) {
             stats_at = Instant::now();
         }
         drop(rebuild_guard);
-        thread::sleep(Duration::from_millis(5));
+        // Direct paths handle the common case; this only drains coalesced backlog.
+        thread::sleep(Duration::from_millis(2));
     }
     // Teardown and replacement publication share one lifecycle transaction.
     // close() joins only after releasing the event/lifecycle gates.

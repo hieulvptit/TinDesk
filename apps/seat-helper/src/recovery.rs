@@ -147,6 +147,13 @@ fn lifetime_exists(c: &RustConnection, window: u32) -> Result<bool> {
         Err(e) => Err(e.into()),
     }
 }
+/// A server reset or exit closes every client connection, including this one.
+pub(crate) fn server_alive(c: &RustConnection) -> bool {
+    c.get_input_focus()
+        .ok()
+        .and_then(|r| r.reply().ok())
+        .is_some()
+}
 fn deadline_valid(deadline: u64) -> Result<()> {
     let now = boot_time_ms()?;
     if deadline <= now || deadline - now > 60_000 {
@@ -155,7 +162,7 @@ fn deadline_valid(deadline: u64) -> Result<()> {
     Ok(())
 }
 fn send<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
-    let bytes = remotevnc_protocol::encode_control(value)?;
+    let bytes = binachicken_protocol::encode_control(value)?;
     stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
     stream.write_all(&bytes)?;
     Ok(())
@@ -164,12 +171,12 @@ fn receive<T: serde::de::DeserializeOwned>(stream: &mut UnixStream) -> Result<T>
     let mut size = [0; 4];
     stream.read_exact(&mut size)?;
     let size = u32::from_be_bytes(size) as usize;
-    if size == 0 || size > remotevnc_protocol::CONTROL_PAYLOAD_LIMIT {
+    if size == 0 || size > binachicken_protocol::CONTROL_PAYLOAD_LIMIT {
         return Err(error("invalid guardian frame"));
     }
     let mut bytes = vec![0; size];
     stream.read_exact(&mut bytes)?;
-    Ok(remotevnc_protocol::decode_control(&bytes)?)
+    Ok(binachicken_protocol::decode_control(&bytes)?)
 }
 pub(crate) struct Client {
     stream: UnixStream,
@@ -509,7 +516,7 @@ fn serve_until(stream: &mut UnixStream, stop: &std::sync::atomic::AtomicBool) ->
     )?
     .check()?;
     let atom = c
-        .intern_atom(false, b"_REMOTEVNC_GUARDIAN_ANCHOR")?
+        .intern_atom(false, b"_BINACHICKEN_GUARDIAN_ANCHOR")?
         .reply()?
         .atom;
     let nonce = uuid::Uuid::new_v4().as_bytes().to_vec();
@@ -563,7 +570,7 @@ fn serve_until(stream: &mut UnixStream, stop: &std::sync::atomic::AtomicBool) ->
                         if boot_time_ms()? >= deadline {
                             return Err(error("guardian lease expired"));
                         }
-                        match remotevnc_protocol::decode_control::<Request>(&bytes)? {
+                        match binachicken_protocol::decode_control::<Request>(&bytes)? {
                             Request::State(next) => {
                                 validate(&next, &c)?;
                                 snapshot = next;
@@ -605,6 +612,12 @@ fn serve_until(stream: &mut UnixStream, stop: &std::sync::atomic::AtomicBool) ->
     // producer on expiry/abnormal EOF, then await X11 quiescence before retiring
     // its snapshot. Normal Drop proves quiescence via Finish and stays alive.
     let termination = if finished {
+        Ok(())
+    } else if !server_alive(&c) {
+        // The guarded X server has exited (e.g. LightDM retiring a lock-screen
+        // greeter on unlock). The producer's connection died with it, so it
+        // cannot mutate this server, and a replacement server needs a new
+        // guarded session. Killing it would only tear down an authorized session.
         Ok(())
     } else {
         producer.signal(libc::SIGKILL)

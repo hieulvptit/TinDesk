@@ -1,0 +1,11 @@
+[package]
+name = "binachicken-sync-helper"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+binachicken-protocol = { path = "../../crates/protocol" }
+binachicken-sync = { path = "../../crates/sync" }
+x11rb = { version = "0.13", features = ["xfixes"] }

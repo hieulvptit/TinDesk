@@ -1,0 +1,39 @@
+[Unit]
+Description=BinaChicken outbound network agent
+Wants=network-online.target binachicken-seat-helper.service
+After=network-online.target binachicken-seat-helper.service
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=binachicken-agent
+Group=binachicken-agent
+StateDirectory=binachicken-agent
+StateDirectoryMode=0700
+# Socket for the logged-in user's clipboard/file sync helper (peer-credential gated).
+RuntimeDirectory=binachicken-agent
+RuntimeDirectoryMode=0711
+UMask=0077
+ExecStart=/usr/bin/binachicken-agent run --config /etc/binachicken/agent.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+KillMode=control-group
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# libnice/glibc enumerate interfaces through NETLINK_ROUTE when gathering ICE.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

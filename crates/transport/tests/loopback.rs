@@ -1,5 +1,5 @@
-use remotevnc_protocol::*;
-use remotevnc_transport::*;
+use binachicken_protocol::*;
+use binachicken_transport::*;
 use std::time::{Duration, Instant};
 
 fn config(role: PeerRole) -> PeerConfig {
@@ -309,4 +309,146 @@ fn structured_h264_is_configured_before_the_initial_offer() {
         assert!(Instant::now() < deadline);
     }
     a.close();
+}
+
+#[test]
+fn connected_peers_report_the_selected_ice_candidate_types() {
+    let mut controller = Peer::new(config(PeerRole::Controller)).unwrap();
+    let mut agent = Peer::new(config(PeerRole::Agent)).unwrap();
+    controller.start_negotiation().unwrap();
+    pump(&mut controller, &mut agent, |event| {
+        matches!(event, PeerEvent::ChannelsReady)
+    });
+    controller
+        .send_input(envelope(0, InputEvent::DisplayAck))
+        .unwrap();
+    pump(&mut controller, &mut agent, |event| {
+        matches!(event, PeerEvent::Input(_))
+    });
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline && controller.stats().native.local_candidate.is_none() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let stats = controller.stats().native;
+    assert_eq!(
+        stats.local_candidate,
+        Some(binachicken_transport::stats::CandidateType::Host),
+        "connected transport has no local candidate: {stats:?}"
+    );
+    assert_eq!(
+        stats.remote_candidate,
+        Some(binachicken_transport::stats::CandidateType::Host),
+        "connected transport has no remote candidate: {stats:?}"
+    );
+    controller.close();
+    agent.close();
+}
+
+struct Mem(std::collections::HashMap<u32, Vec<u8>>, Vec<(u32, Vec<u8>)>);
+impl Sink for Mem {
+    fn begin(&mut self, id: u32, _: SyncKind, _: &str, _: u64) -> std::io::Result<()> {
+        self.0.insert(id, vec![]);
+        Ok(())
+    }
+    fn write(&mut self, id: u32, d: &[u8]) -> std::io::Result<()> {
+        self.0.get_mut(&id).unwrap().extend_from_slice(d);
+        Ok(())
+    }
+    fn commit(&mut self, id: u32) -> std::io::Result<()> {
+        let v = self.0.remove(&id).unwrap();
+        self.1.push((id, v));
+        Ok(())
+    }
+    fn abort(&mut self, id: u32) {
+        self.0.remove(&id);
+    }
+}
+
+/// Moves `data` from `from` to `to` through the real sync channel, honoring window and backpressure.
+fn transfer(from: &mut Peer, to: &mut Peer, id: u32, data: &[u8]) -> Vec<u8> {
+    let mut rx = SyncReceiver::new(
+        Mem(Default::default(), vec![]),
+        Policy {
+            clipboard: true,
+            files: true,
+        },
+    );
+    let (mut tx, offer) = SyncSender::new(id, SyncKind::File, "f.bin", data.len() as u64).unwrap();
+    let mut outbox: std::collections::VecDeque<Vec<u8>> =
+        [encode_sync_control(&offer).unwrap()].into();
+    let mut parts = data.chunks(SYNC_CHUNK_SIZE);
+    let mut pending_part: Option<&[u8]> = parts.next();
+    let mut finished = false;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        // Drain events so signaling-independent errors surface.
+        while let Ok(e) = from.events().try_recv() {
+            if let PeerEvent::Error(e) = e {
+                panic!("{e}")
+            }
+        }
+        while let Ok(e) = to.events().try_recv() {
+            if let PeerEvent::Error(e) = e {
+                panic!("{e}")
+            }
+        }
+        while outbox.is_empty() {
+            if let Some(part) = pending_part.filter(|_| tx.can_send()) {
+                outbox.push_back(tx.chunk(part).unwrap());
+                pending_part = parts.next();
+            } else if pending_part.is_none() && !finished {
+                finished = true;
+                outbox.push_back(
+                    std::mem::replace(
+                        &mut tx,
+                        SyncSender::new(0, SyncKind::File, "x", 0).unwrap().0,
+                    )
+                    .finish()
+                    .unwrap(),
+                );
+            } else {
+                break;
+            }
+        }
+        while let Some(frame) = outbox.front() {
+            match from.send_sync(frame) {
+                Ok(()) => {
+                    outbox.pop_front();
+                }
+                Err(TransportError::QueueFull) => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        while let Ok(frame) = to.sync_events().try_recv() {
+            for reply in rx.handle(&frame).unwrap() {
+                to.send_sync(&encode_sync_control(&reply).unwrap()).unwrap();
+            }
+        }
+        while let Ok(frame) = from.sync_events().try_recv() {
+            if let SyncFrame::Control(SyncMessage::Progress { received, .. }) =
+                decode_frame(&frame).unwrap()
+            {
+                tx.on_progress(received);
+            }
+            if let SyncFrame::Control(SyncMessage::Done { .. }) = decode_frame(&frame).unwrap() {
+                return rx.sink().1[0].1.clone();
+            }
+        }
+        assert!(Instant::now() < deadline, "sync transfer timed out");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn real_peers_transfer_large_files_both_ways_with_flow_control() {
+    let mut a = Peer::new(config(PeerRole::Controller)).unwrap();
+    let mut b = Peer::new(config(PeerRole::Agent)).unwrap();
+    a.start_negotiation().unwrap();
+    pump(&mut a, &mut b, |e| matches!(e, PeerEvent::ChannelsReady));
+    let data: Vec<u8> = (0..5 * 1024 * 1024u32)
+        .map(|i| ((i * 31) >> 3) as u8)
+        .collect();
+    assert_eq!(transfer(&mut a, &mut b, 1, &data), data);
+    assert_eq!(transfer(&mut b, &mut a, 2, &data), data);
+    assert!(!a.is_closed() && !b.is_closed());
 }

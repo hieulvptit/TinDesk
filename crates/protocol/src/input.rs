@@ -53,6 +53,10 @@ pub enum InputEvent {
         x: u32,
         y: u32,
     },
+    /// Live stream limits; the agent retains control of encoder selection.
+    VideoProfile {
+        profile: crate::VideoProfile,
+    },
     ReleaseAll,
     DisplayAck,
 }
@@ -119,6 +123,12 @@ impl InputGuard {
                 if *x >= self.display.width || *y >= self.display.height =>
             {
                 return Err(ProtocolError::InvalidCoordinates);
+            }
+            InputEvent::VideoProfile { profile } => {
+                profile.validate()?;
+                if profile.encoder != crate::VideoEncoder::Auto {
+                    return Err(ProtocolError::InvalidPayload);
+                }
             }
             InputEvent::Text { text } if text.len() > TEXT_LIMIT => {
                 return Err(ProtocolError::TextTooLarge);

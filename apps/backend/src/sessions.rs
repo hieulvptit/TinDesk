@@ -6,7 +6,7 @@ use crate::{
     signaling::Hub,
     turn::{TURN_REFRESH_BEFORE, TURN_TTL, TurnClient},
 };
-use remotevnc_protocol::*;
+use binachicken_protocol::*;
 use rusqlite::{OptionalExtension, Transaction, params};
 use uuid::Uuid;
 
@@ -112,7 +112,18 @@ impl SessionService {
             })?;
         }
         // A failed/unconfigured provider still allows direct connectivity, explicitly unavailable.
-        let ice = self.turn.issue(TURN_TTL).await.unwrap_or_default();
+        let ice = match self.turn.issue(TURN_TTL).await {
+            Ok(ice) => ice,
+            Err(error) => {
+                if self.turn.is_configured() {
+                    // Without relay, sessions only connect when both peers share a network.
+                    eprintln!(
+                        "BinaChicken backend: TURN credentials unavailable for new session: {error}"
+                    );
+                }
+                Vec::new()
+            }
+        };
         let _gate = authorization_gate().lock().await;
         let grant = self.db.transaction(|tx| {
             let principal = caller.resolve(tx)?;

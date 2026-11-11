@@ -1,5 +1,5 @@
 use crate::Result;
-use remotevnc_device::{CredentialStore, FileStore, StoredCredentials};
+use binachicken_device::{CredentialStore, FileStore, StoredCredentials};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
@@ -17,6 +17,12 @@ pub struct Config {
     pub seat: String,
     #[serde(default)]
     pub relay_only: bool,
+    /// Where the logged-in user's sync helper connects. Absent disables clipboard/file sync.
+    #[serde(default)]
+    pub sync_socket: Option<PathBuf>,
+    /// Local sshd port that SSH tunnels lead to. Absent disables the tunnel (the default).
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
 }
 impl Config {
     pub fn read(path: &Path) -> Result<Self> {
@@ -35,7 +41,13 @@ impl Config {
         {
             return Err("requires seat0 and absolute identity/helper paths".into());
         }
-        remotevnc_device::DeviceApi::new(
+        if self.ssh_port == Some(0) {
+            return Err("ssh port must be nonzero".into());
+        }
+        if self.sync_socket.as_ref().is_some_and(|p| !p.is_absolute()) {
+            return Err("sync socket path must be absolute".into());
+        }
+        binachicken_device::DeviceApi::new(
             &self.backend_origin,
             ed25519_dalek::SigningKey::from_bytes(&[0; 32]),
         )?;

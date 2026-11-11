@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=BinaChicken clipboard and file sync
+Comment=Shares the clipboard and files with an authorized remote controller
+Exec=/usr/bin/binachicken-sync-helper
+OnlyShowIn=XFCE;GNOME;KDE;MATE;LXQt;Unity;X-Cinnamon;
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

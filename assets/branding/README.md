@@ -1,8 +1,8 @@
-# RemoteVNC app icons
+# BinaChicken app icons
 
 | Client — macOS controller | Server — Ubuntu remote host |
 | --- | --- |
-| <img src="client-512.png" width="160" alt="RemoteVNC Client icon"> | <img src="server-512.png" width="160" alt="RemoteVNC Server icon"> |
+| <img src="client-512.png" width="160" alt="BinaChicken Client icon"> | <img src="server-512.png" width="160" alt="BinaChicken Server icon"> |
 | Cyan display, peer connection arrows and mouse pointer | Orange display, peer connection arrows and server rack |
 
 Both icons share the navy tile and have transparent margins. Original PNGs are
@@ -10,7 +10,7 @@ Both icons share the navy tile and have transparent margins. Original PNGs are
 and desktop integration. Each `.icns` contains standard and Retina sizes from
 16 through 1024 pixels.
 
-The macOS build script installs `client.icns` as `RemoteVNC.icns` and Info.plist
+The macOS build script installs `client.icns` as `BinaChicken.icns` and Info.plist
 references that resource. Existing built apps must be rebuilt to include it.
 The Ubuntu server runs as background services; its PNG is ready for a future
 desktop launcher or management UI.

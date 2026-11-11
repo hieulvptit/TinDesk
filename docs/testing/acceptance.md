@@ -78,14 +78,14 @@ ssh clawmachine@172.22.8.59 'cat /etc/os-release; uname -r; loginctl list-sessio
 ```
 
 On the approved26.04 host, prepare binaries/units, enroll as the actual
-`remotevnc-agent` state owner, save the printed rollback path, review `--doctor`
+`binachicken-agent` state owner, save the printed rollback path, review `--doctor`
 and apply, using the linked procedure. An on-site administrator must preserve
 local console access and explicitly perform the reboot. Never log a password or
 film real credentials. After that gate, record each case separately:
 
 | Case | Procedure and required observation |
 | --- | --- |
-| Boot → physical greeter | Administrator reboots; `systemctl is-active remotevnc-input-guardian remotevnc-seat-helper remotevnc-agent`; paired client connects before user login. On-site observer confirms monitor/client show the same physical LightDM screen on seat0. |
+| Boot → physical greeter | Administrator reboots; `systemctl is-active binachicken-input-guardian binachicken-seat-helper binachicken-agent`; paired client connects before user login. On-site observer confirms monitor/client show the same physical LightDM screen on seat0. |
 | Login → desktop | Select Xfce/X11 explicitly for the existing user. Enter credentials remotely without clipboard; local Ubuntu authentication remains authoritative. `loginctl show-session SESSION -p Seat -p Type -p Remote -p Display` must report local seat0/X11. `xrandr --query` identifies the chosen physical output. Compare a visible local marker against the client; no extra desktop/session is created. |
 | Lock → unlock | In the local Xfce desktop run `pgrep -x light-locker`, then `light-locker-command --lock`. Compare actual monitor/client and enter a disposable account password remotely. Verify active modifiers/Caps Lock and no clipboard mutation. Unlock must use Ubuntu's own locker. |
 | Logout → login | Use Xfce's normal Log Out action; compare physical greeter, authenticate again, verify display generation changes and stale pointer/input cannot apply to the old session. |
@@ -109,7 +109,8 @@ of `https://amio.vnoffice.io.vn` before any deployment; the callback remains
 consent, real browser behavior or public proxy lifetime.
 
 Launch the normal macOS app using `--backend https://amio.vnoffice.io.vn`; enroll
-both devices with the same Google account and verify device-code confirmation.
+both devices with the same Google account and verify registration completes when
+the enrollment-bound Google callback returns, without a device-code prompt.
 Restart the app and confirm it recovers the existing Keychain identity without
 re-enrollment; deny Keychain access and verify fail-closed behavior without a
 file fallback. In a separate macOS user/account, enroll a different Google

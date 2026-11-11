@@ -1,10 +1,10 @@
 mod common;
+use binachicken_protocol::*;
 use common::*;
 use futures_util::{SinkExt, StreamExt};
 use remotevnc_backend::{
     BackendState, auth::AuthService, sessions::SessionService, turn::TurnClient,
 };
-use remotevnc_protocol::*;
 use std::time::Duration;
 use tokio_tungstenite::{
     connect_async,
@@ -231,7 +231,7 @@ async fn http_sessions_require_bearer_and_return_explicit_turn_status() {
 async fn device_sdk_session_presence_and_event_contract() {
     let f = session_fixture();
     let (base, _, task) = server(&f, TurnClient::unavailable()).await;
-    let api = remotevnc_device::DeviceApi::new(&base, device_key(1)).unwrap();
+    let api = binachicken_device::DeviceApi::new(&base, device_key(1)).unwrap();
     let token = AccessToken {
         token: f.tokens[0].clone(),
         expires_at_unix_ms: unix_ms() + 300_000,
@@ -595,7 +595,7 @@ async fn close_revoke_and_expiry_notify_surviving_peer_and_revoked_socket_has_po
 async fn sdk_sends_typed_signals_and_distinguishes_policy_close() {
     let f = session_fixture();
     let (base, service, task) = server(&f, TurnClient::unavailable()).await;
-    let api = remotevnc_device::DeviceApi::new(&base, device_key(1)).unwrap();
+    let api = binachicken_device::DeviceApi::new(&base, device_key(1)).unwrap();
     let token = AccessToken {
         token: f.tokens[0].clone(),
         expires_at_unix_ms: unix_ms() + 300_000,
@@ -627,7 +627,7 @@ async fn sdk_sends_typed_signals_and_distinguishes_policy_close() {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             match events.next().await {
-                Err(remotevnc_device::Error::PolicyClosed) => break,
+                Err(binachicken_device::Error::PolicyClosed) => break,
                 Ok(Some(_)) => {}
                 _ => panic!("expected typed policy close"),
             }

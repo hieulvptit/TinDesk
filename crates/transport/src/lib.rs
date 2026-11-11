@@ -3,9 +3,9 @@
 pub mod channels;
 mod peer;
 pub mod stats;
+pub use binachicken_protocol::IceServer;
 pub use crossbeam_channel::Receiver;
 pub use peer::*;
-pub use remotevnc_protocol::IceServer;
 pub use stats::PeerStats;
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -13,7 +13,7 @@ pub enum TransportError {
     #[error("signaling belongs to another PeerConnection epoch")]
     StaleEpoch,
     #[error(transparent)]
-    Protocol(#[from] remotevnc_protocol::ProtocolError),
+    Protocol(#[from] binachicken_protocol::ProtocolError),
     #[error("required GStreamer runtime or plugin is unavailable")]
     NativeDependency,
     #[error("GStreamer operation failed")]

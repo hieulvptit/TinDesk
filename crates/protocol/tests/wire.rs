@@ -1,4 +1,4 @@
-use remotevnc_protocol::*;
+use binachicken_protocol::*;
 
 #[test]
 fn unicode_payload_round_trips() {

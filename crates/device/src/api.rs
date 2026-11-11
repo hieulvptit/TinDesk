@@ -1,6 +1,6 @@
 use crate::{DeviceIdentity, Error, Result};
+use binachicken_protocol::*;
 use ed25519_dalek::SigningKey;
-use remotevnc_protocol::*;
 use serde::de::DeserializeOwned;
 use std::time::Duration;
 use url::Url;

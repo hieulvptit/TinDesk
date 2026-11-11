@@ -100,3 +100,37 @@ access token cho agent. Xem [bản ghi triển khai agent](deployment-clawmachin
 Chưa nghiệm thu riêng kết nối WebSocket đã đăng nhập và phiên remote thực tế có
 candidate `relay`. HTTP 201 của provider chưa chứng minh media đã truyền qua TURN.
 Nghiệm thu màn hình login/khóa trên máy Ubuntu vật lý vẫn là bước riêng.
+
+## Tự đăng ký thiết bị sau Google login
+
+Ngày 2026-10-21, callback Google được cập nhật để tự gắn enrollment đang chờ vào
+Google subject vừa xác thực; giao diện không còn yêu cầu nhập mã hay bấm xác nhận
+trên trang web. Image `remotevnc-backend:auto-google-550dd0d8` đã được triển khai;
+image ID là
+`sha256:6b5f5a7a3abf11e583fc5e3301a2f68471acdc78b9d9516d0fedfb7e67e0cc2e`.
+Image build từ source HEAD `c2c69bc368faa82a7b27ba478eb9ae84776bf7e0` cộng patch
+SHA-256 `550dd0d89c69f08cae1d5c51555ca335b24bf51fa48611349352d57a0a9b8805`;
+build record và log nằm trong
+`/Users/hieulv/Projects/RemoteVNC-builds/backend-autogoogle-550dd0d8`.
+
+Sau khi thay image, backend container chạy với restart count 0, timer maintenance
+vẫn active, landing HTTPS trả 200, API chưa xác thực trả 401 và route xác nhận mã
+cũ trả 404. Chưa ghi nhận enrollment mới theo luồng tự động; người dùng cần mở
+Google login từ app Mac mới để gắn thiết bị.
+
+## Sửa cấp TURN ngày 2026-10-22
+
+Trước bản này, cả 61 phiên đều được tạo với danh sách ICE rỗng: Cloudflare trả hai
+URL STUN (cổng 3478 và 443) nhưng backend chỉ chấp nhận một, rồi lỗi bị bỏ qua im
+lặng. Phiên chỉ kết nối được khi hai máy cùng mạng LAN. Backend giờ giữ URL STUN
+đầu tiên, giữ toàn bộ URL relay và ghi log khi không cấp được TURN.
+
+- Image tag: `remotevnc-backend:turnfix` (cùng image với tag `local`), image ID
+  `sha256:31c582d1b97b18bf26c780ae5f0b52bd14fd71a6079925be53f1d15cabf58264`.
+- Image trước đó giữ ở tag `remotevnc-backend:pre-turnfix`
+  (`sha256:6b5f5a7a3abf11e583fc5e3301a2f68471acdc78b9d9516d0fedfb7e67e0cc2e`) để rollback.
+- Build trên server bằng cùng `Dockerfile.offline` (SHA-256 `0c72b974…`); bản
+  `.dockerignore` trong thư mục build được mở thêm `.build-cargo-cache`.
+- Nghiệm thu: container running, restart 0; landing 200, API chưa xác thực 401.
+  Phiên mới có 1 STUN + 6 TURN. Client macOS chạy `--relay-only` kết nối thành công
+  và agent báo `media path=TURN relay` (1920x1080, 30 FPS).

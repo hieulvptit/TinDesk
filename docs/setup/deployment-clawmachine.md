@@ -42,7 +42,7 @@ No OAuth client secret or long-term TURN key was copied to this host.
   reviewed systemd policies. Private state is owner0700; helper socket is
   agent-owned0600 under root0711; guardian directory is root0700.
 
-The current GDM/Wayland session was preserved. LightDM/Xfce/X11 is selected for
+At initial installation the GDM/Wayland session was preserved. LightDM/Xfce/X11 was selected for
 the **next boot**. Save work and reboot manually when ready; the current Wayland
 desktop cannot be controlled by this X11 implementation. No automatic reboot
 or display-manager restart occurred.
@@ -57,3 +57,30 @@ exact private backup path printed in the installation terminal. To inspect statu
 ```sh
 systemctl status remotevnc-agent remotevnc-seat-helper remotevnc-input-guardian
 ```
+
+## Follow-up on 2026-10-21
+
+The user subsequently rebooted into LightDM/X11. The physical `seat0` greeter
+was detected at 1920x1080 with XTest/XKB/XI2 ready. The user applied the Xorg
+executable-lookup correction (`CAP_SYS_PTRACE`), backed up under
+`/var/lib/remotevnc-installer/xorg-probe-backup-BiuJGOf3`, and the agent ICE
+interface-discovery correction (`AF_NETLINK`), backed up under
+`/var/lib/remotevnc-installer/ice-network-backup-F2mLTBmd`. Live systemd inspection
+confirmed AF_NETLINK was loaded, the agent was active and its restart count was
+zero. Original-policy denied probes are intentional failure reproductions.
+
+A new agent with live FPS/stream-size requests, 30 FPS default, timestamp-clock
+mapping and sanitized P2P/TURN diagnostics was built in the existing Ubuntu
+25.10/Rust 1.95 container and staged at
+`/home/clawmachine/RemoteVNC-deploy/video-settings-v1`.
+Agent SHA256: `2698725fb062b92c968338c0e392a367996322215ce02072898cf16d97d3a9de`.
+Checksums, command entry and native library resolution passed on the target.
+The user applied this binary update at 16:24 local time. Live verification
+confirmed the installed hash above, active state and zero automatic restarts.
+The old
+helper supports the existing UpdateProfile IPC and does not need replacement.
+Current artifacts and immutable source manifest/archive are under
+`target/video-controls-build`; the Mac development app is under
+`target/release/video-settings`, with the active workspace app also copied to
+`target/release/RemoteVNC.app`. Real physical-session performance and route
+must be checked after installation; fixtures do not prove those results.
