@@ -254,6 +254,7 @@ async fn enroll(
     }
     Err("Browser confirmation expired; sign in again".into())
 }
+#[allow(clippy::too_many_arguments)]
 async fn run(
     config: Config,
     state: Arc<Mutex<ViewState>>,

@@ -182,7 +182,7 @@ mod tests {
         stats.bytes_received = Some(1);
         t.observe(scope, stats, 6.);
         assert_eq!(t.current(6.).rx_mbps, None);
-        t.observe(Some((scope.unwrap().0, 2)), stats, 7.);
+        t.observe(scope.map(|s| (s.0, 2)), stats, 7.);
         assert_eq!(t.current(7.).rx_mbps, None);
     }
     #[test]

@@ -20,7 +20,7 @@ jobs:
       CARGO_BUILD_JOBS: "1"
       RUSTUP_TOOLCHAIN: 1.95.0
     steps:
-      - run: apt-get update && apt-get install -y ca-certificates curl git build-essential pkg-config libssl-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice libx11-dev libxtst-dev libxi-dev libxrandr-dev libxfixes-dev libxkbcommon-dev libwayland-dev xvfb xauth x11-utils nginx-core python3 python3-gi gir1.2-gtk-3.0
+      - run: apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y ca-certificates curl git build-essential pkg-config libssl-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice libx11-dev libxtst-dev libxi-dev libxrandr-dev libxfixes-dev libxkbcommon-dev libwayland-dev xvfb xauth x11-utils nginx-core python3 python3-gi gir1.2-gtk-3.0
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.95.0 --component rustfmt --component clippy
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"

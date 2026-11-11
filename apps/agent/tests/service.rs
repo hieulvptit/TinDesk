@@ -664,8 +664,8 @@ async fn cli_oidc_candidate_recovery_and_running_local_revoke() {
         Fault::None,
     );
     let login = auth.finish_login(&code, &state).await.unwrap();
-    auth.confirm(&login.confirmation, parts.last().unwrap())
-        .unwrap();
+    // Registration completes automatically after the enrollment-bound login.
+    auth.auto_confirm(&login.confirmation).unwrap();
     assert!(
         tokio::task::spawn_blocking(move || enroll.wait().unwrap())
             .await
